@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import stat
 from types import SimpleNamespace
 
@@ -83,7 +84,11 @@ def test_custom_model_store_round_trips_and_uses_private_permissions(tmp_path):
     store.add(profile)
 
     assert store.list() == [profile]
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    else:
+        # POSIX mode bits do not describe NTFS access control lists.
+        assert os.access(path, os.R_OK | os.W_OK)
     assert store.delete(profile.id)
     assert store.list() == []
     assert not store.delete(profile.id)

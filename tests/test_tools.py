@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+
+import pytest
 
 from paicli.config import load_config
 from paicli.tools import ToolRegistry, get_builtin_tools
@@ -61,3 +65,35 @@ def test_memory_tools_save_metadata_and_recall_relevant_items(tmp_path, monkeypa
     assert not recalled.is_error
     assert "uv" in recalled.content
     assert "preference" in recalled.content
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell shell integration is Windows-specific")
+@pytest.mark.parametrize(
+    ("command", "expected_error", "expected_output"),
+    [
+        ("Write-Output 'PowerShell works'", False, "PowerShell works"),
+        ("Get-Content -LiteralPath 'missing-file.txt'", True, "missing-file.txt"),
+        ('cmd.exe /c "exit 7"', True, ""),
+    ],
+)
+def test_bash_tool_uses_powershell_and_preserves_failures(
+    tmp_path,
+    monkeypatch,
+    command,
+    expected_error,
+    expected_output,
+):
+    if not (shutil.which("pwsh") or shutil.which("powershell.exe")):
+        pytest.skip("PowerShell executable is unavailable")
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(project_root=tmp_path)
+    config.policy.hitl_mode = "never"
+    context = ToolContext(cwd=str(tmp_path), config=config)
+    tool = next(tool for tool in get_builtin_tools() if tool.name == "bash")
+
+    result = asyncio.run(tool.execute({"command": command}, context))
+
+    assert result.is_error is expected_error
+    if expected_output:
+        assert expected_output in result.content

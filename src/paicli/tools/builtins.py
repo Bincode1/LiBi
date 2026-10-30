@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from typing import Any
 
 from paicli.memory import MemoryManager
@@ -186,7 +187,11 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="bash",
-            description="Execute a shell command in the current workspace.",
+            description=(
+                "Execute a command in the current workspace. On Windows, commands run through "
+                "PowerShell (pwsh or Windows PowerShell), so use PowerShell syntax such as "
+                "Get-ChildItem, Get-Content, and $env:NAME. Other platforms use their system shell."
+            ),
             parameters=object_schema(
                 {
                     "command": {"type": "string", "description": "Shell command"},
@@ -203,7 +208,10 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="execute_command",
-            description="Alias of bash. Execute a shell command in the current workspace.",
+            description=(
+                "Alias of bash. On Windows, execute a command through PowerShell; use PowerShell "
+                "syntax such as Get-ChildItem, Get-Content, and $env:NAME."
+            ),
             parameters=object_schema(
                 {
                     "command": {"type": "string", "description": "Shell command"},
@@ -474,13 +482,28 @@ async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     if context.config.policy.command_guard_enabled:
         CommandGuard(context.config.policy.command_blacklist).validate(command)
     timeout = float(payload.get("timeout") or context.config.tools.timeout)
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        cwd=context.cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=os.environ.copy(),
-    )
+    powershell = _powershell_invocation(command) if os.name == "nt" else None
+    if os.name == "nt" and powershell is None:
+        return ToolResult(
+            "PowerShell was not found. Install PowerShell 7 (pwsh) or enable Windows PowerShell.",
+            is_error=True,
+        )
+    if powershell is None:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=context.cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy(),
+        )
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            *powershell,
+            cwd=context.cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy(),
+        )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.CancelledError:
@@ -499,6 +522,42 @@ async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
         output or f"(exit {proc.returncode}, no output)",
         is_error=proc.returncode != 0,
     )
+
+
+def _powershell_invocation(command: str) -> list[str] | None:
+    executable = (
+        shutil.which("pwsh") or shutil.which("powershell.exe") or shutil.which("powershell")
+    )
+    if executable is None:
+        return None
+
+    script = f"""
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+$ErrorActionPreference = 'Stop'
+$global:LASTEXITCODE = 0
+try {{
+{command}
+    $commandSucceeded = $?
+    if (-not $commandSucceeded) {{
+        if ($global:LASTEXITCODE -is [int] -and $global:LASTEXITCODE -ne 0) {{
+            exit $global:LASTEXITCODE
+        }}
+        exit 1
+    }}
+}} catch {{
+    [Console]::Error.WriteLine($_.ToString())
+    exit 1
+}}
+"""
+    return [
+        executable,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        script,
+    ]
 
 
 # ---------------------------------------------------------------------------

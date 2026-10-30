@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import httpx
 import pytest
@@ -53,7 +54,7 @@ if __name__ == "__main__":
                 "mcpServers": {
                     "fake": {
                         "type": "stdio",
-                        "command": "python",
+                        "command": sys.executable,
                         "args": [str(server)],
                     }
                 }
@@ -106,7 +107,7 @@ if __name__ == "__main__":
                 "mcpServers": {
                     "noisy": {
                         "type": "stdio",
-                        "command": "python",
+                        "command": sys.executable,
                         "args": [str(server)],
                     }
                 }
