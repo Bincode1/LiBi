@@ -81,8 +81,9 @@ def test_agent_propagates_connection_error_without_raising(tmp_path, monkeypatch
 
     events = asyncio.run(_collect_agent_events(agent))
 
-    assert [event["type"] for event in events] == ["error"]
-    assert "Could not connect to deepseek" in str(events[0]["error"])
+    assert [event["type"] for event in events] == ["context_summary", "error"]
+    error_event = next(event for event in events if event["type"] == "error")
+    assert "Could not connect to deepseek" in str(error_event["error"])
 
 
 def test_usage_only_chunk_without_choices_is_parsed() -> None:
@@ -132,6 +133,83 @@ def test_usage_normalizes_old_and_provider_fields() -> None:
     assert provider.output_tokens == 4
     assert provider.reasoning_tokens == 2
     assert provider.total_tokens == 14
+
+
+def test_cache_usage_uses_deepseek_fields():
+    usage = Usage.from_mapping(
+        {
+            "prompt_tokens": 1_000,
+            "prompt_cache_hit_tokens": 600,
+            "prompt_cache_miss_tokens": 400,
+        }
+    )
+
+    assert usage.input_tokens == 1_000
+    assert usage.cache_hit_tokens == 600
+    assert usage.cache_miss_tokens == 400
+    assert usage.cache_context_tokens == 1_000
+
+
+def test_cache_usage_supports_harness_disjoint_buckets():
+    usage = Usage.from_mapping(
+        {
+            "input_tokens": 1_000,
+            "cache_read_input_tokens": 600,
+            "cache_creation_input_tokens": 400,
+        }
+    )
+
+    assert usage.input_tokens == 1_000
+    assert usage.cache_hit_tokens == 600
+    assert usage.cache_miss_tokens == 1_000
+    assert usage.cache_write_tokens == 400
+    assert usage.cache_context_tokens == 2_000
+    assert (
+        usage.cache_hit_tokens
+        / (usage.cache_miss_tokens + usage.cache_hit_tokens + usage.cache_write_tokens)
+        == 0.3
+    )
+
+
+def test_cache_usage_normalizes_harness_camel_case_buckets():
+    usage = Usage.from_mapping(
+        {
+            "inputTokens": 1_000,
+            "outputTokens": 10,
+            "cacheReadTokens": 600,
+            "cacheWriteTokens": 400,
+        }
+    )
+
+    assert usage.input_tokens == 1_000
+    assert usage.cache_hit_tokens == 600
+    assert usage.cache_miss_tokens == 1_000
+    assert usage.cache_write_tokens == 400
+    assert usage.cache_context_tokens == 2_000
+    assert usage.total_tokens == 1_010
+
+
+def test_cache_usage_normalizes_harness_nested_details():
+    usage = Usage.from_mapping(
+        {
+            "input_tokens": 1_000,
+            "input_tokens_details": {"cache_read_tokens": 600, "cache_write_tokens": 400},
+        }
+    )
+
+    assert usage.input_tokens == 1_000
+    assert usage.cache_hit_tokens == 600
+    assert usage.cache_write_tokens == 400
+    assert usage.cache_miss_tokens == 1_000
+    assert usage.cache_context_tokens == 2_000
+
+
+def test_cache_usage_supports_compat_fields_and_only_derives_miss_when_hit_is_known():
+    compat = Usage.from_mapping({"prompt_tokens": 1_000, "cached_tokens": 700})
+    unknown = Usage.from_mapping({"prompt_tokens": 1_000})
+
+    assert (compat.cache_hit_tokens, compat.cache_miss_tokens) == (700, 300)
+    assert (unknown.cache_hit_tokens, unknown.cache_miss_tokens) == (0, 0)
 
 
 def test_deepseek_v4_profiles_and_cost_formula() -> None:

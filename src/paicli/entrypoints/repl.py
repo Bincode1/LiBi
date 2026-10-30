@@ -18,9 +18,10 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from paicli import __version__
-from paicli.agent import Agent, AgentOrchestrator, PlanExecuteAgent
+from paicli.agent import Agent, QueryEngine
 from paicli.bootstrap import build_tool_registry
 from paicli.config import PaiCliConfig, config_to_public_dict
+from paicli.context import estimate_message_tokens
 from paicli.entrypoints.model_selector import ModelSelectorState, run_model_selector
 from paicli.llm import create_llm_client
 from paicli.llm.model_profiles import (
@@ -168,6 +169,7 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
                 "toolbar.model": "noreverse bold #ffffff bg:#000000",
                 "toolbar.ctx.bar": "noreverse #22c55e bg:#000000",
                 "toolbar.ctx.value": "noreverse #ffffff bg:#000000",
+                "toolbar.cache": "noreverse bold #22d3ee bg:#000000",
                 "toolbar.cwd.value": "noreverse #c084fc bg:#000000",
                 "toolbar.mode.default": "noreverse bold #22c55e bg:#000000",
                 "toolbar.mode.auto": "noreverse bold #f59e0b bg:#000000",
@@ -236,15 +238,34 @@ async def _handle_slash(
         console.print("\n".join(SLASH_COMMANDS))
     elif command == "/clear":
         agent.clear_history()
+        renderer.reset_session_stats()
         console.clear()
     elif command == "/context":
         memories = MemoryManager(config.memory.long_term_db_path, scope=cwd).list(limit=5)
+        session_id = agent.session_id or "not started"
+        session_state = (
+            agent.session_store.state(session_id)
+            if agent.session_store is not None and agent.session_id is not None
+            else None
+        )
+        estimated_tokens = sum(estimate_message_tokens(message) for message in agent.history)
         table = Table(title="PaiCLI Context")
         table.add_column("Field")
         table.add_column("Value")
+        table.add_row("session", session_id)
+        if session_state:
+            table.add_row(
+                "turn / step",
+                f"{session_state.active_turn_id or '-'} / {session_state.active_step_id or '-'}",
+            )
+            table.add_row("last event", str(session_state.last_sequence))
+            table.add_row("compaction", session_state.latest_compaction_id or "none")
         table.add_row("cwd", cwd)
         table.add_row("model", f"{config.llm.model} ({config.llm.provider})")
         table.add_row("context window", str(agent.llm_client.max_context_window))
+        table.add_row(
+            "visible messages / est. tokens", f"{len(agent.history)} / {estimated_tokens}"
+        )
         table.add_row("render", config.render_mode)
         table.add_row("memory", f"{len(memories)} recent entries")
         table.add_row("tools", str(len(registry.list_names())))
@@ -286,16 +307,19 @@ async def _handle_slash(
         if not arg:
             console.print("[red]Usage:[/red] /plan <task>")
         else:
-            plan_agent = PlanExecuteAgent(
+            session_id = agent._ensure_session()
+            query = QueryEngine(
                 llm_client=agent.llm_client,
                 tool_registry=registry,
                 config=config,
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
+                session_store=agent.session_store,
+                session_id=session_id,
             )
             await _run_events(
-                plan_agent.run(arg),
-                RichRenderer(),
+                query.plan(arg),
+                renderer,
                 agent.llm_client.max_context_window,
             )
     elif command == "/team":
@@ -307,17 +331,19 @@ async def _handle_slash(
             except ValueError as exc:
                 console.print(f"[red]{exc}[/red]")
                 return False
-            orchestrator = AgentOrchestrator(
+            session_id = agent._ensure_session()
+            query = QueryEngine(
                 llm_client=agent.llm_client,
                 tool_registry=registry,
                 config=config,
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
-                default_worker_mode=worker_mode,
+                session_store=agent.session_store,
+                session_id=session_id,
             )
             await _run_events(
-                orchestrator.run(team_task),
-                RichRenderer(),
+                query.team(team_task, worker_mode=worker_mode),
+                renderer,
                 agent.llm_client.max_context_window,
             )
     elif command == "/model":
@@ -644,7 +670,8 @@ def _approval_prompt(
         return "deny"
     console.print(
         f"[yellow]Approval required[/yellow] {request['tool_name']} "
-        f"({request['danger_level']})\n{request['input']}"
+        f"({request['danger_level']}) by {request.get('agent_id', 'root')} "
+        f"at {request.get('cwd', 'unknown cwd')}\n{request['input']}"
     )
     answer = Prompt.ask("Approve?", choices=["y", "n", "a", "s"], default="n")
     if answer == "a":
@@ -762,12 +789,15 @@ def _bottom_toolbar(
     has_usage = bool(stats.get("has_usage"))
     context_ratio = float(stats.get("context_ratio") or 0)
     context_text = _format_toolbar_percent(context_ratio) if has_usage else "0%"
+    cache_text = _format_cache_rate(stats.get("cache_hit_rate"))
     return [
         ("class:toolbar.model", model),
         ("class:toolbar.gap", "    "),
         ("class:toolbar.ctx.bar", _format_toolbar_bar(context_ratio if has_usage else 0)),
         ("class:toolbar.gap", " "),
         ("class:toolbar.ctx.value", context_text),
+        ("class:toolbar.gap", "  "),
+        ("class:toolbar.cache", f"Cache hit {cache_text}"),
         ("class:toolbar.gap", "  "),
         ("class:toolbar.cwd.value", _shorten_home(cwd)),
         ("class:toolbar.gap", "  "),
@@ -802,6 +832,16 @@ def _format_toolbar_bar(value: float, *, width: int = 12) -> str:
 
 
 def _format_toolbar_percent(value: float) -> str:
+    if value <= 0:
+        return "0%"
+    if value < 0.01:
+        return "<1%"
+    return f"{value:.0%}"
+
+
+def _format_cache_rate(value: float | None) -> str:
+    if value is None:
+        return "—"
     if value <= 0:
         return "0%"
     if value < 0.01:

@@ -40,7 +40,7 @@ class PlanExecuteAgent:
         cwd: str,
         approval_callback=None,
         planner: Planner | None = None,
-        max_task_turns: int = 8,
+        max_task_turns: int | None = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry

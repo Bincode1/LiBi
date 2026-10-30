@@ -31,6 +31,11 @@ class RichRenderer:
         self._context_window = context_window or 0
         self._input_tokens = 0
         self._output_tokens = 0
+        self._cache_hit_tokens = 0
+        self._cache_miss_tokens = 0
+        self._cache_write_tokens = 0
+        self._cache_context_tokens = 0
+        self._run_saw_usage_event = False
         self._last_input_tokens = 0
         self._last_turns = 0
         self._last_total_tokens = 0
@@ -49,12 +54,31 @@ class RichRenderer:
         self._input_tokens = 0
         self._output_tokens = 0
         self._last_input_tokens = 0
+        self._run_saw_usage_event = False
+
+    def reset_session_stats(self) -> None:
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._cache_hit_tokens = 0
+        self._cache_miss_tokens = 0
+        self._cache_write_tokens = 0
+        self._cache_context_tokens = 0
+        self._last_input_tokens = 0
+        self._last_turns = 0
+        self._last_total_tokens = 0
+        self._last_context_ratio = 0.0
+        self._last_has_usage = False
 
     def toolbar_status(self) -> dict[str, Any]:
         return {
             "turns": self._last_turns,
             "input_tokens": self._input_tokens,
             "output_tokens": self._output_tokens,
+            "cache_hit_tokens": self._cache_hit_tokens,
+            "cache_miss_tokens": self._cache_miss_tokens,
+            "cache_write_tokens": self._cache_write_tokens,
+            "cache_context_tokens": self._cache_context_tokens,
+            "cache_hit_rate": self._cache_hit_rate(),
             "total_tokens": self._last_total_tokens,
             "context_ratio": self._last_context_ratio,
             "has_usage": self._last_has_usage,
@@ -121,7 +145,12 @@ class RichRenderer:
                 )
             )
         elif event_type == "usage":
+            self._run_saw_usage_event = True
             self._record_usage(event.get("usage") or {})
+        elif event_type == "context_summary":
+            self._flush_thinking()
+            self._flush_markdown(title="Assistant Output")
+            self._print_context_summary(event)
         elif event_type == "turn_complete":
             stop_reason = str(event.get("stop_reason") or "end_turn")
             title = "Assistant Output" if stop_reason == "tool_use" else "Final Output"
@@ -140,6 +169,8 @@ class RichRenderer:
             self._flush_markdown(title="Assistant Output")
             self.console.print(f"[red]Error:[/red] {event.get('error')}")
         elif event_type == "done":
+            if not self._run_saw_usage_event:
+                self._record_usage(event.get("usage") or {})
             self._flush_thinking()
             self._flush_markdown(title="Final Output")
             self._record_run_summary(event)
@@ -247,8 +278,24 @@ class RichRenderer:
         output_tokens = int(usage.get("output_tokens") or 0)
         self._input_tokens += input_tokens
         self._output_tokens += output_tokens
+        self._cache_hit_tokens += int(usage.get("cache_hit_tokens") or 0)
+        self._cache_miss_tokens += int(usage.get("cache_miss_tokens") or 0)
+        self._cache_write_tokens += int(usage.get("cache_write_tokens") or 0)
+        cache_context = usage.get("cache_context_tokens")
+        if cache_context is None:
+            cache_context = int(usage.get("input_tokens") or 0) or (
+                int(usage.get("cache_hit_tokens") or 0)
+                + int(usage.get("cache_miss_tokens") or 0)
+                + int(usage.get("cache_write_tokens") or 0)
+            )
+        self._cache_context_tokens += int(cache_context or 0)
         if input_tokens:
             self._last_input_tokens = input_tokens
+
+    def _cache_hit_rate(self) -> float | None:
+        if not self._cache_context_tokens:
+            return None
+        return min(1.0, self._cache_hit_tokens / self._cache_context_tokens)
 
     def _print_tool_call(self, event: dict[str, Any]) -> None:
         name = str(event.get("name") or "unknown")
@@ -265,6 +312,21 @@ class RichRenderer:
                 border_style="#facc15",
             )
         )
+
+    def _print_context_summary(self, event: dict[str, Any]) -> None:
+        roles = event.get("role_counts") or {}
+        role_text = ", ".join(f"{name} {count}" for name, count in sorted(roles.items()))
+        tokens = int(event.get("estimated_input_tokens") or 0)
+        window = int(event.get("context_window") or 0)
+        ratio = f"{tokens / window:.0%}" if window else "unknown"
+        details = (
+            f"step {event.get('step_id', '-')}: {event.get('message_count', 0)} messages"
+            f" ({role_text or 'empty'}), {event.get('tool_count', 0)} tools, "
+            f"~{tokens:,} input tokens / {ratio} of context window"
+        )
+        if event.get("compaction_id"):
+            details += "; compacted history"
+        self.console.print(Text(f"Context · {details}", style="dim"))
 
     def _print_tool_result(self, event: dict[str, Any]) -> None:
         is_error = bool(event.get("is_error"))

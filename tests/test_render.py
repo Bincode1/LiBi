@@ -119,12 +119,19 @@ def test_bottom_toolbar_uses_runtime_summary_segments():
     toolbar = _bottom_toolbar(
         "/Users/me/project",
         "deepseek-v4-flash",
-        {"turns": 1, "total_tokens": 13187, "context_ratio": 0.013, "has_usage": True},
+        {
+            "turns": 1,
+            "total_tokens": 13187,
+            "context_ratio": 0.013,
+            "cache_hit_rate": 0.97,
+            "has_usage": True,
+        },
     )
 
     assert ("class:toolbar.model", "deepseek-v4-flash") in toolbar
     assert ("class:toolbar.ctx.bar", "█░░░░░░░░░░░") in toolbar
     assert ("class:toolbar.ctx.value", "1%") in toolbar
+    assert ("class:toolbar.cache", "Cache hit 97%") in toolbar
     assert ("class:toolbar.cwd.value", "/Users/me/project") in toolbar
     assert not any(text == " TURN " for _style, text in toolbar)
     assert not any("Token" in text for _style, text in toolbar)
@@ -177,6 +184,32 @@ def test_interleaved_thinking_does_not_repeat_assistant_output_panels():
     assert output.count("Final Output") == 1
     assert output.count("Thinking") == 1
     assert "第一段第二段" in output
+
+
+def test_context_summary_shows_request_shape_without_prompt_contents():
+    stream = StringIO()
+    renderer = RichRenderer(console=Console(file=stream, color_system=None, width=120))
+
+    renderer.handle(
+        {
+            "type": "context_summary",
+            "step_id": "step_1",
+            "message_count": 4,
+            "role_counts": {"assistant": 1, "user": 2, "tool": 1},
+            "tool_count": 9,
+            "estimated_input_tokens": 800,
+            "context_window": 4000,
+            "compaction_id": "compact_1",
+        }
+    )
+
+    output = stream.getvalue()
+    assert "Context" in output
+    assert "4 messages" in output
+    assert "9 tools" in output
+    assert "800 input tokens / 20%" in output
+    assert "compacted history" in output
+    assert "system prompt" not in output
 
 
 def test_plan_status_and_scoped_thinking_render_with_task_identity():
@@ -270,9 +303,29 @@ def test_start_run_resets_token_usage():
     console = Console(file=stream, color_system=None, width=120)
     renderer = RichRenderer(console=console, context_window=1000)
 
-    renderer.handle({"type": "usage", "usage": {"input_tokens": 900, "output_tokens": 10}})
+    renderer.handle(
+        {
+            "type": "usage",
+            "usage": {
+                "input_tokens": 900,
+                "output_tokens": 10,
+                "cache_hit_tokens": 700,
+                "cache_miss_tokens": 200,
+            },
+        }
+    )
     renderer.start_run()
-    renderer.handle({"type": "usage", "usage": {"input_tokens": 100, "output_tokens": 20}})
+    renderer.handle(
+        {
+            "type": "usage",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_hit_tokens": 50,
+                "cache_miss_tokens": 50,
+            },
+        }
+    )
     renderer.handle({"type": "done", "total_turns": 1, "total_tokens": 120})
 
     assert "900" not in stream.getvalue()
@@ -281,6 +334,51 @@ def test_start_run_resets_token_usage():
     assert stats["output_tokens"] == 20
     assert stats["total_tokens"] == 120
     assert stats["context_ratio"] == 0.1
+    assert stats["cache_hit_tokens"] == 750
+    assert stats["cache_miss_tokens"] == 250
+    assert stats["cache_hit_rate"] == 0.75
+
+
+def test_clear_session_stats_resets_cache_hit_rate():
+    renderer = RichRenderer(context_window=1000)
+    renderer.handle(
+        {
+            "type": "usage",
+            "usage": {"cache_hit_tokens": 75, "cache_miss_tokens": 25},
+        }
+    )
+
+    renderer.reset_session_stats()
+
+    assert renderer.toolbar_status()["cache_hit_rate"] is None
+
+
+def test_cache_hit_rate_counts_write_tokens_in_context_denominator():
+    renderer = RichRenderer()
+    renderer.handle(
+        {
+            "type": "usage",
+            "usage": {
+                "cache_hit_tokens": 600,
+                "cache_miss_tokens": 1_000,
+                "cache_write_tokens": 400,
+            },
+        }
+    )
+
+    stats = renderer.toolbar_status()
+    assert stats["cache_hit_tokens"] == 600
+    assert stats["cache_miss_tokens"] == 1_000
+    assert stats["cache_write_tokens"] == 400
+    assert stats["cache_hit_rate"] == 0.3
+
+
+def test_cache_hit_rate_is_token_weighted_across_usage_events():
+    renderer = RichRenderer()
+    renderer.handle({"type": "usage", "usage": {"cache_hit_tokens": 90, "cache_miss_tokens": 10}})
+    renderer.handle({"type": "usage", "usage": {"cache_hit_tokens": 0, "cache_miss_tokens": 900}})
+
+    assert renderer.toolbar_status()["cache_hit_rate"] == 0.09
 
 
 def test_missing_usage_keeps_toolbar_tokens_unavailable():
@@ -295,3 +393,4 @@ def test_missing_usage_keeps_toolbar_tokens_unavailable():
     assert ("class:toolbar.model", "deepseek-v4-flash") in toolbar
     assert ("class:toolbar.ctx.bar", "░░░░░░░░░░░░") in toolbar
     assert ("class:toolbar.ctx.value", "0%") in toolbar
+    assert ("class:toolbar.cache", "Cache hit —") in toolbar

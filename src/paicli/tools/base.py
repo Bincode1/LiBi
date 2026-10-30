@@ -27,6 +27,8 @@ class ToolContext:
         None
     )
     skill_context_buffer: Any | None = None
+    session_store: Any | None = None
+    session_id: str | None = None
 
 
 @dataclass(slots=True)

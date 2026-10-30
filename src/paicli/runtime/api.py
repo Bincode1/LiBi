@@ -5,17 +5,20 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import aclosing
 from dataclasses import asdict
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from paicli.agent import QueryEngine
 from paicli.bootstrap import build_tool_registry
 from paicli.config import PaiCliConfig
 from paicli.llm import create_llm_client
 from paicli.runtime.tasks import TASK_MODES, DurableTaskManager, TaskRecord
+from paicli.session import ContextProjector, SessionStore
 from paicli.types import Message
 
 
@@ -45,6 +48,9 @@ class RuntimeApiServer:
         self.workers = workers
         self._stop = threading.Event()
         self._ensure_schema()
+        self.session_store = SessionStore(
+            self.db_path, sensitive_values=(api_key, config.llm.api_key)
+        )
 
     def serve_forever(self) -> None:
         self._start_workers()
@@ -113,7 +119,13 @@ class RuntimeApiServer:
                 _send_json(request, 200, result)
             elif method == "GET" and path.startswith("/v1/threads/") and path.endswith("/events"):
                 thread_id = path.split("/")[3]
-                self._send_events(request, thread_id)
+                query_cursor = parse_qs(request.path.partition("?")[2]).get("cursor", [None])[0]
+                cursor = query_cursor or request.headers.get("last-event-id") or "0"
+                try:
+                    after_sequence = max(0, int(cursor))
+                except ValueError as exc:
+                    raise ValueError("cursor must be a non-negative integer") from exc
+                self._send_events(request, thread_id, after_sequence=after_sequence)
             elif method == "POST" and path == "/v1/tasks":
                 prompt = str(body.get("message") or body.get("prompt") or "")
                 if not prompt:
@@ -143,36 +155,45 @@ class RuntimeApiServer:
     ) -> dict[str, Any]:
         self._ensure_llm_key()
         mode = _validate_mode(mode)
-        self._append_event(thread_id, "turn.started", {"message": message, "mode": mode})
+        self._append_event(thread_id, "turn.started", {"mode": mode})
         registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
         engine = QueryEngine(
             llm_client=create_llm_client(self.config.llm),
             tool_registry=registry,
             config=self.config,
             cwd=self.cwd,
+            session_store=self.session_store,
+            session_id=thread_id,
         )
         history = self._thread_history(thread_id) if mode == "react" else []
         text = ""
         events = _engine_events(engine, mode, message, history=history)
         total_tokens = 0
-        async for event in events:
-            event_type = str(event.get("type"))
-            if event_type == "text_delta":
-                text += str(event.get("text") or "")
-                self._append_event(thread_id, "message.delta", {"text": event.get("text") or ""})
-            elif event_type in {"tool_call", "tool_result", "error", "done"}:
-                self._append_event(thread_id, event_type, _jsonable(event))
-                if event_type == "error":
-                    raise event["error"]
-                if event_type == "done":
-                    total_tokens = int(event.get("total_tokens") or 0)
-        self._append_thread_message(thread_id, "user", message)
-        self._append_thread_message(thread_id, "assistant", text)
+        async with aclosing(events):
+            async for event in events:
+                event_type = str(event.get("type"))
+                if event_type == "text_delta":
+                    text += str(event.get("text") or "")
+                elif event_type in {"tool_call", "tool_result", "error", "done"}:
+                    safe_event = _runtime_event_payload(event)
+                    self._append_event(thread_id, event_type, safe_event)
+                    if event_type == "error":
+                        self._append_event(
+                            thread_id,
+                            "turn.failed",
+                            {"error_type": safe_event.get("error_type", "RuntimeError")},
+                        )
+                        raise RuntimeError(
+                            str(safe_event.get("error_type") or "Runtime turn failed")
+                        )
+                    if event_type == "done":
+                        total_tokens = int(event.get("total_tokens") or 0)
         self._append_event(
             thread_id,
             "turn.completed",
-            {"text": text, "mode": mode, "total_tokens": total_tokens},
+            {"mode": mode, "total_tokens": total_tokens},
         )
+        self._sync_thread_messages(thread_id)
         return {
             "thread_id": thread_id,
             "text": text,
@@ -228,13 +249,15 @@ class RuntimeApiServer:
             cwd=self.cwd,
         )
         text = ""
-        async for event in _engine_events(engine, task.mode, task.prompt):
-            if self.task_manager.is_canceled(task.id):
-                raise TaskCanceledError(task.id)
-            if event.get("type") == "text_delta":
-                text += str(event.get("text") or "")
-            elif event.get("type") == "error":
-                raise event["error"]
+        events = _engine_events(engine, task.mode, task.prompt)
+        async with aclosing(events):
+            async for event in events:
+                if self.task_manager.is_canceled(task.id):
+                    raise TaskCanceledError(task.id)
+                if event.get("type") == "text_delta":
+                    text += str(event.get("text") or "")
+                elif event.get("type") == "error":
+                    raise event["error"]
         return text
 
     def _ensure_llm_key(self) -> None:
@@ -256,34 +279,87 @@ class RuntimeApiServer:
                 (thread_id, datetime.now(UTC).isoformat()),
             )
         self._append_event(thread_id, "thread.created", {"id": thread_id})
+        self.session_store.create_session(thread_id)
+        self.session_store.append(thread_id, "session/created", {"id": thread_id}, source="runtime")
         return thread_id
 
     def _append_event(self, thread_id: str, event_type: str, payload: dict[str, Any]) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                insert into events(thread_id, type, payload, created_at)
-                values (?, ?, ?, ?)
-                """,
-                (
-                    thread_id,
-                    event_type,
-                    json.dumps(payload, ensure_ascii=False),
-                    datetime.now(UTC).isoformat(),
-                ),
-            )
+        safe_payload = self.session_store.sanitize_payload(payload)
+        self.session_store.append(
+            thread_id,
+            f"runtime/{event_type}",
+            safe_payload,
+            source="runtime-compat",
+        )
 
     def _append_thread_message(self, thread_id: str, role: str, content: str) -> None:
+        safe_content = (
+            str(self.session_store.sanitize_payload({"content": content})["content"])
+            if hasattr(self, "session_store")
+            else content
+        )
         with self._connect() as conn:
             conn.execute(
                 """
                 insert into messages(thread_id, role, content, created_at)
                 values (?, ?, ?, ?)
                 """,
-                (thread_id, role, content, datetime.now(UTC).isoformat()),
+                (thread_id, role, safe_content, datetime.now(UTC).isoformat()),
+            )
+
+    def _sync_thread_messages(self, thread_id: str) -> None:
+        history = self._thread_history(thread_id)
+        serialized = [
+            (
+                thread_id,
+                item.role,
+                item.content if isinstance(item.content, str) else json.dumps(item.content),
+                datetime.now(UTC).isoformat(),
+            )
+            for item in history
+        ]
+        with self._connect() as conn:
+            conn.execute("begin immediate")
+            conn.execute("delete from messages where thread_id = ?", (thread_id,))
+            conn.executemany(
+                "insert into messages(thread_id, role, content, created_at) values (?, ?, ?, ?)",
+                serialized,
             )
 
     def _thread_history(self, thread_id: str, limit: int = 100) -> list[Message]:
+        if hasattr(self, "session_store"):
+            events = self.session_store.events(thread_id)
+            turns = [
+                event.turn_id
+                for event in events
+                if event.event_type == "user/message" and event.turn_id is not None
+            ]
+            if turns:
+                turn_id = next(
+                    (
+                        event.turn_id
+                        for event in reversed(events)
+                        if event.event_type == "turn/completed" and event.turn_id
+                    ),
+                    None,
+                )
+                if turn_id is None:
+                    return []
+                steps = [
+                    event.step_id
+                    for event in events
+                    if event.event_type == "step/completed"
+                    and event.turn_id == turn_id
+                    and event.step_id
+                ]
+                if steps:
+                    view = ContextProjector().project(
+                        events,
+                        session_id=thread_id,
+                        turn_id=turn_id,
+                        step_id=steps[-1],
+                    )
+                    return list(view.messages[-limit:])
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -297,19 +373,27 @@ class RuntimeApiServer:
             ).fetchall()
         return [Message(role=role, content=content) for role, content in reversed(rows)]
 
-    def _send_events(self, request: BaseHTTPRequestHandler, thread_id: str) -> None:
+    def _send_events(
+        self,
+        request: BaseHTTPRequestHandler,
+        thread_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> None:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                select type, payload, created_at
+                select id, sequence, type, payload, created_at
                 from events
-                where thread_id = ?
+                where thread_id = ? and (sequence > ? or ? = 0)
                 order by id
                 """,
-                (thread_id,),
+                (thread_id, after_sequence, after_sequence),
             ).fetchall()
         body = "".join(
-            f"event: {event_type}\ndata: {payload}\n\n" for event_type, payload, _created_at in rows
+            f"id: {sequence if sequence is not None else event_id}\nevent: {event_type}\n"
+            f"data: {payload}\n\n"
+            for event_id, sequence, event_type, payload, _created_at in rows
         ).encode("utf-8")
         request.send_response(200)
         request.send_header("content-type", "text/event-stream")
@@ -352,6 +436,19 @@ class RuntimeApiServer:
                 )
                 """
             )
+            columns = {row[1] for row in conn.execute("pragma table_info(events)")}
+            for column, column_type in {
+                "event_id": "text",
+                "sequence": "integer",
+                "turn_id": "text",
+                "step_id": "text",
+                "tool_call_id": "text",
+                "approval_id": "text",
+                "source": "text",
+                "schema_version": "integer",
+            }.items():
+                if column not in columns:
+                    conn.execute(f"alter table events add column {column} {column_type}")
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
@@ -385,6 +482,32 @@ def _jsonable(event: dict[str, Any]) -> dict[str, Any]:
         else:
             result[key] = str(value)
     return result
+
+
+def _runtime_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type") or "unknown")
+    if event_type == "error":
+        return {"type": event_type, "error_type": type(event.get("error")).__name__}
+    if event_type == "done":
+        return {
+            key: event[key]
+            for key in ("type", "total_turns", "total_tokens", "usage", "session_id", "turn_id")
+            if key in event
+        }
+    if event_type == "tool_call":
+        return {
+            "type": event_type,
+            "name": event.get("name"),
+            "input": event.get("input", {}),
+            "tool_call_id": event.get("tool_call_id"),
+        }
+    return {
+        "type": event_type,
+        "name": event.get("name"),
+        "result": event.get("result", ""),
+        "is_error": bool(event.get("is_error")),
+        "tool_call_id": event.get("tool_call_id"),
+    }
 
 
 def runtime_api_key(explicit: str | None = None) -> str:

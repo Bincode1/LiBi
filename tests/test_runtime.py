@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import threading
 
 from paicli.config import load_config
 from paicli.runtime import DurableTaskManager
 from paicli.runtime.api import RuntimeApiServer, _engine_events
+from paicli.session import SessionStore
 
 
 def test_durable_task_lifecycle(tmp_path):
@@ -112,6 +114,108 @@ def test_runtime_thread_history_persists_between_turns(tmp_path, monkeypatch):
         ("user", "first question"),
         ("assistant", "first answer"),
     ]
+
+
+def test_runtime_event_sse_resumes_after_cursor(tmp_path):
+    class Request:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+            self.headers = []
+            self.status = None
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            self.headers.append((key, value))
+
+        def end_headers(self):
+            pass
+
+    server = RuntimeApiServer.__new__(RuntimeApiServer)
+    server.db_path = tmp_path / "runtime.db"
+    server._ensure_schema()
+    server.session_store = SessionStore(server.db_path)
+    first = server.session_store.append("thread-a", "turn/started", {}, source="runtime")
+    second = server.session_store.append("thread-a", "turn/completed", {}, source="runtime")
+    request = Request()
+
+    server._send_events(request, "thread-a", after_sequence=first.sequence)
+
+    body = request.wfile.getvalue().decode("utf-8")
+    assert request.status == 200
+    assert f"id: {second.sequence}\nevent: turn/completed" in body
+    assert "turn/started" not in body
+
+
+def test_runtime_events_accepts_last_event_id_header(tmp_path):
+    class Request:
+        command = "GET"
+        path = "/v1/threads/thread-a/events"
+        headers = {"last-event-id": "1", "content-length": "0"}
+
+        def __init__(self):
+            self.rfile = io.BytesIO()
+            self.wfile = io.BytesIO()
+            self.status = None
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, _key, _value):
+            pass
+
+        def end_headers(self):
+            pass
+
+    server = RuntimeApiServer.__new__(RuntimeApiServer)
+    server.db_path = tmp_path / "runtime.db"
+    server._ensure_schema()
+    server.session_store = SessionStore(server.db_path)
+    server.session_store.append("thread-a", "turn/started", {}, source="runtime")
+    second = server.session_store.append("thread-a", "turn/completed", {}, source="runtime")
+    server._authorized = lambda _request: True
+    request = Request()
+
+    server._handle(request)
+
+    body = request.wfile.getvalue().decode("utf-8")
+    assert request.status == 200
+    assert f"id: {second.sequence}\nevent: turn/completed" in body
+    assert "turn/started" not in body
+
+
+def test_runtime_history_sync_keeps_legacy_messages_when_projection_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    server = RuntimeApiServer(
+        cwd=str(tmp_path),
+        config=load_config(project_root=tmp_path),
+        api_key="test-key",
+        workers=1,
+    )
+    thread_id = server._create_thread()
+    server._append_thread_message(thread_id, "user", "legacy")
+    server.session_store.append(thread_id, "turn/started", {}, turn_id="turn-a")
+    server.session_store.append(thread_id, "user/message", {"content": "new"}, turn_id="turn-a")
+    server.session_store.append(thread_id, "turn/completed", {}, turn_id="turn-a")
+    server.session_store.append(thread_id, "step/completed", {}, turn_id="turn-a", step_id="step-a")
+
+    def fail_projection(*args, **kwargs):
+        raise ValueError("projection failed")
+
+    server.session_store.events = fail_projection
+    try:
+        server._sync_thread_messages(thread_id)
+    except ValueError as exc:
+        assert "projection failed" in str(exc)
+    else:
+        raise AssertionError("projection failure was swallowed")
+
+    with server._connect() as conn:
+        rows = conn.execute(
+            "select role, content from messages where thread_id = ?", (thread_id,)
+        ).fetchall()
+    assert rows == [("user", "legacy")]
 
 
 def test_runtime_routes_react_plan_and_team_modes():

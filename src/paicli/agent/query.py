@@ -27,7 +27,7 @@ async def query(
     config: PaiCliConfig,
     approval_callback=None,
     skill_context_buffer=None,
-    max_turns: int = 20,
+    max_turns: int | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     original_user_message = user_message
     user_message = _prepend_skill_candidates(user_message, cwd, config)
@@ -68,7 +68,7 @@ async def query(
     total_usage = Usage()
     turn = 0
 
-    while turn < max_turns:
+    while max_turns is None or turn < max_turns:
         turn += 1
         text = ""
         thinking = ""
@@ -171,6 +171,15 @@ async def query(
                     ),
                 )
             )
+
+    if max_turns is not None and turn >= max_turns and tool_calls:
+        yield {
+            "type": "error",
+            "error": RuntimeError(
+                f"Agent reached its {max_turns}-step limit before producing a final answer."
+            ),
+        }
+        return
 
     done_event: dict[str, Any] = {
         "type": "done",
