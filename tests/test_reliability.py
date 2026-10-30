@@ -311,7 +311,7 @@ def test_observation_queues_are_bounded_isolated_and_report_gaps():
                 {
                     "type": "subagent_event",
                     "parent_id": "a",
-                    "event": {"type": "text_delta", "text": str(index)},
+                    "event": {"type": "tool_result", "result": str(index)},
                 }
             )
         manager._publish_event(
@@ -324,7 +324,8 @@ def test_observation_queues_are_bounded_isolated_and_report_gaps():
         assert manager._events["a"].qsize() == 32
         assert (await manager.next_event("b"))["event"]["type"] == "ended"
         gap = await manager.next_event("a")
-        assert gap["event"] == {"type": "observation_gap", "dropped": 68}
+        assert gap["event"]["type"] == "observation_gap"
+        assert gap["event"]["dropped"] == 68
         assert len(manager.drain_events("a")) == 32
 
     asyncio.run(run())
@@ -354,6 +355,7 @@ def test_stream_redaction_across_every_split_and_exception_outputs(tmp_path, mon
         async with asyncio.timeout(3):
             while not child.settled:
                 await asyncio.sleep(0)
+        await manager.flush_observations()
         assert secret not in child.result
         assert secret not in json.dumps(captured)
         assert secret not in json.dumps(manager.drain_events("root"))
@@ -393,6 +395,7 @@ def test_observer_failure_keeps_delivery_and_persistence_failure_is_visible(tmp_
         deliveries = controller.collect_deliveries(defer_ack=True)
         assert len(deliveries) == 1
         controller.acknowledge_deliveries(deliveries)
+        await manager.flush_observations()
         with pytest.raises(RuntimeError, match="observation callback failed"):
             manager.raise_background_errors()
         await manager.drain()
@@ -470,6 +473,7 @@ def test_stream_limit_and_two_children_do_not_share_buffers(tmp_path, monkeypatc
             await manager.start({"description": name, "prompt": name}, ctx)
         for child in manager.activations.values():
             await wait_idle(child)
+        await manager.flush_observations()
         text = [e for e in captured if e["event"]["type"] == "text_delta"]
         assert len(text) == 2 and len({e["agent"] for e in text}) == 2
         assert all(e["event"]["text"] == "[redacted]" for e in text)
@@ -502,6 +506,7 @@ def test_interrupted_partial_stream_is_hidden_and_plain_renderer_shows_status(
         async with asyncio.timeout(2):
             while not child.settled:
                 await asyncio.sleep(0)
+        await manager.flush_observations()
         assert "unit-private-prefix" not in json.dumps(captured)
         renderer = PlainRenderer()
         for event in captured:

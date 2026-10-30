@@ -34,6 +34,7 @@ class ToolContext:
     session_id: str | None = None
     llm_client: Any | None = None
     tool_registry: Any | None = None
+    status_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
 
 @dataclass(slots=True)

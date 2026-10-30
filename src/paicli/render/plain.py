@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+from paicli.render.subagent_status import format_status
+
 
 class PlainRenderer:
     def __init__(self, *, print_events: bool = True):
@@ -15,6 +17,16 @@ class PlainRenderer:
             agent = str(event.get("agent") or "subagent")
             kind = str(inner.get("type") or "event")
             content = inner.get("text", inner.get("thinking", inner.get("result", "")))
+            if kind == "status":
+                return
+            if kind == "idle":
+                content = "waiting for instructions"
+            if kind == "phase_changed":
+                content = (
+                    "waiting for approval"
+                    if inner.get("waiting_reason") == "approval"
+                    else inner.get("phase", "unknown")
+                )
             if kind == "observation_gap":
                 content = f"{inner.get('dropped', 0)} events omitted"
             elif kind == "ended":
@@ -24,6 +36,9 @@ class PlainRenderer:
             elif kind == "error":
                 content = inner.get("error", "Child failed")
             sys.stdout.write(f"\n[{agent}:{kind}] {content}\n")
+            if kind == "observation_gap":
+                for snapshot in inner.get("snapshots", []):
+                    sys.stdout.write(format_status(snapshot) + "\n")
             sys.stdout.flush()
             return
         if event_type == "text_delta":

@@ -439,7 +439,12 @@ async def _agents_command(agent: Agent, arg: str, console: Console) -> None:
             item.id,
             str(item.status),
             details["provider"],
-            details["phase"],
+            (
+                f"waiting {details['waiting_reason']}"
+                if details["waiting_reason"]
+                else details["phase"]
+            )
+            + f" / {details['elapsed_seconds']:.1f}s",
             "-" if deadline is None else f"{deadline:.1f}s",
             f"{details['last_activity_seconds_ago']:.1f}s ago",
             item.description,

@@ -11,6 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from paicli.agent.subagent_events import ObservationBuffer, public_event
 from paicli.policy.redaction import Redactor
 from paicli.tools.base import ToolContext, ToolResult, object_schema
 
@@ -197,6 +198,14 @@ class Activation:
     event_sequence: int = 0
     stream_buffers: dict[str, str] = field(default_factory=dict)
     hidden_channels: set[str] = field(default_factory=set)
+    completed_runs: set[str] = field(default_factory=set)
+    ended_published: bool = False
+    waiting_tools: set[str] = field(default_factory=set)
+    pending_tools: dict[str, str] = field(default_factory=dict)
+    last_tool_result: str | None = None
+    diagnostic: dict[str, Any] | None = None
+    cleanup_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    finished_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -238,8 +247,11 @@ class SubagentManager:
         self._closed = False
         self.session_store: Any | None = None
         self._settlers: set[asyncio.Task[None]] = set()
-        self._events: dict[str, asyncio.Queue[dict[str, Any]]] = {}
-        self._observation_gaps: dict[str, int] = {}
+        self._events: dict[str, ObservationBuffer] = {}
+        self._callback_buffer = ObservationBuffer(max(32, event_queue_size))
+        self._observer_task: asyncio.Task[None] | None = None
+        self._observer_stopping = False
+        self._callback_busy = False
         self.redactor = Redactor()
         self.default_deadline = default_deadline
         self.event_queue_size = max(32, event_queue_size)
@@ -449,10 +461,7 @@ class SubagentManager:
             try:
                 await activation.provider_adapter.dispose(activation)
             except Exception as cleanup_exc:
-                activation.cleanup_error = _bounded_diagnostic(
-                    self.redactor.exception(cleanup_exc, "Provider cleanup failed")
-                )
-                self.settlement_error = cleanup_exc
+                self._cleanup_failure(activation, cleanup_exc, "Provider cleanup failed")
             activation.provider_disposed = True
             self.activations.pop(agent_id, None)
             self.depths.pop(agent_id, None)
@@ -524,31 +533,171 @@ class SubagentManager:
 
     def _offer_event(self, event: dict[str, Any]) -> None:
         parent_id = str(event.get("parent_id") or "root")
-        queue = self._events.setdefault(parent_id, asyncio.Queue(maxsize=self.event_queue_size))
-        if queue.full():
-            queue.get_nowait()
-            self._observation_gaps[parent_id] = self._observation_gaps.get(parent_id, 0) + 1
+        queue = self._events.setdefault(parent_id, ObservationBuffer(self.event_queue_size))
         queue.put_nowait(event)
 
     def _publish_event(self, event: dict[str, Any]) -> None:
-        event = self.redactor.clean(event)
         activation = self.activations.get(str(event.get("agent") or ""))
+        inner = event.get("event")
+        kind = inner.get("type") if isinstance(inner, dict) else None
         if activation is not None:
+            if kind == "turn_completed":
+                if activation.run_id in activation.completed_runs:
+                    return
+                activation.completed_runs.add(activation.run_id)
+            if kind == "ended":
+                if activation.ended_published:
+                    return
+                activation.ended_published = True
             activation.event_sequence += 1
-            event.update(
-                version=1,
-                run_id=activation.run_id,
-                seq=activation.event_sequence,
-                session_id=activation.session_id,
-            )
+            event = {
+                **event,
+                "run_id": activation.run_id,
+                "seq": activation.event_sequence,
+                "session_id": activation.session_id,
+                "agent_description": activation.description,
+            }
+        event = public_event(event, self.redactor)
         self._offer_event(event)
-        if self.event_callback is not None:
+        if self.event_callback is not None and not self._observer_stopping:
+            self._callback_buffer.put_nowait(event)
+            if self._observer_task is None or self._observer_task.done():
+                self._observer_task = asyncio.create_task(self._observe_callbacks())
+
+    def _gap_event(self, buffer: ObservationBuffer, parent_id: str | None = None):
+        dropped, coalesced = buffer.take_counts()
+        if not dropped:
+            return None
+        snapshots = [
+            self.describe_activation(item)
+            for item in self.activations.values()
+            if parent_id is None or item.parent_id == parent_id
+        ]
+        return public_event(
+            {
+                "parent_id": parent_id or "root",
+                "event": {
+                    "type": "observation_gap",
+                    "dropped": dropped,
+                    "coalesced": coalesced,
+                    "snapshots": snapshots,
+                },
+            },
+            self.redactor,
+        )
+
+    async def _observe_callbacks(self) -> None:
+        while not self._observer_stopping or not self._callback_buffer.empty():
             try:
-                self.event_callback(event)
+                event = await asyncio.wait_for(self._callback_buffer.get(), timeout=1.0)
+            except TimeoutError:
+                for activation in self.activations.values():
+                    if activation.status in _RESIDENT_STATES:
+                        self._publish_event(
+                            {
+                                "agent": activation.id,
+                                "parent_id": activation.parent_id,
+                                "event": {
+                                    "type": "status",
+                                    "snapshot": self.describe_activation(activation),
+                                },
+                            }
+                        )
+                continue
+            callback = self.event_callback
+            if callback is None:
+                continue
+            try:
+                self._callback_busy = True
+                gap = self._gap_event(self._callback_buffer)
+                for item in [gap, event] if gap else [event]:
+                    # Terminal rendering may block; serialize it off the Agent event loop.
+                    result = await asyncio.to_thread(callback, deepcopy(item))
+                    if asyncio.iscoroutine(result):
+                        await result
             except Exception as exc:
                 self.observation_error = RuntimeError(
                     self.redactor.exception(exc, "Observation failed")
                 )
+                self.event_callback = None
+                return
+            finally:
+                self._callback_busy = False
+
+    async def flush_observations(self) -> None:
+        while not self._callback_buffer.empty() or self._callback_busy:
+            if self._observer_task is None or self._observer_task.done():
+                break
+            await asyncio.sleep(0.001)
+
+    def _phase(self, activation: Activation, phase: str) -> None:
+        if activation.current_phase == phase:
+            return
+        activation.current_phase = phase
+        self._publish_event(
+            {
+                "agent": activation.id,
+                "parent_id": activation.parent_id,
+                "event": {
+                    "type": "phase_changed",
+                    "phase": phase,
+                    "waiting_reason": "approval" if activation.waiting_tools else None,
+                },
+            }
+        )
+
+    async def tool_status(self, agent_id: str, event: dict[str, Any]) -> None:
+        activation = self.activations.get(agent_id)
+        if activation is None:
+            return
+        activation.last_activity_at = time.monotonic()
+        call_id = event["tool_call_id"]
+        kind = event["type"]
+        if kind == "approval_waiting":
+            activation.waiting_tools.add(call_id)
+        elif kind == "approval_resolved":
+            activation.waiting_tools.discard(call_id)
+        elif kind == "tool_started":
+            activation.pending_tools[call_id] = event["tool_name"]
+        elif kind == "tool_finished":
+            activation.pending_tools.pop(call_id, None)
+            activation.waiting_tools.discard(call_id)
+            activation.last_tool_result = self.redactor.clean(event.get("summary", ""))[:500]
+        phase = (
+            "approval"
+            if activation.waiting_tools
+            else "tool"
+            if activation.pending_tools
+            else "model"
+        )
+        activation.current_phase = phase
+        self._publish_event(
+            {
+                "agent": activation.id,
+                "parent_id": activation.parent_id,
+                "event": {
+                    "type": "phase_changed",
+                    "phase": phase,
+                    "tool_name": event["tool_name"],
+                    "tool_call_id": call_id,
+                    "waiting_reason": "approval" if activation.waiting_tools else None,
+                },
+            }
+        )
+
+    def _cleanup_failure(self, activation: Activation, exc: Exception, action: str) -> None:
+        diagnostic = {
+            "code": "CHILD_CLEANUP_FAILED",
+            "category": "cleanup",
+            "message": self.redactor.exception(exc, action),
+            "exception_type": type(exc).__name__,
+            "retryable": False,
+        }
+        activation.cleanup_diagnostics.append(diagnostic)
+        activation.cleanup_error = _bounded_diagnostic(
+            "; ".join(item["message"] for item in activation.cleanup_diagnostics)
+        )
+        self.settlement_error = RuntimeError(diagnostic["message"])
 
     def _flush_streams(self, activation: Activation) -> None:
         for channel, text in activation.stream_buffers.items():
@@ -584,6 +733,8 @@ class SubagentManager:
                 "result_status": status,
                 "error_code": activation.error_code,
                 "content": result,
+                "diagnostic": activation.diagnostic,
+                "cleanup_diagnostics": activation.cleanup_diagnostics,
             },
             source="subagent-manager",
         )
@@ -615,12 +766,8 @@ class SubagentManager:
         async def forward(event: dict[str, Any]) -> None:
             activation.last_activity_at = time.monotonic()
             event_type = str(event.get("type") or "")
-            if event_type in {"tool_call", "tool_result"}:
-                activation.current_phase = "tool"
-            elif event_type in {"thinking_delta", "text_delta"}:
-                activation.current_phase = "model"
-            elif event_type == "approval":
-                activation.current_phase = "approval"
+            if event_type in {"text_delta", "thinking_delta", "context_summary"}:
+                self._phase(activation, "model")
             if event_type in {"text_delta", "thinking_delta"}:
                 key = "text" if event_type == "text_delta" else "thinking"
                 if event_type not in activation.hidden_channels:
@@ -630,12 +777,14 @@ class SubagentManager:
                         text = ""
                     activation.stream_buffers[event_type] = text
                 return
-            if event_type in {"turn_complete", "done", "error"}:
+            if event_type == "error":
+                activation.stream_buffers.clear()
+                activation.hidden_channels.clear()
+            elif event_type in {"turn_complete", "done"}:
                 self._flush_streams(activation)
             # done contains the full raw history; public observation only needs its summary.
             if event_type == "done":
-                event = {key: value for key, value in event.items() if key != "messages"}
-                event = {**event, "type": "turn_completed"}
+                return
             elif event_type == "error":
                 event = {
                     "type": "error",
@@ -692,24 +841,33 @@ class SubagentManager:
                 self._flush_streams(activation)
             activation.result = self.redactor.clean(result.text)
             usage = getattr(result, "usage", None)
-            activation.usage = usage.to_dict() if usage is not None else {}
+            if usage is not None:
+                for key, value in usage.to_dict().items():
+                    activation.usage[key] = activation.usage.get(key, 0) + value
             activation.result_available = True
             activation.delivered = False
-            activation.current_phase = "idle"
             if not activation.capabilities.continuable:
                 return result.text
             async with self._child_lock(agent_id):
                 self._create_delivery(activation, "completed", activation.result)
                 if activation.inbox.empty():
                     self.transition(activation, ActivationState.IDLE_WAITING)
+                    self._phase(activation, "idle")
+            self._publish_event(
+                {
+                    "agent": activation.id,
+                    "parent_id": activation.parent_id,
+                    "event": {"type": "turn_completed", "result": activation.result},
+                }
+            )
             self._publish_event(
                 {
                     "type": "subagent_event",
                     "event": {
                         "type": "idle"
                         if activation.status == ActivationState.IDLE_WAITING
-                        else "turn_completed",
-                        "result": activation.result,
+                        else "status",
+                        "snapshot": self.describe_activation(activation),
                     },
                     "agent": activation.id,
                     "parent_id": activation.parent_id,
@@ -723,7 +881,7 @@ class SubagentManager:
                 if activation.status != ActivationState.RUNNING:
                     raise RuntimeError("Child continuation has no capacity reservation.")
                 activation.run_id = f"run_{uuid.uuid4().hex}"
-            activation.current_phase = "starting"
+            self._phase(activation, "starting")
             activation.result_available = False
             self._publish_event(
                 {
@@ -748,7 +906,7 @@ class SubagentManager:
         except Exception as exc:
             self.settlement_error = exc
             activation = self.activations[agent_id]
-            activation.cleanup_error = self.redactor.exception(exc, "Settlement failed")
+            self._cleanup_failure(activation, exc, "Settlement failed")
             activation.settled = True
             async with self._condition:
                 self._condition.notify_all()
@@ -809,7 +967,14 @@ class SubagentManager:
                 self.transition(activation, ActivationState.STOPPING)
             self.transition(activation, ActivationState.TIMED_OUT)
         except Exception as exc:
-            activation.error_code = type(exc).__name__
+            activation.error_code = "CHILD_EXECUTION_FAILED"
+            activation.diagnostic = {
+                "code": activation.error_code,
+                "category": "execution",
+                "message": self.redactor.exception(exc, "Child execution failed"),
+                "exception_type": type(exc).__name__,
+                "retryable": False,
+            }
             activation.result = self.redactor.exception(exc, "Child execution failed")
             if activation.status == ActivationState.STOPPING:
                 self.transition(activation, self._stopped_state(activation))
@@ -827,14 +992,28 @@ class SubagentManager:
                 activation.provider_disposed = True
             except Exception as exc:
                 activation.provider_disposed = True
-                activation.cleanup_error = self.redactor.exception(exc, "Child cleanup failed")
-                self.settlement_error = exc
+                self._cleanup_failure(activation, exc, "Child cleanup failed")
         stop_reason = {
             ActivationState.COMPLETED: "completed",
             ActivationState.CANCELED: "aborted",
             ActivationState.DISPOSED: "aborted",
             ActivationState.TIMED_OUT: "timeout",
         }.get(activation.status, "error")
+        if stop_reason != "completed" and activation.diagnostic is None:
+            activation.diagnostic = {
+                "code": activation.error_code or "CHILD_EXECUTION_FAILED",
+                "category": "timeout"
+                if stop_reason == "timeout"
+                else "cancellation"
+                if stop_reason == "aborted"
+                else "execution",
+                "message": activation.result,
+                "exception_type": None,
+                "retryable": False,
+            }
+            activation.diagnostic["message"] = _bounded_diagnostic(
+                self.redactor.clean(activation.result)
+            )
         if activation.final_result is None:
             activation.final_result = SubagentResult(
                 output=activation.result,
@@ -859,9 +1038,20 @@ class SubagentManager:
                 },
                 source="subagent-manager",
             )
+            if activation.status == ActivationState.COMPLETED:
+                self._publish_event(
+                    {
+                        "agent": activation.id,
+                        "parent_id": activation.parent_id,
+                        "event": {"type": "turn_completed", "result": activation.result},
+                    }
+                )
         except Exception as exc:
-            activation.cleanup_error = self.redactor.exception(exc, "Delivery persistence failed")
-            self.settlement_error = exc
+            self._cleanup_failure(activation, exc, "Delivery persistence failed")
+        activation.finished_at = time.monotonic()
+        activation.pending_tools.clear()
+        activation.waiting_tools.clear()
+        activation.current_phase = "ended"
         self._publish_event(
             {
                 "type": "subagent_event",
@@ -869,6 +1059,7 @@ class SubagentManager:
                     "type": "ended",
                     "status": str(activation.status),
                     "cleanup_error": activation.cleanup_error,
+                    "diagnostic": activation.diagnostic,
                     "result": activation.result,
                     "error": activation.result,
                 },
@@ -1119,7 +1310,7 @@ class SubagentManager:
 
     @staticmethod
     def describe_activation(activation: Activation) -> dict[str, Any]:
-        elapsed = max(0.0, time.monotonic() - activation.started_at)
+        elapsed = max(0.0, (activation.finished_at or time.monotonic()) - activation.started_at)
         deadline_remaining = (
             max(0.0, activation.deadline_seconds - elapsed)
             if activation.deadline_seconds is not None
@@ -1142,6 +1333,16 @@ class SubagentManager:
             "run_id": activation.run_id,
             "event_sequence": activation.event_sequence,
             "cleanup_error": activation.cleanup_error,
+            "cleanup_diagnostics": list(activation.cleanup_diagnostics),
+            "diagnostic": activation.diagnostic,
+            "waiting_reason": "approval"
+            if activation.waiting_tools
+            else "instructions"
+            if activation.status == ActivationState.IDLE_WAITING
+            else None,
+            "pending_tool_ids": sorted(activation.pending_tools),
+            "pending_tools": dict(activation.pending_tools),
+            "last_tool_result": activation.last_tool_result,
             "capabilities": {
                 "continuable": activation.capabilities.continuable,
                 "queue_idle": activation.capabilities.queue_idle,
@@ -1156,7 +1357,7 @@ class SubagentManager:
                 "output_schema": activation.capabilities.output_schema,
                 "depth_limit": activation.capabilities.depth_limit,
             },
-            "usage": dict(activation.usage),
+            "usage": dict(activation.usage) if activation.usage else None,
             "error_code": activation.error_code,
         }
 
@@ -1169,25 +1370,24 @@ class SubagentManager:
         return ActivationState.CANCELED
 
     async def next_event(self, parent_id: str) -> dict[str, Any] | None:
-        gap = self._observation_gaps.pop(parent_id, 0)
+        queue = self._events.setdefault(parent_id, ObservationBuffer(self.event_queue_size))
+        gap = self._gap_event(queue, parent_id)
         if gap:
-            return {
-                "type": "subagent_event",
-                "parent_id": parent_id,
-                "event": {"type": "observation_gap", "dropped": gap},
-            }
-        queue = self._events.setdefault(parent_id, asyncio.Queue(maxsize=self.event_queue_size))
+            return gap
         if not self.active_for(parent_id) and queue.empty():
             return None
         return await queue.get()
 
     def drain_events(self, parent_id: str) -> list[dict[str, Any]]:
         queue = self._events.get(parent_id)
-        events: list[dict[str, Any]] = []
-        if queue is not None:
-            while not queue.empty():
-                events.append(queue.get_nowait())
-        self._observation_gaps.pop(parent_id, None)
+        if queue is None:
+            return []
+        events = []
+        gap = self._gap_event(queue, parent_id)
+        if gap:
+            events.append(gap)
+        while not queue.empty():
+            events.append(queue.get_nowait())
         return events
 
     def active_for(self, parent_id: str) -> list[Activation]:
@@ -1239,8 +1439,7 @@ class SubagentManager:
             try:
                 await activation.provider_adapter.dispose(activation)
             except Exception as exc:
-                activation.cleanup_error = self.redactor.exception(exc, "Child cleanup failed")
-                self.settlement_error = exc
+                self._cleanup_failure(activation, exc, "Child cleanup failed")
                 raise
             finally:
                 activation.provider_disposed = True
@@ -1252,10 +1451,7 @@ class SubagentManager:
         try:
             await adapter.interrupt(activation)
         except Exception as exc:
-            activation.cleanup_error = _bounded_diagnostic(
-                self.redactor.exception(exc, "Provider interruption failed")
-            )
-            self.settlement_error = exc
+            self._cleanup_failure(activation, exc, "Provider interruption failed")
             if not activation.task.done() and not activation.task.cancelling():
                 activation.task.cancel()
 
@@ -1349,7 +1545,14 @@ class SubagentManager:
     async def drain(self) -> None:
         try:
             async with asyncio.timeout(self.drain_timeout):
-                await self._drain()
+                try:
+                    await self._drain()
+                finally:
+                    self._observer_stopping = True
+                    await self.flush_observations()
+                    if self.observation_error is not None:
+                        self.observation_error = None
+                        raise RuntimeError("Subagent observation callback failed.") from None
         except TimeoutError:
             for activation in self.activations.values():
                 if not activation.settled:
@@ -1360,6 +1563,12 @@ class SubagentManager:
             raise TimeoutError(
                 f"Subagent drain exceeded {self.drain_timeout:.1f}s; cleanup remains active."
             ) from None
+
+        finally:
+            self._observer_stopping = True
+            if self._observer_task is not None and not self._observer_task.done():
+                self._observer_task.cancel()
+                await asyncio.gather(self._observer_task, return_exceptions=True)
 
     async def _drain(self) -> None:
         self._closed = True

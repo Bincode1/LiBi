@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 from rich import box
@@ -12,6 +13,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from paicli.render.subagent_status import format_status
+
 
 class RichRenderer:
     def __init__(
@@ -22,6 +25,7 @@ class RichRenderer:
         context_window: int | None = None,
     ):
         self.console = console or Console()
+        self._render_lock = threading.RLock()
         self._buffer: list[str] = []
         self._thinking_buffer: list[str] = []
         self._thinking_scope: str | None = None
@@ -117,6 +121,10 @@ class RichRenderer:
         self.console.print()
 
     def handle(self, event: dict[str, Any]) -> None:
+        with self._render_lock:
+            self._handle(event)
+
+    def _handle(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
         if event_type == "text_delta":
             self._flush_thinking()
@@ -387,6 +395,15 @@ class RichRenderer:
         agent = str(event.get("agent") or "subagent")
         inner = event.get("event") or {}
         kind = str(inner.get("type") or event.get("kind") or "event")
+        if kind == "status":
+            if self.console.is_terminal:
+                self.console.print(Text(format_status(inner.get("snapshot") or {}), style="dim"))
+            return
+        if kind == "phase_changed":
+            wait = inner.get("waiting_reason")
+            phase = "waiting for approval" if wait == "approval" else inner.get("phase", "unknown")
+            self.console.print(Text(f"[{agent}] {phase}", style="dim"))
+            return
         if kind == "ended":
             status = str(inner.get("status") or "unknown")
             cleanup = inner.get("cleanup_error")
@@ -405,9 +422,14 @@ class RichRenderer:
                     style="yellow",
                 )
             )
+            for snapshot in inner.get("snapshots", []):
+                self.console.print(Text(format_status(snapshot), style="dim"))
             return
         if kind == "turn_completed":
             self.console.print(Text(f"[{agent}] turn completed", style="dim"))
+            return
+        if kind == "idle":
+            self.console.print(Text(f"[{agent}] waiting for instructions", style="dim"))
             return
         if kind == "text_delta":
             self.console.print(

@@ -67,10 +67,35 @@ class ToolExecutor:
 
         audit = AuditLog(context.config.policy.audit_log_path)
         approver = "none"
+
+        async def notify(kind: str, **fields: Any) -> None:
+            if context.status_callback is not None:
+                await context.status_callback(
+                    {
+                        "type": kind,
+                        "tool_call_id": tool_call_id,
+                        "tool_name": name,
+                        **fields,
+                    }
+                )
+
+        await notify("tool_started")
+        summary = "Tool did not finish."
         try:
             data = tool.validate(payload)
-            decision = await self._approval_decision(tool, data, context)
+            approval = context.config.policy.hitl_mode
+            needs_approval = approval not in {"never"} and (
+                approval != "auto" or tool.requires_approval
+            )
+            if needs_approval:
+                await notify("approval_waiting")
+            try:
+                decision = await self._approval_decision(tool, data, context)
+            finally:
+                if needs_approval:
+                    await notify("approval_resolved")
             if decision in {"deny", "skip"}:
+                summary = f"Approval {decision}."
                 approver = "hitl"
                 audit.record(
                     tool_name=tool.name,
@@ -88,6 +113,7 @@ class ToolExecutor:
                 approver = "hitl"
 
             result = await tool.execute(data, context)
+            summary = result.content
             result.tool_use_id = tool_call_id
             if not tool.is_read_only and context.config.features.audit_log:
                 audit.record(
@@ -99,6 +125,7 @@ class ToolExecutor:
                 )
             return result
         except Exception as exc:  # noqa: BLE001 - tool errors must flow back to the model
+            summary = f"Tool failed ({type(exc).__name__})."
             if context.config.features.audit_log and tool and not tool.is_read_only:
                 audit.record(
                     tool_name=tool.name,
@@ -112,6 +139,8 @@ class ToolExecutor:
                 content=f'Tool "{name}" execution error: {exc}',
                 is_error=True,
             )
+        finally:
+            await notify("tool_finished", summary=summary)
 
     async def _approval_decision(
         self,

@@ -371,6 +371,9 @@ class Agent:
             session_id=session_id,
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
+            status_callback=(lambda event: self.subagent_manager.tool_status(self.agent_id, event))
+            if self.subagent_manager is not None
+            else None,
         )
 
         # Build the dynamic part of the system prompt (tool list, cwd, etc.).
