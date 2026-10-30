@@ -10,3 +10,18 @@ dist/
 build/
 .paicli/
 /.playwright-cli
+
+# Local credentials and environment overrides
+.env.*
+!.env.example
+
+# Local design documents and workspace reports
+/docs/
+/DIRECTORY_REPORT.md
+
+# Scratch files and command output
+/%TMPD%/
+/$null
+/test1.md
+/test2.md
+*.log
