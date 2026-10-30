@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import replace
+
 from paicli.tools.base import Tool
 
 
@@ -22,3 +25,18 @@ class ToolRegistry:
 
     def definitions(self) -> list[dict]:
         return [self._tools[name].definition() for name in self.list_names()]
+
+    def clone(self, *, allowed_names: set[str] | None = None) -> ToolRegistry:
+        cloned = ToolRegistry()
+        cloned._tools.update(
+            {
+                name: replace(
+                    tool,
+                    parameters=deepcopy(tool.parameters),
+                    required_keys=list(tool.required_keys),
+                )
+                for name, tool in self._tools.items()
+                if allowed_names is None or name in allowed_names
+            }
+        )
+        return cloned

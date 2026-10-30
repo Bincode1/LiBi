@@ -4,9 +4,7 @@ import asyncio
 import os
 import re
 import shlex
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
 
 from paicli.policy import CommandGuard
 
@@ -53,7 +51,9 @@ _WRITE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b(mkdir|touch|truncate)\b"),
     re.compile(r"\b(wget|curl)\s+.*[-]O\b"),
     re.compile(r"\b(git\s+push|git\s+commit|git\s+reset|git\s+rebase|git\s+merge)\b"),
-    re.compile(r"\b(pip|npm|brew|apt|yum|dnf|pacman)\s+(install|uninstall|remove|update|upgrade)\b"),
+    re.compile(
+        r"\b(pip|npm|brew|apt|yum|dnf|pacman)\s+(install|uninstall|remove|update|upgrade)\b"
+    ),
     re.compile(r"\b(kubectl|helm|docker|podman)\s+(apply|create|delete|run|exec|port-forward)\b"),
     re.compile(r"\b(>|>>)\s*[^\s]"),
     re.compile(r"\|.*\b(sh|bash)\b"),
@@ -298,7 +298,9 @@ class CommandExecutor:
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        return await self._handle_process(proc, _list_to_shell(cmd_parts), timeout, max_output_chars)
+        return await self._handle_process(
+            proc, _list_to_shell(cmd_parts), timeout, max_output_chars
+        )
 
     async def _handle_process(
         self,
@@ -310,6 +312,11 @@ class CommandExecutor:
         timed_out = False
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            raise
         except TimeoutError:
             proc.kill()
             await proc.wait()

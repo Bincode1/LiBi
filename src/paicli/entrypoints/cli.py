@@ -347,6 +347,8 @@ async def _run_prompt(
     except Exception as exc:  # noqa: BLE001 - CLI should report model/config errors cleanly
         typer.echo(f"Fatal error: {exc}", err=True)
         raise typer.Exit(1) from exc
+    finally:
+        await engine.aclose()
     if json_output:
         typer.echo(
             json.dumps(

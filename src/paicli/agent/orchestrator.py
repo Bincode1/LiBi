@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 from collections.abc import AsyncIterator
@@ -136,28 +137,36 @@ class SubAgent:
         *,
         mode: str | None = None,
         plan_depth: int = 0,
+        on_event=None,
     ) -> AgentMessage:
         content = f"{context}\n\nCurrent task:\n{task.content}".strip() if context else task.content
         if self.role == AgentRole.WORKER:
             selected_mode = _normalize_worker_mode(mode or self.default_mode)
             if selected_mode == AgentRunMode.PLAN:
-                return await self._execute_plan(content, plan_depth=plan_depth)
-            return await self._execute_worker(content)
-        return await self._execute_without_tools(content)
+                return await self._execute_plan(content, plan_depth=plan_depth, on_event=on_event)
+            return await self._execute_worker(content, on_event=on_event)
+        return await self._execute_without_tools(content, on_event=on_event)
 
-    async def review(self, original_task: str, execution_result: str) -> AgentMessage:
+    async def review(
+        self,
+        original_task: str,
+        execution_result: str,
+        *,
+        on_event=None,
+    ) -> AgentMessage:
         return await self.execute(
             AgentMessage.task(
                 "orchestrator",
                 f"Original task:\n{original_task}\n\nExecution result:\n{execution_result}",
-            )
+            ),
+            on_event=on_event,
         )
 
     def clear_history(self) -> None:
         self.history = []
         self.skill_context_buffer.clear()
 
-    async def _execute_worker(self, content: str) -> AgentMessage:
+    async def _execute_worker(self, content: str, *, on_event=None) -> AgentMessage:
         text = ""
         tool_results: list[str] = []
         usage = Usage()
@@ -173,24 +182,35 @@ class SubAgent:
                 config=self.config,
                 approval_callback=self.approval_callback,
                 skill_context_buffer=self.skill_context_buffer,
-                max_turns=8,
             ):
-                if event.get("type") == "text_delta":
+                event_type = event.get("type")
+                if event_type == "text_delta":
                     text += str(event.get("text") or "")
-                elif event.get("type") == "tool_result":
+                elif event_type == "tool_result":
                     tool_results.append(str(event.get("result") or ""))
-                elif event.get("type") == "done":
+                elif event_type == "done":
                     self.history = list(event.get("messages") or [])
                     usage = usage + Usage.from_mapping(event.get("usage") or {})
                     turns += int(event.get("total_turns") or 0)
-                elif event.get("type") == "error":
+                elif event_type == "error":
                     raise event["error"]
+                if on_event and event_type == "usage":
+                    on_event(event)
+                if on_event and event_type in {
+                    "text_delta",
+                    "thinking_delta",
+                    "tool_call",
+                    "tool_result",
+                    "turn_complete",
+                    "context_compressed",
+                }:
+                    on_event(event)
         except Exception as exc:  # noqa: BLE001
             return AgentMessage.error(self.name, self.role, str(exc), usage, turns)
         result = text.strip() or "\n".join(item for item in tool_results if item).strip()
         return AgentMessage.result(self.name, self.role, result, usage, turns)
 
-    async def _execute_plan(self, content: str, *, plan_depth: int) -> AgentMessage:
+    async def _execute_plan(self, content: str, *, plan_depth: int, on_event=None) -> AgentMessage:
         if plan_depth >= self.max_plan_depth:
             return AgentMessage.error(
                 self.name,
@@ -211,13 +231,16 @@ class SubAgent:
         turns = 0
         try:
             async for event in agent.run(content):
-                if event.get("type") == "text_delta":
+                event_type = event.get("type")
+                if event_type == "text_delta":
                     text += str(event.get("text") or "")
-                elif event.get("type") == "done":
+                elif event_type == "done":
                     usage = usage + Usage.from_mapping(event.get("usage") or {})
                     turns += int(event.get("total_turns") or 0)
-                elif event.get("type") == "error":
+                elif event_type == "error":
                     raise event["error"]
+                if on_event and event_type != "done":
+                    on_event(event)
         except Exception as exc:  # noqa: BLE001
             return AgentMessage.error(self.name, self.role, str(exc), usage, turns)
         self.history = [
@@ -226,7 +249,7 @@ class SubAgent:
         ]
         return AgentMessage.result(self.name, self.role, text.strip(), usage, turns)
 
-    async def _execute_without_tools(self, content: str) -> AgentMessage:
+    async def _execute_without_tools(self, content: str, *, on_event=None) -> AgentMessage:
         text = ""
         usage = Usage()
         messages = [*self.history, Message(role="user", content=content)]
@@ -236,12 +259,15 @@ class SubAgent:
                 [],
                 system_prompt=self._system_prompt(),
             ):
-                if event.get("type") == "text_delta":
+                event_type = event.get("type")
+                if event_type == "text_delta":
                     text += str(event.get("text") or "")
-                elif event.get("type") == "usage":
+                elif event_type == "usage":
                     usage = usage + Usage.from_mapping(event.get("usage") or {})
-                elif event.get("type") == "error":
+                elif event_type == "error":
                     raise event["error"]
+                if on_event and event_type in {"text_delta", "thinking_delta", "usage"}:
+                    on_event(event)
         except Exception as exc:  # noqa: BLE001
             return AgentMessage.error(self.name, self.role, str(exc), usage, 1)
         self.history = [*messages, Message(role="assistant", content=text)]
@@ -311,10 +337,39 @@ class AgentOrchestrator:
         self.total_usage = Usage()
         self.total_turns = 0
         try:
-            yield {"type": "text_delta", "text": "Phase 1: planner\n\n"}
-            plan_result = await self.planner.execute(
-                AgentMessage.task("orchestrator", f"Create an execution plan for:\n{message}")
-            )
+            yield {
+                "type": "team_status",
+                "phase": "planning",
+                "message": "Creating execution plan",
+                "agent": "planner",
+            }
+            plan_events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+            async def run_planner() -> AgentMessage:
+                try:
+                    return await self.planner.execute(
+                        AgentMessage.task(
+                            "orchestrator", f"Create an execution plan for:\n{message}"
+                        ),
+                        on_event=lambda event: plan_events.put_nowait(
+                            _with_team_context(event, "planning", "planner")
+                        ),
+                    )
+                finally:
+                    plan_events.put_nowait(None)
+
+            plan_task = asyncio.create_task(run_planner())
+            try:
+                while True:
+                    event = await plan_events.get()
+                    if event is None:
+                        break
+                    yield event
+            except BaseException:
+                plan_task.cancel()
+                await asyncio.gather(plan_task, return_exceptions=True)
+                raise
+            plan_result = await plan_task
             self.total_usage = self.total_usage + plan_result.usage
             self.total_turns += plan_result.turns
             self.planner.clear_history()
@@ -323,11 +378,19 @@ class AgentOrchestrator:
             steps = self.parse_plan(plan_result.content)
             if not steps:
                 raise ValueError(f"planner output could not be parsed:\n{plan_result.content}")
+            yield {
+                "type": "team_status",
+                "phase": "planning",
+                "message": f"Plan ready with {len(steps)} step(s)",
+                "agent": "planner",
+            }
             yield {"type": "text_delta", "text": self.summarize_steps(steps) + "\n"}
-            yield {"type": "text_delta", "text": "Phase 2: workers and reviewer\n\n"}
-            for event in await self._execute_steps(
-                steps, lambda text: {"type": "text_delta", "text": text}
-            ):
+            yield {
+                "type": "team_status",
+                "phase": "workers",
+                "message": "Starting workers and reviewers",
+            }
+            async for event in self._execute_steps(steps):
                 yield event
             final_text = self.build_final_result(steps)
             yield {"type": "text_delta", "text": final_text}
@@ -353,12 +416,7 @@ class AgentOrchestrator:
             done["cost"] = costs
         yield done
 
-    async def _execute_steps(
-        self,
-        steps: list[ExecutionStep],
-        event_factory,
-    ) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
+    async def _execute_steps(self, steps: list[ExecutionStep]) -> AsyncIterator[dict[str, Any]]:
         retry_count: dict[str, int] = {}
         worker_queue: asyncio.Queue[SubAgent] = asyncio.Queue()
         for worker in self.workers:
@@ -369,23 +427,32 @@ class AgentOrchestrator:
             if not executable:
                 break
             if len(executable) > 1:
-                events.append(
-                    event_factory(
-                        f"Parallel batch: {', '.join(step.id for step in executable)}\n\n"
-                    )
+                yield {
+                    "type": "team_status",
+                    "phase": "workers",
+                    "message": f"Running in parallel: {', '.join(step.id for step in executable)}",
+                }
+            events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+            tasks = [
+                asyncio.create_task(
+                    self._run_step_with_worker_queue(step, steps, retry_count, worker_queue, events)
                 )
-            await asyncio.gather(
-                *(
-                    self._run_step_with_worker_queue(
-                        step,
-                        steps,
-                        retry_count,
-                        worker_queue,
-                    )
-                    for step in executable
-                )
-            )
-        return events
+                for step in executable
+            ]
+            finished = 0
+            try:
+                while finished < len(tasks):
+                    event = await events.get()
+                    if event is None:
+                        finished += 1
+                    else:
+                        yield event
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run_step_with_worker_queue(
         self,
@@ -393,14 +460,19 @@ class AgentOrchestrator:
         steps: list[ExecutionStep],
         retry_count: dict[str, int],
         worker_queue: asyncio.Queue[SubAgent],
+        events: asyncio.Queue[dict[str, Any] | None] | None = None,
     ) -> None:
-        worker = await worker_queue.get()
+        events = events or asyncio.Queue()
         try:
-            reviewer = self._subagent(f"reviewer-{step.id}", AgentRole.REVIEWER)
-            await self._run_step(step, steps, retry_count, worker, reviewer)
+            worker = await worker_queue.get()
+            try:
+                reviewer = self._subagent(f"reviewer-{step.id}", AgentRole.REVIEWER)
+                await self._run_step(step, steps, retry_count, worker, reviewer, events)
+            finally:
+                worker.clear_history()
+                worker_queue.put_nowait(worker)
         finally:
-            worker.clear_history()
-            worker_queue.put_nowait(worker)
+            events.put_nowait(None)
 
     async def _run_step(
         self,
@@ -409,19 +481,66 @@ class AgentOrchestrator:
         retry_count: dict[str, int],
         worker: SubAgent,
         reviewer: SubAgent,
+        events: asyncio.Queue[dict[str, Any] | None] | None = None,
     ) -> None:
+        events = events or asyncio.Queue()
         self._update_step(steps, step.id, step.started())
         context = self.build_step_context(steps, step)
         task_msg = AgentMessage.task("orchestrator", step.description)
-        result = await worker.execute(task_msg, context, mode=step.mode)
+        worker_name = str(getattr(worker, "name", "worker"))
+        reviewer_name = str(getattr(reviewer, "name", f"reviewer-{step.id}"))
+        events.put_nowait(
+            {
+                "type": "team_status",
+                "phase": "workers",
+                "message": f"Executing: {step.description}",
+                "task_id": step.id,
+                "agent": worker_name,
+            }
+        )
+        result = await _invoke_agent(
+            worker.execute,
+            task_msg,
+            context,
+            mode=step.mode,
+            on_event=lambda event: events.put_nowait(
+                _with_team_context(event, "execution", worker_name, task_id=step.id)
+            ),
+        )
         self.total_usage = self.total_usage + result.usage
         self.total_turns += result.turns
         if result.type == AgentMessageType.ERROR or not result.content.strip():
             self._update_step(steps, step.id, step.with_failed(result.content or "empty result"))
+            events.put_nowait(
+                {
+                    "type": "team_status",
+                    "phase": "workers",
+                    "message": f"Failed: {result.content or 'empty result'}",
+                    "task_id": step.id,
+                    "agent": worker_name,
+                    "error": True,
+                }
+            )
             return
 
         accepted_result = result.content
-        review = await reviewer.review(step.description, accepted_result)
+        events.put_nowait(
+            {
+                "type": "team_status",
+                "phase": "review",
+                "message": "Reviewing worker result",
+                "task_id": step.id,
+                "agent": reviewer_name,
+            }
+        )
+        review = await _invoke_agent(
+            reviewer.review,
+            step.description,
+            accepted_result,
+            on_event=lambda event: events.put_nowait(
+                _with_team_context(event, "review", reviewer_name, task_id=step.id)
+            ),
+        )
         self.total_usage = self.total_usage + review.usage
         self.total_turns += review.turns
         reviewer.clear_history()
@@ -432,14 +551,38 @@ class AgentOrchestrator:
             retries += 1
             retry_count[step.id] = retries
             retry_context = context + f"\n\nReviewer rejected the previous result:\n{issues}"
-            retry_result = await worker.execute(task_msg, retry_context, mode=step.mode)
+            events.put_nowait(
+                {
+                    "type": "team_status",
+                    "phase": "workers",
+                    "message": f"Retrying worker (attempt {retries})",
+                    "task_id": step.id,
+                    "agent": worker_name,
+                }
+            )
+            retry_result = await _invoke_agent(
+                worker.execute,
+                task_msg,
+                retry_context,
+                mode=step.mode,
+                on_event=lambda event: events.put_nowait(
+                    _with_team_context(event, "execution", worker_name, task_id=step.id)
+                ),
+            )
             self.total_usage = self.total_usage + retry_result.usage
             self.total_turns += retry_result.turns
             if retry_result.type == AgentMessageType.ERROR or not retry_result.content.strip():
                 issues = retry_result.content or "empty retry result"
                 continue
             accepted_result = retry_result.content
-            retry_review = await reviewer.review(step.description, accepted_result)
+            retry_review = await _invoke_agent(
+                reviewer.review,
+                step.description,
+                accepted_result,
+                on_event=lambda event: events.put_nowait(
+                    _with_team_context(event, "review", reviewer_name, task_id=step.id)
+                ),
+            )
             self.total_usage = self.total_usage + retry_review.usage
             self.total_turns += retry_review.turns
             reviewer.clear_history()
@@ -452,8 +595,27 @@ class AgentOrchestrator:
                 step.id,
                 step.with_failed(f"review rejected after {retries} retries: {issues}"),
             )
+            events.put_nowait(
+                {
+                    "type": "team_status",
+                    "phase": "review",
+                    "message": f"Review rejected after {retries} retries",
+                    "task_id": step.id,
+                    "agent": reviewer_name,
+                    "error": True,
+                }
+            )
             return
         self._update_step(steps, step.id, step.with_result(accepted_result))
+        events.put_nowait(
+            {
+                "type": "team_status",
+                "phase": "review",
+                "message": "Review approved; step completed",
+                "task_id": step.id,
+                "agent": reviewer_name,
+            }
+        )
 
     def parse_plan(self, plan_json: str) -> list[ExecutionStep]:
         try:
@@ -627,6 +789,36 @@ def _normalize_worker_mode(mode: str) -> str:
     if value not in {item.value for item in AgentRunMode}:
         raise ValueError("worker mode must be react or plan")
     return value
+
+
+def _with_team_context(
+    event: dict[str, Any],
+    phase: str,
+    agent: str,
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    event_type = event.get("type")
+    if event_type == "text_delta":
+        event_type = "team_text_delta"
+    return {
+        **event,
+        "type": event_type,
+        "phase": phase,
+        "agent": agent,
+        **({"task_id": task_id} if task_id else {}),
+    }
+
+
+async def _invoke_agent(callable_, *args, on_event=None, **kwargs):
+    """Invoke test doubles and legacy subagents that predate ``on_event``."""
+    try:
+        supports_events = "on_event" in inspect.signature(callable_).parameters
+    except (TypeError, ValueError):
+        supports_events = True
+    if supports_events:
+        return await callable_(*args, on_event=on_event, **kwargs)
+    return await callable_(*args, **kwargs)
 
 
 def _calculate_costs(llm_client: LlmClient, usage: Usage) -> dict[str, Any]:

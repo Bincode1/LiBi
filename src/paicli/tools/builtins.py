@@ -483,6 +483,11 @@ async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        raise
     except TimeoutError:
         proc.kill()
         await proc.wait()

@@ -128,6 +128,10 @@ class ToolExecutor:
             return "deny"
         result = context.approval_callback(
             {
+                "agent_id": context.agent_id or "root",
+                "parent_id": context.parent_agent_id,
+                "session_id": context.session_id,
+                "cwd": context.cwd,
                 "tool_name": tool.name,
                 "input": payload,
                 "danger_level": tool.danger_level,

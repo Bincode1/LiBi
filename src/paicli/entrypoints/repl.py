@@ -39,6 +39,7 @@ from paicli.runtime import DurableTaskManager
 from paicli.skill import SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools import ToolRegistry
+from paicli.tools.approval import ApprovalBroker
 
 SLASH_COMMANDS = [
     "/help",
@@ -61,6 +62,7 @@ SLASH_COMMANDS = [
     "/skill",
     "/mcp",
     "/task",
+    "/agents",
     "/snapshot",
     "/restore",
 ]
@@ -132,14 +134,19 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
             console.print(
                 f"MCP server {name} failed to load: {error}", style="yellow", markup=False
             )
+    approval_broker = ApprovalBroker(
+        lambda request: _approval_prompt(request, console, permission_mode)
+    )
     agent = Agent(
         llm_client=client,
         tool_registry=registry,
         system_prompt=system_prompt,
         cwd=cwd,
         config=config,
-        approval_callback=lambda request: _approval_prompt(request, console, permission_mode),
+        approval_callback=approval_broker.request,
     )
+    if agent.subagent_manager is not None:
+        agent.subagent_manager.event_callback = renderer.handle
 
     history_path = Path.home() / ".paicli" / "history" / "prompt_history.txt"
     history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,6 +191,9 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
             user_input = await session.prompt_async()
         except (EOFError, KeyboardInterrupt):
             console.print()
+            if agent.subagent_manager is not None:
+                await agent.subagent_manager.drain()
+            await approval_broker.close()
             return
         message = user_input.strip()
         if not message:
@@ -200,6 +210,9 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
                 renderer,
             )
             if should_exit:
+                if agent.subagent_manager is not None:
+                    await agent.subagent_manager.drain()
+                await approval_broker.close()
                 return
             continue
         await _run_agent(agent, renderer, message)
@@ -361,6 +374,8 @@ async def _handle_slash(
         console.print("Use `paicli mcp serve --transport stdio|http --port 3000` to expose tools.")
     elif command == "/task":
         _task_command(arg, console, cwd)
+    elif command == "/agents":
+        await _agents_command(agent, arg, console)
     elif command == "/snapshot":
         _snapshot_command(arg, console, cwd)
     elif command == "/restore":
@@ -372,6 +387,92 @@ async def _handle_slash(
     else:
         console.print(f"[red]Unknown command:[/red] {command}")
     return False
+
+
+async def _agents_command(agent: Agent, arg: str, console: Console) -> None:
+    manager = agent.subagent_manager
+    if manager is None:
+        console.print("Subagent runtime is unavailable.")
+        return
+    if arg.startswith("interrupt ") or arg.startswith("dispose "):
+        _, _, agent_id = arg.partition(" ")
+        action = manager.interrupt if arg.startswith("interrupt ") else manager.dispose
+        completed = await action(agent_id.strip())
+        console.print(
+            f"{arg.split(maxsplit=1)[0]} {'completed' if completed else 'not running'} "
+            f"for {agent_id.strip()}."
+        )
+        return
+    if arg == "drain":
+        await manager.drain()
+        console.print("Subagent runtime drained.")
+        return
+    table = Table(title="Subagents")
+    for column in (
+        "ID",
+        "State",
+        "Provider",
+        "Phase",
+        "Deadline",
+        "Last activity",
+        "Description",
+        "Error",
+    ):
+        table.add_column(column)
+    rows = [
+        item
+        for item in manager.activations.values()
+        if (
+            item.parent_id == (agent.agent_id or "root")
+            or (arg == "--tree" and item.parent_id in manager.activations)
+        )
+    ]
+    recovered = manager.recovered_for(agent.agent_id or "root")
+    catalog = manager.catalog_for(agent.agent_id or "root")
+    if not rows and not recovered and not catalog:
+        console.print("No subagents have been started.")
+        return
+    for item in rows:
+        details = manager.describe_activation(item)
+        deadline = details["deadline_remaining_seconds"]
+        table.add_row(
+            item.id,
+            str(item.status),
+            details["provider"],
+            details["phase"],
+            "-" if deadline is None else f"{deadline:.1f}s",
+            f"{details['last_activity_seconds_ago']:.1f}s ago",
+            item.description,
+            item.error_code or "-",
+        )
+    for item in recovered:
+        table.add_row(
+            str(item["child_id"]),
+            str(item.get("status") or "orphaned"),
+            "unknown",
+            "recovered",
+            "-",
+            "-",
+            "Recovered after restart; execution was not resumed",
+            "ORPHANED",
+        )
+    active_ids = {item.id for item in rows}
+    for item in catalog:
+        if item["child_id"] in active_ids or any(
+            row["child_id"] == item["child_id"] for row in recovered
+        ):
+            continue
+        table.add_row(
+            str(item["child_id"]),
+            "historical",
+            str(item.get("provider") or "unknown"),
+            "catalog",
+            "-",
+            "-",
+            str(item.get("label") or "historical child"),
+            "-",
+        )
+    console.print(table)
 
 
 async def _memory_command(arg: str, console: Console, cwd: str, config: PaiCliConfig) -> None:

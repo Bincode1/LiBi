@@ -169,25 +169,28 @@ class RuntimeApiServer:
         text = ""
         events = _engine_events(engine, mode, message, history=history)
         total_tokens = 0
-        async with aclosing(events):
-            async for event in events:
-                event_type = str(event.get("type"))
-                if event_type == "text_delta":
-                    text += str(event.get("text") or "")
-                elif event_type in {"tool_call", "tool_result", "error", "done"}:
-                    safe_event = _runtime_event_payload(event)
-                    self._append_event(thread_id, event_type, safe_event)
-                    if event_type == "error":
-                        self._append_event(
-                            thread_id,
-                            "turn.failed",
-                            {"error_type": safe_event.get("error_type", "RuntimeError")},
-                        )
-                        raise RuntimeError(
-                            str(safe_event.get("error_type") or "Runtime turn failed")
-                        )
-                    if event_type == "done":
-                        total_tokens = int(event.get("total_tokens") or 0)
+        try:
+            async with aclosing(events):
+                async for event in events:
+                    event_type = str(event.get("type"))
+                    if event_type == "text_delta":
+                        text += str(event.get("text") or "")
+                    elif event_type in {"tool_call", "tool_result", "error", "done"}:
+                        safe_event = _runtime_event_payload(event)
+                        self._append_event(thread_id, event_type, safe_event)
+                        if event_type == "error":
+                            self._append_event(
+                                thread_id,
+                                "turn.failed",
+                                {"error_type": safe_event.get("error_type", "RuntimeError")},
+                            )
+                            raise RuntimeError(
+                                str(safe_event.get("error_type") or "Runtime turn failed")
+                            )
+                        if event_type == "done":
+                            total_tokens = int(event.get("total_tokens") or 0)
+        finally:
+            await engine.aclose()
         self._append_event(
             thread_id,
             "turn.completed",
@@ -249,15 +252,18 @@ class RuntimeApiServer:
             cwd=self.cwd,
         )
         text = ""
-        events = _engine_events(engine, task.mode, task.prompt)
-        async with aclosing(events):
-            async for event in events:
-                if self.task_manager.is_canceled(task.id):
-                    raise TaskCanceledError(task.id)
-                if event.get("type") == "text_delta":
-                    text += str(event.get("text") or "")
-                elif event.get("type") == "error":
-                    raise event["error"]
+        try:
+            events = _engine_events(engine, task.mode, task.prompt)
+            async with aclosing(events):
+                async for event in events:
+                    if self.task_manager.is_canceled(task.id):
+                        raise TaskCanceledError(task.id)
+                    if event.get("type") == "text_delta":
+                        text += str(event.get("text") or "")
+                    elif event.get("type") == "error":
+                        raise event["error"]
+        finally:
+            await engine.aclose()
         return text
 
     def _ensure_llm_key(self) -> None:

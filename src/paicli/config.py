@@ -38,6 +38,18 @@ class ToolsConfig:
 
 
 @dataclass(slots=True)
+class SubagentConfig:
+    """Runtime limits for ReAct delegated agents."""
+
+    max_active: int = 8
+    max_resident: int = 32
+    max_depth: int = 2
+    default_deadline: float | None = None
+    drain_timeout: float = 15.0
+    observation_queue_size: int = 512
+
+
+@dataclass(slots=True)
 class McpConfig:
     servers: list[dict[str, Any]] = field(default_factory=list)
     auto_start: bool = True
@@ -65,6 +77,7 @@ class PolicyConfig:
     hitl_mode: str = "auto"
     path_guard_enabled: bool = True
     command_guard_enabled: bool = True
+    subagent_tool_allowlist: list[str] | None = None
     command_blacklist: list[str] = field(
         default_factory=lambda: [
             "sudo",
@@ -105,6 +118,7 @@ class PaiCliConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     render_mode: str = "inline"
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    subagents: SubagentConfig = field(default_factory=SubagentConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)

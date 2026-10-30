@@ -46,23 +46,86 @@ def test_orchestrator_runs_independent_workers_in_parallel(tmp_path, monkeypatch
     async def run():
         text = ""
         done = None
+        events = []
         async for event in orchestrator.run("并行完成 A 和 B"):
+            events.append(event)
             if event.get("type") == "text_delta":
                 text += str(event.get("text") or "")
             elif event.get("type") == "done":
                 done = event
             elif event.get("type") == "error":
                 raise event["error"]
-        return text, done
+        return text, done, events
 
-    result, done = asyncio.run(run())
+    result, done, events = asyncio.run(run())
 
     assert "Multi-Agent task completed" in result
     assert "Task A result" in result
     assert "Task B result" in result
     assert client.peak_concurrency == 2
+    assert any(
+        event.get("type") == "team_text_delta" and event.get("agent", "").startswith("worker-")
+        for event in events
+    )
+    assert any(
+        event.get("type") == "team_status" and event.get("phase") == "review" for event in events
+    )
+    assert events[-1]["type"] == "done"
     assert done is not None
     assert done["total_turns"] == 5
+
+
+def test_orchestrator_streams_worker_events_before_worker_finishes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    class StreamingTeamClient(FakeTeamClient):
+        def __init__(self):
+            self.release_worker = asyncio.Event()
+
+        async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+            body = _message_text(messages[-1].content)
+            if "Create an execution plan" in body:
+                yield {
+                    "type": "text_delta",
+                    "text": '{"steps":[{"id":"a","description":"Inspect files",'
+                    '"type":"ANALYSIS","dependencies":[]}]}',
+                }
+                yield {"type": "message_end", "stop_reason": "end_turn"}
+                return
+            if "Original task" in body:
+                yield {"type": "text_delta", "text": '{"approved":true,"issues":[]}'}
+                yield {"type": "message_end", "stop_reason": "end_turn"}
+                return
+            yield {"type": "thinking_delta", "thinking": "worker started"}
+            await self.release_worker.wait()
+            yield {"type": "text_delta", "text": "inspection complete"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    client = StreamingTeamClient()
+    orchestrator = _orchestrator(tmp_path, client)
+
+    async def run():
+        events = orchestrator.run("Inspect files")
+        try:
+            while True:
+                event = await asyncio.wait_for(anext(events), timeout=1)
+                if event.get("type") == "team_status" and event.get("message", "").startswith(
+                    "Executing:"
+                ):
+                    break
+
+            event = await asyncio.wait_for(anext(events), timeout=1)
+            while event.get("type") == "context_compressed":
+                event = await asyncio.wait_for(anext(events), timeout=1)
+            assert event["type"] == "thinking_delta"
+            assert event["thinking"] == "worker started"
+            assert event["agent"] == "worker-1"
+            assert event["task_id"] == "step_1"
+        finally:
+            client.release_worker.set()
+            await events.aclose()
+
+    asyncio.run(run())
 
 
 def test_orchestrator_parses_nested_plan_worker_mode(tmp_path, monkeypatch):
@@ -111,6 +174,42 @@ def test_subagent_can_delegate_its_task_to_plan_execute(tmp_path, monkeypatch):
     assert result.content == "nested plan completed"
     assert result.usage.total_tokens == 15
     assert result.turns == 3
+
+
+def test_subagent_forwards_react_events_without_forwarding_internal_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    worker = SubAgent(
+        name="worker-1",
+        role=AgentRole.WORKER,
+        llm_client=FakeTeamClient(),
+        tool_registry=ToolRegistry(),
+        config=load_config(project_root=tmp_path),
+        cwd=str(tmp_path),
+    )
+
+    async def fake_query(**kwargs):  # noqa: ARG001
+        yield {"type": "text_delta", "text": "internal draft"}
+        yield {"type": "thinking_delta", "thinking": "reasoning"}
+        yield {"type": "tool_call", "name": "list_dir", "input": {"path": "."}}
+        yield {"type": "tool_result", "name": "list_dir", "result": "README.md"}
+        yield {"type": "turn_complete", "turn": 1, "stop_reason": "end_turn"}
+        yield {"type": "done", "total_turns": 1, "usage": {}}
+
+    monkeypatch.setattr("paicli.agent.orchestrator.query", fake_query)
+    forwarded = []
+
+    result = asyncio.run(
+        worker.execute(AgentMessage.task("test", "inspect files"), on_event=forwarded.append)
+    )
+
+    assert result.content == "internal draft"
+    assert [event["type"] for event in forwarded] == [
+        "text_delta",
+        "thinking_delta",
+        "tool_call",
+        "tool_result",
+        "turn_complete",
+    ]
 
 
 def test_subagent_plan_depth_is_bounded(tmp_path, monkeypatch):

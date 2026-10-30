@@ -27,8 +27,13 @@ class ToolContext:
         None
     )
     skill_context_buffer: Any | None = None
+    subagent_manager: Any | None = None
+    agent_id: str | None = None
+    parent_agent_id: str | None = None
     session_store: Any | None = None
     session_id: str | None = None
+    llm_client: Any | None = None
+    tool_registry: Any | None = None
 
 
 @dataclass(slots=True)

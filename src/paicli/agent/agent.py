@@ -82,6 +82,10 @@ class Agent:
         team_worker_mode: str = "react",
         session_store: SessionStore | None = None,
         session_id: str | None = None,
+        subagent_manager: Any | None = None,
+        agent_id: str = "root",
+        event_sink: Callable[[dict[str, Any]], Any] | None = None,
+        steer_inbox: asyncio.Queue[str] | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -95,6 +99,21 @@ class Agent:
         self._owns_session_store = session_store is None
         self.session_store = session_store
         self.session_id = session_id
+        if mode == "react" and subagent_manager is None:
+            from paicli.agent.subagents import SubagentManager
+
+            subagent_manager = SubagentManager(
+                max_active=config.subagents.max_active,
+                max_resident=config.subagents.max_resident,
+                max_depth=config.subagents.max_depth,
+                default_deadline=config.subagents.default_deadline,
+                event_queue_size=config.subagents.observation_queue_size,
+                drain_timeout=config.subagents.drain_timeout,
+            )
+        self.subagent_manager = subagent_manager
+        self.agent_id = agent_id
+        self.event_sink = event_sink
+        self.steer_inbox = steer_inbox
         self._context_projector = ContextProjector()
         self._request_builder = RequestBuilder()
 
@@ -163,15 +182,23 @@ class Agent:
             if self.mode == "plan":
                 events = self._run_logged_mode(self._run_plan(message), message, "plan")
                 async for event in events:
+                    if self.event_sink is not None:
+                        await self.event_sink(event)
                     yield event
             elif self.mode == "team":
                 events = self._run_logged_mode(self._run_team(message), message, "team")
                 async for event in events:
+                    if self.event_sink is not None:
+                        await self.event_sink(event)
                     yield event
             else:
                 async for event in self._run_react(message):
+                    if self.event_sink is not None:
+                        await self.event_sink(event)
                     yield event
         except asyncio.CancelledError:
+            if self.subagent_manager is not None:
+                await self.subagent_manager.cancel_for_parent(self.agent_id)
             if self.session_store is not None and self.session_id is not None:
                 state = self.session_store.state(self.session_id)
                 if state.active_turn_id:
@@ -314,14 +341,36 @@ class Agent:
         # Prepend skill candidates that match the user message.
 
         tool_defs = self.tool_registry.definitions()
+        if self.mode == "react":
+            from paicli.agent.subagents import make_subagent_control_tools, make_subagent_tool
+
+            subagent_tools = [make_subagent_tool(), *make_subagent_control_tools()]
+            allowlist = self.config.policy.subagent_tool_allowlist
+            if allowlist is None or self.agent_id == "root":
+                self.tool_registry.register_all(subagent_tools)
+            else:
+                self.tool_registry.register_all(
+                    [tool for tool in subagent_tools if tool.name in set(allowlist)]
+                )
+            tool_defs = self.tool_registry.definitions()
         executor = ToolExecutor(self.tool_registry)
         context = ToolContext(
             cwd=self.cwd,
             config=self.config,
             approval_callback=self.approval_callback,
             skill_context_buffer=self.skill_context_buffer,
+            subagent_manager=self.subagent_manager,
+            agent_id=self.agent_id,
+            parent_agent_id=(
+                self.subagent_manager.activations[self.agent_id].parent_id
+                if self.subagent_manager is not None
+                and self.agent_id in self.subagent_manager.activations
+                else None
+            ),
             session_store=store,
             session_id=session_id,
+            llm_client=self.llm_client,
+            tool_registry=self.tool_registry,
         )
 
         # Build the dynamic part of the system prompt (tool list, cwd, etc.).
@@ -369,6 +418,35 @@ class Agent:
         turn = 0
         finished = False
         latest_messages: list[Message] = []
+        from paicli.agent.run_controller import RunController
+
+        run_controller = RunController(
+            manager=self.subagent_manager,
+            parent_id=self.agent_id,
+            parent_session_id=session_id,
+            session_store=store,
+        )
+
+        async def consume_steer(step_id: str) -> bool:
+            if self.steer_inbox is None:
+                return False
+            consumed = False
+            while True:
+                try:
+                    content = self.steer_inbox.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                store.append(
+                    session_id,
+                    "user/message",
+                    {"content": content},
+                    turn_id=turn_id,
+                    step_id=step_id,
+                    source="subagent-steer",
+                )
+                consumed = True
+            return consumed
+
         while self.max_turns is None or turn < self.max_turns:
             turn += 1
             text = ""
@@ -682,6 +760,17 @@ class Agent:
                 step_id,
             )
 
+            steered = await consume_steer(step_id) if not tool_calls else False
+            if steered and stop_reason != "tool_use" and not tool_calls:
+                store.append(
+                    session_id,
+                    "step/completed",
+                    {"reason": "steered"},
+                    turn_id=turn_id,
+                    step_id=step_id,
+                )
+                continue
+
             # If the model didn't request any tools, we're done.
             if stop_reason != "tool_use" and not tool_calls:
                 store.append(
@@ -691,6 +780,33 @@ class Agent:
                     turn_id=turn_id,
                     step_id=step_id,
                 )
+                if (
+                    self.subagent_manager is not None
+                    and self.subagent_manager.event_callback is not None
+                ):
+                    run_controller.discard_observations()
+                if run_controller.has_pending_children():
+                    async for event in run_controller.observe_until_settled():
+                        if self.subagent_manager.event_callback is None:
+                            yield _annotate_event(event, session_id, turn_id, step_id)
+                    deliveries = run_controller.collect_deliveries(defer_ack=True)
+                    if deliveries:
+                        notices = [run_controller.format_delivery(item) for item in deliveries]
+                        store.append(
+                            session_id,
+                            "user/message",
+                            {
+                                "content": "Child agent results:\n" + "\n".join(notices),
+                                "delivery_ids": [item.delivery_id for item in deliveries],
+                            },
+                            turn_id=turn_id,
+                            source="subagent-delivery",
+                        )
+                        run_controller.acknowledge_deliveries(deliveries)
+                        self.subagent_manager.raise_background_errors()
+                        continue
+                if self.subagent_manager is not None:
+                    self.subagent_manager.raise_background_errors()
                 finished = True
                 break
 
@@ -778,6 +894,7 @@ class Agent:
                 turn_id=turn_id,
                 step_id=step_id,
             )
+            await consume_steer(step_id)
 
             if loaded_skill_context and not injected:
                 # The model-visible skill context is projected from the event above.

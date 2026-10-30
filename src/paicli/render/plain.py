@@ -10,6 +10,22 @@ class PlainRenderer:
 
     def handle(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
+        if event_type == "subagent_event" and self.print_events:
+            inner = event.get("event") or {}
+            agent = str(event.get("agent") or "subagent")
+            kind = str(inner.get("type") or "event")
+            content = inner.get("text", inner.get("thinking", inner.get("result", "")))
+            if kind == "observation_gap":
+                content = f"{inner.get('dropped', 0)} events omitted"
+            elif kind == "ended":
+                content = inner.get("status", "unknown")
+                if inner.get("cleanup_error"):
+                    content = f"{content}; cleanup failed: {inner['cleanup_error']}"
+            elif kind == "error":
+                content = inner.get("error", "Child failed")
+            sys.stdout.write(f"\n[{agent}:{kind}] {content}\n")
+            sys.stdout.flush()
+            return
         if event_type == "text_delta":
             sys.stdout.write(str(event.get("text") or ""))
             sys.stdout.flush()

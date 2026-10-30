@@ -25,6 +25,7 @@ class RichRenderer:
         self._buffer: list[str] = []
         self._thinking_buffer: list[str] = []
         self._thinking_scope: str | None = None
+        self._team_output_scope: str | None = None
         self._live_markdown = live_markdown
         self._live: Live | None = None
         self._thinking_live: Live | None = None
@@ -49,6 +50,7 @@ class RichRenderer:
         self._buffer.clear()
         self._thinking_buffer.clear()
         self._thinking_scope = None
+        self._team_output_scope = None
         self._stop_live_markdown()
         self._stop_live_thinking()
         self._input_tokens = 0
@@ -121,6 +123,24 @@ class RichRenderer:
             text = str(event.get("text") or "")
             self._buffer.append(text)
             self._update_live_markdown()
+        elif event_type == "team_text_delta":
+            self._flush_thinking()
+            scope = _team_scope(event)
+            if scope != self._team_output_scope:
+                if self._team_output_scope is not None:
+                    self.console.print()
+                self.console.print(Text(f"[{_team_title(event)}]", style="bold #22d3ee"))
+                self._team_output_scope = scope
+            self.console.print(Text(str(event.get("text") or ""), style="#e5e7eb"), end="")
+        elif event_type == "team_status":
+            self._finish_team_output()
+            self._flush_thinking()
+            self._flush_markdown(title="Team")
+            message = str(event.get("message") or "")
+            style = "bold red" if event.get("error") else "bold #22d3ee"
+            self.console.print(Text(f"[{_team_title(event)}] {message}", style=style))
+        elif event_type == "subagent_event":
+            self._handle_subagent_event(event)
         elif event_type == "thinking_delta":
             scope = _thinking_scope(event)
             if self._thinking_buffer and scope != self._thinking_scope:
@@ -152,15 +172,22 @@ class RichRenderer:
             self._flush_markdown(title="Assistant Output")
             self._print_context_summary(event)
         elif event_type == "turn_complete":
+            if event.get("agent"):
+                self._finish_team_output()
+                return
             stop_reason = str(event.get("stop_reason") or "end_turn")
             title = "Assistant Output" if stop_reason == "tool_use" else "Final Output"
             self._flush_thinking()
             self._flush_markdown(title=title)
         elif event_type == "tool_call":
+            if event.get("agent"):
+                self._finish_team_output()
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
             self._print_tool_call(event)
         elif event_type == "tool_result":
+            if event.get("agent"):
+                self._finish_team_output()
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
             self._print_tool_result(event)
@@ -172,6 +199,7 @@ class RichRenderer:
             if not self._run_saw_usage_event:
                 self._record_usage(event.get("usage") or {})
             self._flush_thinking()
+            self._finish_team_output()
             self._flush_markdown(title="Final Output")
             self._record_run_summary(event)
 
@@ -180,8 +208,15 @@ class RichRenderer:
 
     def newline(self) -> None:
         self._flush_thinking()
+        self._finish_team_output()
         self._flush_markdown(title="Final Output")
         self.console.print()
+
+    def _finish_team_output(self) -> None:
+        if self._team_output_scope is None:
+            return
+        self.console.print()
+        self._team_output_scope = None
 
     def _flush_markdown(self, *, title: str) -> None:
         if not self._buffer:
@@ -348,6 +383,56 @@ class RichRenderer:
             )
         )
 
+    def _handle_subagent_event(self, event: dict[str, Any]) -> None:
+        agent = str(event.get("agent") or "subagent")
+        inner = event.get("event") or {}
+        kind = str(inner.get("type") or event.get("kind") or "event")
+        if kind == "ended":
+            status = str(inner.get("status") or "unknown")
+            cleanup = inner.get("cleanup_error")
+            detail = f"; cleanup failed: {cleanup}" if cleanup else ""
+            self.console.print(
+                Text(
+                    f"[{agent}] ended: {status}{detail}",
+                    style="bold red" if cleanup else "bold #22c55e",
+                )
+            )
+            return
+        if kind == "observation_gap":
+            self.console.print(
+                Text(
+                    f"[{agent}] observation gap: {inner.get('dropped', 0)} events omitted",
+                    style="yellow",
+                )
+            )
+            return
+        if kind == "turn_completed":
+            self.console.print(Text(f"[{agent}] turn completed", style="dim"))
+            return
+        if kind == "text_delta":
+            self.console.print(
+                Text(f"[{agent}] {inner.get('text') or ''}", style="#c7f9cc"), end=""
+            )
+            return
+        if kind == "thinking_delta":
+            self.console.print(
+                Text(f"[{agent} thinking] {inner.get('thinking') or ''}", style="dim"), end=""
+            )
+            return
+        if kind == "tool_call":
+            self._print_tool_call({**inner, "agent": agent})
+            return
+        if kind == "tool_result":
+            self._print_tool_result({**inner, "agent": agent})
+            return
+        if kind == "done":
+            self.console.print(Text(f"[{agent}] completed", style="bold #22c55e"))
+            return
+        if kind == "error":
+            self.console.print(Text(f"[{agent}] error: {inner.get('error')}", style="bold red"))
+            return
+        self.console.print(Text(f"[{agent}] {kind}", style="dim"))
+
     def _record_run_summary(self, event: dict[str, Any]) -> None:
         total_tokens = int(event.get("total_tokens") or self._input_tokens + self._output_tokens)
         turns = int(event.get("total_turns") or 0)
@@ -418,7 +503,11 @@ def _format_payload(payload: Any) -> str:
 
 
 def _thinking_scope(event: dict[str, Any]) -> str | None:
+    agent = str(event.get("agent") or "").strip()
+    phase = str(event.get("phase") or "").strip()
     task_id = str(event.get("task_id") or "").strip()
+    if agent:
+        return " · ".join(value for value in (phase, agent, task_id) if value)
     if task_id:
         return task_id
     if event.get("phase") == "planning":
@@ -434,9 +523,25 @@ def _thinking_title(scope: str | None) -> str:
     return "Thinking"
 
 
+def _team_scope(event: dict[str, Any]) -> str:
+    return ":".join(str(event.get(key) or "") for key in ("phase", "agent", "task_id"))
+
+
+def _team_title(event: dict[str, Any]) -> str:
+    parts = [
+        str(event.get("phase") or "team").capitalize(),
+        str(event.get("agent") or "").strip(),
+        str(event.get("task_id") or "").strip(),
+    ]
+    return " · ".join(part for part in parts if part)
+
+
 def _scoped_title(title: str, event: dict[str, Any]) -> str:
+    agent = str(event.get("agent") or "").strip()
+    phase = str(event.get("phase") or "").strip()
     task_id = str(event.get("task_id") or "").strip()
-    return f"{title} · {task_id}" if task_id else title
+    scope = " · ".join(value for value in (phase, agent, task_id) if value)
+    return f"{title} · {scope}" if scope else title
 
 
 def _output_panel(renderable: Any, *, title: Text, border_style: str) -> Panel:
