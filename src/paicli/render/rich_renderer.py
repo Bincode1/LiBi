@@ -396,13 +396,11 @@ class RichRenderer:
         inner = event.get("event") or {}
         kind = str(inner.get("type") or event.get("kind") or "event")
         if kind == "status":
-            if self.console.is_terminal:
-                self.console.print(Text(format_status(inner.get("snapshot") or {}), style="dim"))
             return
         if kind == "phase_changed":
             wait = inner.get("waiting_reason")
-            phase = "waiting for approval" if wait == "approval" else inner.get("phase", "unknown")
-            self.console.print(Text(f"[{agent}] {phase}", style="dim"))
+            if wait == "approval":
+                self.console.print(Text(f"[{agent}] waiting for approval", style="yellow"))
             return
         if kind == "ended":
             status = str(inner.get("status") or "unknown")
@@ -426,10 +424,8 @@ class RichRenderer:
                 self.console.print(Text(format_status(snapshot), style="dim"))
             return
         if kind == "turn_completed":
-            self.console.print(Text(f"[{agent}] turn completed", style="dim"))
             return
         if kind == "idle":
-            self.console.print(Text(f"[{agent}] waiting for instructions", style="dim"))
             return
         if kind == "text_delta":
             self.console.print(

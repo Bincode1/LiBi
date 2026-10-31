@@ -19,14 +19,12 @@ class PlainRenderer:
             content = inner.get("text", inner.get("thinking", inner.get("result", "")))
             if kind == "status":
                 return
-            if kind == "idle":
-                content = "waiting for instructions"
+            if kind in {"idle", "turn_completed"}:
+                return
             if kind == "phase_changed":
-                content = (
-                    "waiting for approval"
-                    if inner.get("waiting_reason") == "approval"
-                    else inner.get("phase", "unknown")
-                )
+                if inner.get("waiting_reason") != "approval":
+                    return
+                content = "waiting for approval"
             if kind == "observation_gap":
                 content = f"{inner.get('dropped', 0)} events omitted"
             elif kind == "ended":

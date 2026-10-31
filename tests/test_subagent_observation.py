@@ -307,6 +307,18 @@ def test_renderers_show_approval_and_snapshot_gap_without_llm(capsys):
         {
             "type": "subagent_event",
             "agent": "child",
+            "event": {"type": "status", "snapshot": {**snapshot, "description": "routine refresh"}},
+        },
+        {
+            "type": "subagent_event",
+            "agent": "child",
+            "event": {"type": "phase_changed", "phase": "tool"},
+        },
+        {"type": "subagent_event", "agent": "child", "event": {"type": "idle"}},
+        {"type": "subagent_event", "agent": "child", "event": {"type": "turn_completed"}},
+        {
+            "type": "subagent_event",
+            "agent": "child",
             "event": {"type": "phase_changed", "phase": "approval", "waiting_reason": "approval"},
         },
         {
@@ -320,6 +332,10 @@ def test_renderers_show_approval_and_snapshot_gap_without_llm(capsys):
     for event in events:
         rich.handle(event)
         plain.handle(event)
+    assert "routine refresh" not in output.getvalue()
+    assert "phase_changed" not in output.getvalue()
+    assert "waiting for instructions" not in output.getvalue()
+    assert "turn completed" not in output.getvalue()
     assert "waiting for approval" in output.getvalue()
     assert "last activity 3s ago" in output.getvalue()
     assert "waiting for approval" in capsys.readouterr().out
