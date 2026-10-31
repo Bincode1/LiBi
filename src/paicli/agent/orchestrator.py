@@ -42,6 +42,10 @@ class StepStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class InvalidPlanError(ValueError):
+    """Planner output is structurally invalid and must not be executed."""
+
+
 class AgentRunMode(StrEnum):
     REACT = "react"
     PLAN = "plan"
@@ -620,19 +624,23 @@ class AgentOrchestrator:
     def parse_plan(self, plan_json: str) -> list[ExecutionStep]:
         try:
             data = _parse_json_object(plan_json)
-        except (json.JSONDecodeError, ValueError):
-            return []
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise InvalidPlanError(f"invalid planner JSON: {exc}") from exc
         nodes = data.get("steps") or data.get("tasks") or []
         if not isinstance(nodes, list) or not nodes:
-            return []
+            raise InvalidPlanError("planner output must contain a non-empty steps/tasks list")
         id_mapping: dict[str, str] = {}
         steps: list[ExecutionStep] = []
+        normalized_nodes: list[tuple[int, dict[str, Any]]] = []
         for index, node in enumerate(nodes, start=1):
             if not isinstance(node, dict):
-                continue
+                raise InvalidPlanError(f"step {index} must be an object")
             original_id = str(node.get("id") or f"step_{index}")
+            if original_id in id_mapping:
+                raise InvalidPlanError(f"duplicate step id: {original_id}")
             new_id = f"step_{index}"
             id_mapping[original_id] = new_id
+            normalized_nodes.append((index, node))
             steps.append(
                 ExecutionStep(
                     id=new_id,
@@ -651,16 +659,50 @@ class AgentOrchestrator:
                     ),
                 )
             )
-        for index, node in enumerate(nodes, start=1):
-            if not isinstance(node, dict) or index > len(steps):
-                continue
+        for step, (_index, node) in zip(steps, normalized_nodes, strict=True):
             raw_deps = node.get("dependencies") or []
             if not isinstance(raw_deps, list):
-                continue
-            steps[index - 1].dependencies = [
-                id_mapping.get(str(dep), str(dep)) for dep in raw_deps if str(dep)
-            ]
+                raise InvalidPlanError(f"step {step.id} dependencies must be a list")
+            dependencies: list[str] = []
+            for dep in raw_deps:
+                dep_id = str(dep).strip()
+                if not dep_id:
+                    raise InvalidPlanError(f"step {step.id} contains an empty dependency")
+                normalized = id_mapping.get(dep_id)
+                if normalized is None:
+                    raise InvalidPlanError(
+                        f"step {step.id} references unknown dependency: {dep_id}"
+                    )
+                if normalized == step.id:
+                    raise InvalidPlanError(f"step {step.id} cannot depend on itself")
+                if normalized in dependencies:
+                    raise InvalidPlanError(
+                        f"step {step.id} repeats dependency: {dep_id}"
+                    )
+                dependencies.append(normalized)
+            step.dependencies = dependencies
+        self._validate_plan_graph(steps)
         return steps
+
+    @staticmethod
+    def _validate_plan_graph(steps: list[ExecutionStep]) -> None:
+        graph = {step.id: tuple(step.dependencies) for step in steps}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(step_id: str) -> None:
+            if step_id in visiting:
+                raise InvalidPlanError(f"planner dependency cycle includes: {step_id}")
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            for dependency in graph[step_id]:
+                visit(dependency)
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step_id in graph:
+            visit(step_id)
 
     def get_executable_steps(self, steps: list[ExecutionStep]) -> list[ExecutionStep]:
         status = {step.id: step.status for step in steps}

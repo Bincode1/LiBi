@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from paicli.agent.orchestrator import (
     AgentMessage,
     AgentMessageType,
@@ -36,6 +38,31 @@ def test_orchestrator_parses_steps_and_review_output(tmp_path, monkeypatch):
     assert "缺少验证" in orchestrator.parse_review_issues(
         '{"approved": false, "issues": ["缺少验证"]}'
     )
+
+
+@pytest.mark.parametrize(
+    "plan, message",
+    [
+        ('{"steps":[null]}', "must be an object"),
+        ('{"steps":[{"id":"a"},{"id":"a"}]}', "duplicate step id"),
+        ('{"steps":[{"id":"a","dependencies":["missing"]}]}', "unknown dependency"),
+        ('{"steps":[{"id":"a","dependencies":["a"]}]}', "cannot depend on itself"),
+        (
+            '{"steps":[{"id":"a","dependencies":["b"]},'
+            '{"id":"b","dependencies":["a"]}]}',
+            "dependency cycle",
+        ),
+        (
+            '{"steps":[{"id":"a"},{"id":"b","dependencies":["a","a"]}]}',
+            "repeats dependency",
+        ),
+    ],
+)
+def test_orchestrator_rejects_invalid_task_graph(tmp_path, monkeypatch, plan, message):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    orchestrator = _orchestrator(tmp_path, FakeTeamClient())
+    with pytest.raises(ValueError, match=message):
+        orchestrator.parse_plan(plan)
 
 
 def test_orchestrator_runs_independent_workers_in_parallel(tmp_path, monkeypatch):
