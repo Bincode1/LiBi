@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import threading
 
+import pytest
+
 from paicli.config import load_config
 from paicli.runtime import DurableTaskManager
 from paicli.runtime.api import RuntimeApiServer, _engine_events
@@ -116,6 +118,38 @@ def test_runtime_thread_history_persists_between_turns(tmp_path, monkeypatch):
     ]
 
 
+def test_runtime_initialization_failure_closes_canonical_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(project_root=tmp_path)
+    config.llm.api_key = "unit-placeholder"
+    server = RuntimeApiServer(
+        cwd=str(tmp_path), config=config, api_key="unit-runtime-placeholder", workers=1
+    )
+    thread_id = server._create_thread()
+
+    async def fail_registry(**_kwargs):
+        raise RuntimeError("registry initialization failed")
+
+    monkeypatch.setattr("paicli.runtime.api.build_tool_registry", fail_registry)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="registry initialization failed"):
+            await server._run_turn(thread_id, "hello")
+
+    import asyncio
+
+    asyncio.run(run())
+    lifecycle = [
+        event
+        for event in server.session_store.events(thread_id)
+        if event.event_type in {"turn/started", "turn/failed", "turn/completed"}
+    ]
+    assert [event.event_type for event in lifecycle] == ["turn/started", "turn/failed"]
+    state = server.session_store.state(thread_id)
+    assert state.status == "failed"
+    assert state.active_turn_id is None
+
+
 def test_runtime_event_sse_resumes_after_cursor(tmp_path):
     class Request:
         def __init__(self):
@@ -183,6 +217,34 @@ def test_runtime_events_accepts_last_event_id_header(tmp_path):
     assert request.status == 200
     assert f"id: {second.sequence}\nevent: turn/completed" in body
     assert "turn/started" not in body
+
+
+def test_runtime_console_json_events_include_child_sessions(tmp_path):
+    server = RuntimeApiServer.__new__(RuntimeApiServer)
+    server.db_path = tmp_path / "runtime.db"
+    server._ensure_schema()
+    server.session_store = SessionStore(server.db_path)
+    server.session_store.create_session("root-thread")
+    server.session_store.create_session("child-session")
+    server.session_store.append(
+        "root-thread",
+        "agent/subagent_catalog",
+        {"child_id": "child-1", "child_session_id": "child-session"},
+        source="subagent-manager",
+    )
+    server.session_store.append(
+        "child-session",
+        "tool/execution_started",
+        {"name": "read_file"},
+        source="tool-executor",
+    )
+
+    payload = server._events_json("root-thread", 0)
+
+    assert any(
+        event.get("agent_id") == "child-1" and event["type"] == "tool/execution_started"
+        for event in payload["events"]
+    )
 
 
 def test_runtime_history_sync_keeps_legacy_messages_when_projection_fails(tmp_path, monkeypatch):

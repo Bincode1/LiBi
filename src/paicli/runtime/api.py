@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import threading
+import uuid
 from contextlib import aclosing
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -47,6 +48,8 @@ class RuntimeApiServer:
         )
         self.workers = workers
         self._stop = threading.Event()
+        self._background_turns: dict[str, dict[str, Any]] = {}
+        self._background_turns_lock = threading.Lock()
         self._ensure_schema()
         self.session_store = SessionStore(
             self.db_path, sensitive_values=(api_key, config.llm.api_key)
@@ -98,16 +101,24 @@ class RuntimeApiServer:
             thread.start()
 
     def _handle(self, request: BaseHTTPRequestHandler) -> None:
+        path = request.path.split("?", 1)[0]
         if not self._authorized(request):
             _send_json(request, 401, {"error": "unauthorized"})
             return
         method = request.command
-        path = request.path.split("?", 1)[0]
-        body = _read_json(request)
+        try:
+            body = _read_json(request)
+        except ValueError as exc:
+            _send_json(request, 400, {"error": str(exc)})
+            return
         try:
             if method == "POST" and path == "/v1/threads":
                 thread_id = self._create_thread()
                 _send_json(request, 200, {"id": thread_id})
+            elif method == "GET" and path == "/v1/threads":
+                _send_json(request, 200, {"threads": self._list_threads()})
+            elif method == "GET" and path == "/v1/health":
+                _send_json(request, 200, {"status": "ok", "cwd": self.cwd})
             elif method == "POST" and path.startswith("/v1/threads/") and path.endswith("/turns"):
                 thread_id = path.split("/")[3]
                 message = str(body.get("message") or body.get("prompt") or "")
@@ -117,6 +128,31 @@ class RuntimeApiServer:
                 mode = _mode_from_body(body)
                 result = asyncio.run(self._run_turn(thread_id, message, mode=mode))
                 _send_json(request, 200, result)
+            elif (
+                method == "POST"
+                and path.startswith("/v1/threads/")
+                and path.endswith("/turns/async")
+            ):
+                thread_id = path.split("/")[3]
+                message = str(body.get("message") or body.get("prompt") or "")
+                if not message:
+                    _send_json(request, 400, {"error": "message is required"})
+                    return
+                mode = _mode_from_body(body)
+                run_id = self._start_background_turn(thread_id, message, mode=mode)
+                _send_json(request, 202, {"run_id": run_id, "thread_id": thread_id, "mode": mode})
+            elif (
+                method == "GET"
+                and path.startswith("/v1/threads/")
+                and path.endswith("/events.json")
+            ):
+                thread_id = path.split("/")[3]
+                query_cursor = parse_qs(request.path.partition("?")[2]).get("cursor", ["0"])[0]
+                try:
+                    after_sequence = max(0, int(query_cursor))
+                except ValueError as exc:
+                    raise ValueError("cursor must be a non-negative integer") from exc
+                _send_json(request, 200, self._events_json(thread_id, after_sequence))
             elif method == "GET" and path.startswith("/v1/threads/") and path.endswith("/events"):
                 thread_id = path.split("/")[3]
                 query_cursor = parse_qs(request.path.partition("?")[2]).get("cursor", [None])[0]
@@ -155,21 +191,24 @@ class RuntimeApiServer:
     ) -> dict[str, Any]:
         self._ensure_llm_key()
         mode = _validate_mode(mode)
+        turn_id = f"turn_{uuid.uuid4().hex}"
         self._append_event(thread_id, "turn.started", {"mode": mode})
-        registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
-        engine = QueryEngine(
-            llm_client=create_llm_client(self.config.llm),
-            tool_registry=registry,
-            config=self.config,
-            cwd=self.cwd,
-            session_store=self.session_store,
-            session_id=thread_id,
-        )
-        history = self._thread_history(thread_id) if mode == "react" else []
+        runtime_boundary = self.session_store.events(thread_id)[-1].sequence
+        engine: QueryEngine | None = None
         text = ""
-        events = _engine_events(engine, mode, message, history=history)
         total_tokens = 0
         try:
+            registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
+            engine = QueryEngine(
+                llm_client=create_llm_client(self.config.llm),
+                tool_registry=registry,
+                config=self.config,
+                cwd=self.cwd,
+                session_store=self.session_store,
+                session_id=thread_id,
+            )
+            history = self._thread_history(thread_id) if mode == "react" else []
+            events = _engine_events(engine, mode, message, history=history)
             async with aclosing(events):
                 async for event in events:
                     event_type = str(event.get("type"))
@@ -189,8 +228,31 @@ class RuntimeApiServer:
                             )
                         if event_type == "done":
                             total_tokens = int(event.get("total_tokens") or 0)
-        finally:
-            await engine.aclose()
+        except asyncio.CancelledError:
+            self._close_unowned_turn(
+                thread_id,
+                turn_id,
+                mode=mode,
+                status="turn/canceled",
+                detail={"mode": mode},
+                after_sequence=runtime_boundary,
+            )
+            raise
+        except Exception as exc:
+            self._close_unowned_turn(
+                thread_id,
+                turn_id,
+                mode=mode,
+                status="turn/failed",
+                detail={"error_type": type(exc).__name__},
+                after_sequence=runtime_boundary,
+            )
+            raise
+        if engine is not None:
+            try:
+                await engine.aclose()
+            except Exception:
+                raise
         self._append_event(
             thread_id,
             "turn.completed",
@@ -203,6 +265,164 @@ class RuntimeApiServer:
             "mode": mode,
             "total_tokens": total_tokens,
         }
+
+    def _start_background_turn(self, thread_id: str, message: str, *, mode: str) -> str:
+        run_id = f"run_{uuid.uuid4().hex}"
+        with self._background_turns_lock:
+            self._background_turns[run_id] = {
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "mode": mode,
+                "status": "running",
+                "started_at": datetime.now(UTC).isoformat(),
+            }
+
+        def runner() -> None:
+            try:
+                result = asyncio.run(self._run_turn(thread_id, message, mode=mode))
+                outcome = {"status": "completed", "result": result}
+            except Exception as exc:  # noqa: BLE001 - background task boundary
+                outcome = {"status": "failed", "error": type(exc).__name__}
+            with self._background_turns_lock:
+                record = self._background_turns.get(run_id)
+                if record is not None:
+                    record.update(outcome, finished_at=datetime.now(UTC).isoformat())
+
+        threading.Thread(target=runner, name=f"paicli-turn-{run_id}", daemon=True).start()
+        return run_id
+
+    def _list_threads(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "select id, created_at from sessions order by created_at desc"
+            ).fetchall()
+            child_rows = conn.execute(
+                "select payload from events where type = 'agent/subagent_catalog'"
+            ).fetchall()
+        child_sessions = set()
+        for (payload,) in child_rows:
+            try:
+                child_id = json.loads(payload).get("child_session_id")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if child_id:
+                child_sessions.add(str(child_id))
+        result = []
+        for thread_id, created_at in rows:
+            if thread_id in child_sessions:
+                continue
+            state = self.session_store.state(thread_id)
+            events = self.session_store.events(thread_id)
+            prompt = next(
+                (
+                    str(event.payload.get("content") or "")
+                    for event in events
+                    if event.event_type == "user/message"
+                ),
+                "",
+            )
+            result.append(
+                {
+                    "id": thread_id,
+                    "created_at": created_at,
+                    "status": state.status,
+                    "last_sequence": state.last_sequence,
+                    "prompt": prompt[:160],
+                }
+            )
+        return result[:100]
+
+    def _events_json(self, thread_id: str, after_sequence: int) -> dict[str, Any]:
+        parent_events = self.session_store.events(thread_id, after_sequence=after_sequence)
+        all_parent_events = self.session_store.events(thread_id)
+        child_sessions = {
+            str(event.payload.get("child_session_id")): str(event.payload.get("child_id"))
+            for event in all_parent_events
+            if event.event_type == "agent/subagent_catalog"
+            and event.payload.get("child_session_id")
+            and event.payload.get("child_id")
+        }
+        child_events: list[tuple[str, str, Any]] = []
+        for child_session, agent_id in child_sessions.items():
+            child_events.extend(
+                (child_session, agent_id, event)
+                for event in self.session_store.events(child_session)
+            )
+        state = self.session_store.state(thread_id)
+        serialized = [self._serialize_event(event) for event in parent_events]
+        serialized.extend(
+            {
+                **self._serialize_event(event),
+                "sequence": 0,
+                "agent_session_id": child_session,
+                "agent_id": agent_id,
+                "source": f"child:{child_session}",
+            }
+            for child_session, agent_id, event in child_events
+        )
+        serialized.sort(key=lambda item: (item["created_at"], item["sequence"], item["id"]))
+        return {
+            "thread_id": thread_id,
+            "events": serialized,
+            "next_cursor": state.last_sequence,
+            "state": asdict(state),
+        }
+
+    @staticmethod
+    def _serialize_event(event: Any) -> dict[str, Any]:
+        return {
+            "id": event.event_id,
+            "sequence": event.sequence,
+            "type": event.event_type,
+            "payload": event.payload,
+            "created_at": event.created_at,
+            "turn_id": event.turn_id,
+            "step_id": event.step_id,
+            "tool_call_id": event.tool_call_id,
+            "source": event.source,
+        }
+
+    def _close_unowned_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        mode: str,
+        status: str,
+        detail: dict[str, Any],
+        after_sequence: int,
+    ) -> None:
+        if any(
+            event.event_type == "turn/started"
+            for event in self.session_store.events(thread_id)
+            if event.sequence > after_sequence
+        ):
+            return
+        state = self.session_store.state(thread_id)
+        if state.active_turn_id is not None:
+            if state.active_turn_id == turn_id:
+                self.session_store.append(
+                    thread_id,
+                    status,
+                    detail,
+                    turn_id=turn_id,
+                    source="runtime-recovery",
+                )
+            return
+        self.session_store.append(
+            thread_id,
+            "turn/started",
+            {"mode": mode, "synthetic": True},
+            turn_id=turn_id,
+            source="runtime-recovery",
+        )
+        self.session_store.append(
+            thread_id,
+            status,
+            detail,
+            turn_id=turn_id,
+            source="runtime-recovery",
+        )
 
     def _worker_loop(self, worker_id: str) -> None:
         while not self._stop.is_set():
@@ -466,9 +686,11 @@ def _read_json(request: BaseHTTPRequestHandler) -> dict[str, Any]:
         return {}
     try:
         value = json.loads(request.rfile.read(length).decode("utf-8"))
-    except json.JSONDecodeError:
-        return {}
-    return value if isinstance(value, dict) else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("malformed JSON body") from exc
+    if not isinstance(value, dict):
+        raise ValueError("JSON body must be an object")
+    return value
 
 
 def _send_json(request: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
