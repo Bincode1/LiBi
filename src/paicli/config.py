@@ -153,6 +153,8 @@ def load_config(
 
     data = _apply_env(data, env_map)
     config = _dict_to_config(data)
+    if config.prompt.agent_mode not in {"react", "plan"}:
+        raise ValueError("prompt.agent_mode must be react or plan; Team mode has been removed")
     config.memory.long_term_db_path = _expand_home(config.memory.long_term_db_path)
     config.policy.audit_log_path = _expand_home(config.policy.audit_log_path)
     return config

@@ -461,9 +461,13 @@ class RuntimeApiServer:
                 return
 
     async def _run_task(self, task: TaskRecord) -> str:
-        self._ensure_llm_key()
         if self.task_manager.is_canceled(task.id):
             raise TaskCanceledError(task.id)
+        if task.mode not in TASK_MODES:
+            raise ValueError(
+                f"task mode {task.mode!r} is no longer supported; recreate it as react or plan"
+            )
+        self._ensure_llm_key()
         registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
         engine = QueryEngine(
             llm_client=create_llm_client(self.config.llm),
@@ -759,6 +763,6 @@ def _validate_mode(mode: str) -> str:
 def _engine_events(engine: QueryEngine, mode: str, message: str, *, history=None):
     if mode == "plan":
         return engine.plan(message)
-    if mode == "team":
-        return engine.team(message)
+    if mode != "react":
+        raise ValueError(f"mode {mode!r} is no longer supported; use react or plan")
     return engine.ask(message, history=history)

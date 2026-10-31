@@ -29,7 +29,6 @@ class RichRenderer:
         self._buffer: list[str] = []
         self._thinking_buffer: list[str] = []
         self._thinking_scope: str | None = None
-        self._team_output_scope: str | None = None
         self._live_markdown = live_markdown
         self._live: Live | None = None
         self._thinking_live: Live | None = None
@@ -54,7 +53,6 @@ class RichRenderer:
         self._buffer.clear()
         self._thinking_buffer.clear()
         self._thinking_scope = None
-        self._team_output_scope = None
         self._stop_live_markdown()
         self._stop_live_thinking()
         self._input_tokens = 0
@@ -131,22 +129,6 @@ class RichRenderer:
             text = str(event.get("text") or "")
             self._buffer.append(text)
             self._update_live_markdown()
-        elif event_type == "team_text_delta":
-            self._flush_thinking()
-            scope = _team_scope(event)
-            if scope != self._team_output_scope:
-                if self._team_output_scope is not None:
-                    self.console.print()
-                self.console.print(Text(f"[{_team_title(event)}]", style="bold #22d3ee"))
-                self._team_output_scope = scope
-            self.console.print(Text(str(event.get("text") or ""), style="#e5e7eb"), end="")
-        elif event_type == "team_status":
-            self._finish_team_output()
-            self._flush_thinking()
-            self._flush_markdown(title="Team")
-            message = str(event.get("message") or "")
-            style = "bold red" if event.get("error") else "bold #22d3ee"
-            self.console.print(Text(f"[{_team_title(event)}] {message}", style=style))
         elif event_type == "subagent_event":
             self._handle_subagent_event(event)
         elif event_type == "thinking_delta":
@@ -180,22 +162,15 @@ class RichRenderer:
             self._flush_markdown(title="Assistant Output")
             self._print_context_summary(event)
         elif event_type == "turn_complete":
-            if event.get("agent"):
-                self._finish_team_output()
-                return
             stop_reason = str(event.get("stop_reason") or "end_turn")
             title = "Assistant Output" if stop_reason == "tool_use" else "Final Output"
             self._flush_thinking()
             self._flush_markdown(title=title)
         elif event_type == "tool_call":
-            if event.get("agent"):
-                self._finish_team_output()
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
             self._print_tool_call(event)
         elif event_type == "tool_result":
-            if event.get("agent"):
-                self._finish_team_output()
             self._flush_thinking()
             self._flush_markdown(title="Assistant Output")
             self._print_tool_result(event)
@@ -207,7 +182,6 @@ class RichRenderer:
             if not self._run_saw_usage_event:
                 self._record_usage(event.get("usage") or {})
             self._flush_thinking()
-            self._finish_team_output()
             self._flush_markdown(title="Final Output")
             self._record_run_summary(event)
 
@@ -216,15 +190,8 @@ class RichRenderer:
 
     def newline(self) -> None:
         self._flush_thinking()
-        self._finish_team_output()
         self._flush_markdown(title="Final Output")
         self.console.print()
-
-    def _finish_team_output(self) -> None:
-        if self._team_output_scope is None:
-            return
-        self.console.print()
-        self._team_output_scope = None
 
     def _flush_markdown(self, *, title: str) -> None:
         if not self._buffer:
@@ -539,19 +506,6 @@ def _thinking_title(scope: str | None) -> str:
     if scope:
         return f"Thinking · {scope}"
     return "Thinking"
-
-
-def _team_scope(event: dict[str, Any]) -> str:
-    return ":".join(str(event.get(key) or "") for key in ("phase", "agent", "task_id"))
-
-
-def _team_title(event: dict[str, Any]) -> str:
-    parts = [
-        str(event.get("phase") or "team").capitalize(),
-        str(event.get("agent") or "").strip(),
-        str(event.get("task_id") or "").strip(),
-    ]
-    return " · ".join(part for part in parts if part)
 
 
 def _scoped_title(title: str, event: dict[str, Any]) -> str:

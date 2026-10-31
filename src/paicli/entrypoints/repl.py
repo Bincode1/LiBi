@@ -56,7 +56,6 @@ SLASH_COMMANDS = [
     "/index",
     "/search",
     "/plan",
-    "/team",
     "/model",
     "/usage",
     "/skill",
@@ -332,30 +331,6 @@ async def _handle_slash(
             )
             await _run_events(
                 query.plan(arg),
-                renderer,
-                agent.llm_client.max_context_window,
-            )
-    elif command == "/team":
-        if not arg:
-            console.print("[red]Usage:[/red] /team <task>")
-        else:
-            try:
-                worker_mode, team_task = _parse_mode_argument(arg)
-            except ValueError as exc:
-                console.print(f"[red]{exc}[/red]")
-                return False
-            session_id = agent._ensure_session()
-            query = QueryEngine(
-                llm_client=agent.llm_client,
-                tool_registry=registry,
-                config=config,
-                cwd=cwd,
-                approval_callback=agent.approval_callback,
-                session_store=agent.session_store,
-                session_id=session_id,
-            )
-            await _run_events(
-                query.team(team_task, worker_mode=worker_mode),
                 renderer,
                 agent.llm_client.max_context_window,
             )
@@ -728,7 +703,7 @@ def _task_command(arg: str, console: Console, cwd: str) -> None:
     sub, _, rest = arg.partition(" ")
     if sub == "add" and rest:
         try:
-            mode, prompt = _parse_mode_argument(rest, allowed={"react", "plan", "team"})
+            mode, prompt = _parse_mode_argument(rest, allowed={"react", "plan"})
         except ValueError as exc:
             console.print(f"[red]{exc}[/red]")
             return

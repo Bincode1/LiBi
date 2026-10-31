@@ -122,26 +122,6 @@ class QueryEngine:
         self.session_store = agent.session_store
         self.session_id = agent.session_id
 
-    async def team(self, message: str, *, worker_mode: str = "react"):
-        agent = Agent(
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry,
-            config=self.config,
-            cwd=self.cwd,
-            approval_callback=self.approval_callback,
-            mode="team",
-            team_worker_mode=worker_mode,
-            session_store=self.session_store,
-            session_id=self.session_id,
-        )
-        self._last_agent = agent
-        self.session_store = agent.session_store
-        self.session_id = agent.session_id
-        async for event in agent.run(message):
-            yield event
-        self.session_store = agent.session_store
-        self.session_id = agent.session_id
-
     async def ask_complete_async(
         self,
         message: str,
@@ -152,19 +132,11 @@ class QueryEngine:
     async def plan_complete_async(self, message: str) -> QueryResult:
         return await self._complete_from_events(self.plan(message))
 
-    async def team_complete_async(self, message: str, *, worker_mode: str = "react") -> QueryResult:
-        return await self._complete_from_events(self.team(message, worker_mode=worker_mode))
-
     def ask_complete(self, message: str, history: list[Message] | None = None) -> QueryResult:
         return asyncio.run(self._complete_and_close(self.ask_complete_async(message, history)))
 
     def plan_complete(self, message: str) -> QueryResult:
         return asyncio.run(self._complete_and_close(self.plan_complete_async(message)))
-
-    def team_complete(self, message: str, *, worker_mode: str = "react") -> QueryResult:
-        return asyncio.run(
-            self._complete_and_close(self.team_complete_async(message, worker_mode=worker_mode))
-        )
 
     async def _complete_from_events(self, events) -> QueryResult:
         text = ""

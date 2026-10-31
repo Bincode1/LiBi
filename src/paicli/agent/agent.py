@@ -3,12 +3,11 @@
 Integrates LLM API, parses natural-language instructions, schedules command
 and file operations via the tool system, and generates streaming responses.
 
-Supports three execution modes:
+Supports two execution modes:
     - react  : Standard ReAct loop (thought → tool → observation → answer)
     - plan   : Plan-then-execute with a DAG of sub-tasks
-    - team   : Multi-agent orchestrator (planner → workers → reviewer)
 
-All modes share the same streaming event protocol so callers can render
+Both modes share the same streaming event protocol so callers can render
 progress incrementally.
 """
 
@@ -23,7 +22,6 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
-from paicli.agent.orchestrator import AgentOrchestrator
 from paicli.agent.plan_execute import PlanExecuteAgent
 from paicli.config import PaiCliConfig
 from paicli.context import (
@@ -43,7 +41,7 @@ from paicli.tools.executor import ToolExecutor
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, QueryResult, Usage
 
-AgentMode = Literal["react", "plan", "team"]
+AgentMode = Literal["react", "plan"]
 
 
 class Agent:
@@ -78,8 +76,6 @@ class Agent:
         mode: AgentMode = "react",
         system_prompt: str | None = None,
         max_turns: int | None = None,
-        max_plan_depth: int = 1,
-        team_worker_mode: str = "react",
         session_store: SessionStore | None = None,
         session_id: str | None = None,
         subagent_manager: Any | None = None,
@@ -94,8 +90,8 @@ class Agent:
         self.approval_callback = approval_callback
         self.mode = mode
         self.max_turns = max_turns
-        self.max_plan_depth = max_plan_depth
-        self.team_worker_mode = team_worker_mode
+        if mode not in {"react", "plan"}:
+            raise ValueError("agent mode must be react or plan")
         self._owns_session_store = session_store is None
         self.session_store = session_store
         self.session_id = session_id
@@ -151,10 +147,6 @@ class Agent:
 
         ``text_delta``
             {"type": "text_delta", "text": "..."}
-        ``team_text_delta``
-            {"type": "team_text_delta", "text": "...", "phase": str, "agent": str}
-        ``team_status``
-            {"type": "team_status", "phase": str, "message": str, "agent": str}
         ``thinking_delta``
             {"type": "thinking_delta", "thinking": "..."}
         ``tool_call``
@@ -181,12 +173,6 @@ class Agent:
         try:
             if self.mode == "plan":
                 events = self._run_logged_mode(self._run_plan(message), message, "plan")
-                async for event in events:
-                    if self.event_sink is not None:
-                        await self.event_sink(event)
-                    yield event
-            elif self.mode == "team":
-                events = self._run_logged_mode(self._run_team(message), message, "team")
                 async for event in events:
                     if self.event_sink is not None:
                         await self.event_sink(event)
@@ -1147,23 +1133,6 @@ class Agent:
         agent.history = list(self.history)
 
         async for event in agent.run(message):
-            if event.get("type") == "done":
-                self.history = list(event.get("messages") or [])
-                self.last_usage = Usage.from_mapping(event.get("usage") or {})
-                self.last_cost = dict(event.get("cost") or {})
-            yield event
-
-    async def _run_team(self, message: str) -> AsyncIterator[dict[str, Any]]:
-        """Multi-agent team mode: planner → parallel workers → reviewer."""
-        orchestrator = AgentOrchestrator(
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry,
-            config=self.config,
-            cwd=self.cwd,
-            approval_callback=self.approval_callback,
-            default_worker_mode=self.team_worker_mode,
-        )
-        async for event in orchestrator.run(message):
             if event.get("type") == "done":
                 self.history = list(event.get("messages") or [])
                 self.last_usage = Usage.from_mapping(event.get("usage") or {})

@@ -31,7 +31,6 @@ uv sync --extra dev
 uv run paicli
 uv run paicli -p "解释这个仓库"
 uv run paicli --mode plan -p "先规划再执行"
-uv run paicli --mode team --worker-mode plan -p "并行审计核心模块"
 uv run paicli doctor --cwd .
 ```
 
@@ -51,19 +50,18 @@ uv run paicli doctor --cwd .
 
 ## 架构概览
 
-三条 Agent 执行路径必须共享真实的工具、策略、记忆、Skill 和快照能力：
+两条 Agent 执行路径必须共享真实的工具、策略、记忆、Skill 和快照能力：
 
 | 路径 | 主要入口 | 触发方式 |
 | --- | --- | --- |
 | ReAct | `agent/agent.py` | 默认交互或 `-p` |
 | Plan-and-Execute | `agent/plan_execute.py` | `/plan` 或 `--mode plan` |
-| Multi-Agent | `agent/orchestrator.py` | `/team` 或 `--mode team` |
 
 核心模块：
 
 ```text
 src/paicli/
-├── agent/       ReAct、Plan-and-Execute、Multi-Agent 编排
+├── agent/       ReAct、Plan-and-Execute、ReAct 子 Agent Runtime
 ├── entrypoints/ Typer CLI 与 prompt-toolkit REPL
 ├── llm/         模型抽象、OpenAI-compatible 客户端、usage/cost
 ├── tools/       工具定义、执行器、文件与命令操作
@@ -86,7 +84,7 @@ src/paicli/
 ## 修改联动规则
 
 - 改 CLI/斜杠命令：同步检查 `entrypoints/cli.py`、`entrypoints/repl.py`、README 和测试。
-- 改 Agent 行为：同时检查 ReAct、Plan、Team 和 SDK/Runtime 等公开入口，避免只修一条路径。
+- 改 Agent 行为：同时检查 ReAct、Plan、子 Agent Runtime 和 SDK/Runtime 等公开入口，避免只修一条路径。
 - 改工具：同步检查 Tool schema、`ToolExecutor`、只读/并发/危险级别、审批策略、审计和测试。
 - 改 HITL 或权限模式：同步检查审批回调、PathGuard、CommandGuard、MCP 写工具、终端状态显示和
   恢复默认策略的行为。

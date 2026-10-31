@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from paicli.config import load_config
 
 
@@ -58,3 +60,15 @@ def test_invalid_thinking_env_keeps_default(tmp_path, monkeypatch):
     config = load_config(project_root=tmp_path)
 
     assert config.llm.thinking_enabled is False
+
+
+def test_removed_team_mode_is_rejected_from_config(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".paicli"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text(
+        json.dumps({"prompt": {"agent_mode": "team"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Team mode has been removed"):
+        load_config(project_root=tmp_path)

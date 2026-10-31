@@ -275,47 +275,6 @@ def test_streaming_text_waits_for_turn_boundary_by_default():
     assert stream.getvalue().count("Final Output") == 1
 
 
-def test_team_progress_and_agent_text_render_immediately():
-    stream = StringIO()
-    renderer = RichRenderer(console=Console(file=stream, color_system=None, width=120))
-
-    renderer.handle(
-        {
-            "type": "team_status",
-            "phase": "workers",
-            "message": "Executing: inspect files",
-            "task_id": "step_1",
-            "agent": "worker-1",
-        }
-    )
-    assert "Executing: inspect files" in stream.getvalue()
-
-    renderer.handle(
-        {
-            "type": "team_text_delta",
-            "phase": "execution",
-            "agent": "worker-1",
-            "task_id": "step_1",
-            "text": "Checking the source",
-        }
-    )
-    assert "Checking the source" in stream.getvalue()
-
-    renderer.handle(
-        {
-            "type": "tool_call",
-            "phase": "execution",
-            "agent": "worker-1",
-            "task_id": "step_1",
-            "name": "list_dir",
-            "input": {"path": "."},
-        }
-    )
-    output = stream.getvalue()
-    assert "Tool Use" in output
-    assert "execution · worker-1 · step_1" in output
-
-
 def test_tool_use_and_result_render_as_structured_panels():
     stream = StringIO()
     console = Console(file=stream, color_system=None, width=120)

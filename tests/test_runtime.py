@@ -6,7 +6,7 @@ import threading
 import pytest
 
 from paicli.config import load_config
-from paicli.runtime import DurableTaskManager
+from paicli.runtime import DurableTaskManager, TaskRecord
 from paicli.runtime.api import RuntimeApiServer, _engine_events
 from paicli.session import SessionStore
 
@@ -75,7 +75,7 @@ def test_cancel_running_task_cannot_be_overwritten_by_worker_completion(tmp_path
 
 def test_expired_worker_lease_is_reclaimed(tmp_path):
     manager = DurableTaskManager(tmp_path / "tasks.db")
-    task_id = manager.add("do work", mode="team")
+    task_id = manager.add("do work", mode="plan")
     first = manager.claim_next("worker-1", lease_seconds=-1)
     assert first is not None
 
@@ -91,11 +91,33 @@ def test_task_mode_validation(tmp_path):
     manager = DurableTaskManager(tmp_path / "tasks.db")
 
     try:
-        manager.add("bad", mode="unknown")
+        manager.add("bad", mode="team")
     except ValueError as exc:
         assert "task mode" in str(exc)
     else:  # pragma: no cover - explicit failure message
         raise AssertionError("invalid task mode was accepted")
+
+
+def test_legacy_team_task_fails_explicitly(tmp_path):
+    class TaskManager:
+        def is_canceled(self, task_id):  # noqa: ARG002
+            return False
+
+    server = RuntimeApiServer.__new__(RuntimeApiServer)
+    server.task_manager = TaskManager()
+    task = TaskRecord(
+        id="legacy-team-task",
+        prompt="old task",
+        status="running",
+        created_at="",
+        updated_at="",
+        mode="team",
+    )
+
+    import asyncio
+
+    with pytest.raises(ValueError, match="no longer supported"):
+        asyncio.run(server._run_task(task))
 
 
 def test_runtime_thread_history_persists_between_turns(tmp_path, monkeypatch):
@@ -280,7 +302,7 @@ def test_runtime_history_sync_keeps_legacy_messages_when_projection_fails(tmp_pa
     assert rows == [("user", "legacy")]
 
 
-def test_runtime_routes_react_plan_and_team_modes():
+def test_runtime_routes_react_and_plan_modes():
     class Engine:
         def ask(self, message, history=None):
             return ("react", message, history)
@@ -288,14 +310,12 @@ def test_runtime_routes_react_plan_and_team_modes():
         def plan(self, message):
             return ("plan", message)
 
-        def team(self, message):
-            return ("team", message)
-
     engine = Engine()
 
     assert _engine_events(engine, "react", "x", history=["h"])[0] == "react"
     assert _engine_events(engine, "plan", "x")[0] == "plan"
-    assert _engine_events(engine, "team", "x")[0] == "team"
+    with pytest.raises(ValueError, match="no longer supported"):
+        _engine_events(engine, "team", "x")
 
 
 def test_task_workers_do_not_consume_another_project_scope(tmp_path):

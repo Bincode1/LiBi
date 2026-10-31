@@ -31,8 +31,7 @@ PaiCLI Python 是一个运行在终端里的 AI Agent CLI，面向真实项目�
 - 支持 `DEEPSEEK_API_KEY` 等 provider-specific API Key
 - ReAct 工具调用循环，支持 thinking、tool call、tool result、final output 和 usage 事件
 - Plan-and-Execute 模式，使用独立 Planner 生成 DAG，并按依赖批次执行可并行任务
-- Multi-Agent 协作模式，包含 Planner、Worker、Reviewer、依赖调度、并行 worker、review
-  重试，以及可切换到独立 Plan-and-Execute 的子 Agent
+- ReAct 子 Agent 委派，支持独立上下文、事件观察、取消和生命周期管理
 - 内置文件、Shell、grep、glob、记忆、网页搜索、网页抓取、代码搜索等工具
 - HITL 人工确认、命令/路径安全策略和 JSONL 审计日志
 - MCP client，支持 stdio 和 Streamable HTTP MCP server
@@ -41,7 +40,7 @@ PaiCLI Python 是一个运行在终端里的 AI Agent CLI，面向真实项目�
 - Chrome DevTools MCP 配置助手
 - PaiCLI 自身也可以作为 MCP server 暴露内置工具
 - Runtime API，支持有历史的 thread、turn、事件日志，以及带原子抢占、租约恢复、取消保护、
-  项目隔离和 `react|plan|team` 模式的持久化后台任务
+  项目隔离和 `react|plan` 模式的持久化后台任务
 - 静态项目记忆 + SQLite 动态长期记忆，支持元数据、去重、TTL、容量治理和相关性召回
 - 上下文预算与压缩：达到可用输入预算的 80% 后压缩旧轮次，保留近期消息和完整工具调用对
 - 完整 usage、缓存命中/未命中 Token、reasoning Token 和可配置成本估算
@@ -80,7 +79,6 @@ uv run paicli -p "帮我总结这个项目"
 
 ```bash
 uv run paicli --mode plan -p "先读取 README，再验证项目" --json
-uv run paicli --mode team --worker-mode plan -p "并行审计核心模块" --json
 ```
 
 检查当前环境：
@@ -172,8 +170,6 @@ uv run paicli -p "解释这个仓库"
 /index [path]
 /search <query>
 /plan <task>
-/team <task>
-/team --plan <task>
 /model
 /model <model-id>
 /model <provider> <model-id>
@@ -186,7 +182,7 @@ uv run paicli -p "解释这个仓库"
 /skill reload
 /mcp
 /task
-/task add [--mode react|plan|team] <task>
+/task add [--mode react|plan] <task>
 /task cancel <task_id>
 /task log <task_id>
 /snapshot
@@ -429,7 +425,6 @@ result = engine.ask_complete("解释这个项目")
 print(result.text)
 
 plan_result = engine.plan_complete("先读取 README，再总结项目结构")
-team_result = engine.team_complete("让多个 Agent 并行检查核心模块")
 ```
 
 ## 开发
