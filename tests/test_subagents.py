@@ -172,7 +172,9 @@ def test_send_message_continues_a_parked_local_child(tmp_path, monkeypatch):
             await asyncio.sleep(0)
         await manager.interrupt(activation.id)
         assert calls == 2
-        assert activation.status == ActivationState.CANCELED
+        assert activation.status == ActivationState.IDLE_WAITING
+        assert await manager.dispose(activation.id)
+        assert activation.status == ActivationState.DISPOSED
         await manager.drain()
 
     asyncio.run(run())
@@ -349,15 +351,17 @@ def test_settlement_creates_and_acknowledges_durable_delivery(tmp_path, monkeypa
         activation = next(iter(manager.activations.values()))
         while activation.status != ActivationState.IDLE_WAITING:
             await asyncio.sleep(0)
-        await manager.interrupt(activation.id)
+        assert await manager.interrupt(activation.id)
+        assert activation.status == ActivationState.IDLE_WAITING
+        assert not activation.settled
+        assert await manager.dispose(activation.id)
         while not activation.settled:
             await asyncio.sleep(0)
         events = context.session_store.events(context.session_id)
         created = [event for event in events if event.event_type == "agent/child_delivery_created"]
-        assert len(created) == 2
-        assert created[-1].payload["delivery_id"] == activation.delivery_id
+        assert len(created) == 1
+        assert created[0].payload["delivery_id"] == activation.delivery_id
         assert created[0].payload["result_status"] == "completed"
-        assert created[-1].payload["result_status"] == "canceled"
         controller = RunController(
             manager=manager,
             parent_id="root",
@@ -365,15 +369,15 @@ def test_settlement_creates_and_acknowledges_durable_delivery(tmp_path, monkeypa
             session_store=context.session_store,
         )
         deliveries = controller.collect_deliveries()
-        assert len(deliveries) == 2
-        assert deliveries[-1].delivery_id == activation.delivery_id
+        assert len(deliveries) == 1
+        assert deliveries[0].delivery_id == activation.delivery_id
         assert controller.collect_deliveries() == []
         acked = [
             event
             for event in context.session_store.events(context.session_id)
             if event.event_type == "agent/child_delivery_acknowledged"
         ]
-        assert len(acked) == 2
+        assert len(acked) == 1
         await manager.drain()
 
     asyncio.run(run())
@@ -778,6 +782,7 @@ def test_deferred_ack_marks_activation_and_persists_ack(tmp_path, monkeypatch):
         while activation.status != ActivationState.IDLE_WAITING:
             await asyncio.sleep(0)
         await manager.interrupt(activation.id)
+        assert await manager.dispose(activation.id)
         while not activation.settled:
             await asyncio.sleep(0)
         controller = RunController(

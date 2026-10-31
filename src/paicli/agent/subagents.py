@@ -199,6 +199,7 @@ class Activation:
     stream_buffers: dict[str, str] = field(default_factory=dict)
     hidden_channels: set[str] = field(default_factory=set)
     completed_runs: set[str] = field(default_factory=set)
+    delivery_run_id: str | None = None
     ended_published: bool = False
     waiting_tools: set[str] = field(default_factory=set)
     pending_tools: dict[str, str] = field(default_factory=dict)
@@ -720,6 +721,10 @@ class SubagentManager:
     def _create_delivery(self, activation: Activation, status: str, result: str) -> None:
         if self.session_store is None or not activation.parent_session_id:
             raise RuntimeError("Child results require parent session persistence.")
+        # A run may publish its result while entering the parked state. Settlement
+        # of the same run must not publish a second parent notice.
+        if activation.delivery_run_id == activation.run_id:
+            return
         delivery_id = f"delivery_{uuid.uuid4().hex}"
         result = self.redactor.clean(result)
         self.session_store.append(
@@ -748,6 +753,7 @@ class SubagentManager:
             activation.error_code,
         )
         activation.delivery_id = delivery_id
+        activation.delivery_run_id = activation.run_id
         activation.result_available = True
         activation.delivered = False
 
@@ -1420,6 +1426,10 @@ class SubagentManager:
                 ActivationState.IDLE_WAITING,
             }:
                 return False
+            if activation.status == ActivationState.IDLE_WAITING:
+                # Parked continuable activations remain resident; interrupting
+                # them must not create a second terminal settlement or delivery.
+                return True
             self.transition(activation, ActivationState.STOPPING)
             activation.error_code = "INTERRUPTED"
         if activation.provider_adapter is None:
