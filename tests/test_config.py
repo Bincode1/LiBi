@@ -40,3 +40,21 @@ def test_provider_specific_api_key(tmp_path, monkeypatch):
     config = load_config(project_root=tmp_path)
 
     assert config.llm.api_key == "deepseek-key"
+
+
+def test_thinking_is_disabled_by_default_and_can_be_enabled_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PAICLI_THINKING", "true")
+
+    config = load_config(project_root=tmp_path)
+
+    assert config.llm.thinking_enabled is True
+
+
+def test_invalid_thinking_env_keeps_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PAICLI_THINKING", "maybe")
+
+    config = load_config(project_root=tmp_path)
+
+    assert config.llm.thinking_enabled is False

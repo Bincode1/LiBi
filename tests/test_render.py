@@ -25,7 +25,7 @@ def test_banner_renders_pi_home_layout():
     renderer = RichRenderer(console=console)
 
     renderer.banner(
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         provider="deepseek",
         cwd="/tmp/project",
         tools=12,
@@ -48,7 +48,7 @@ def test_banner_renders_pi_home_layout():
 def test_prompt_message_keeps_status_and_input_together():
     prompt = _prompt_message(
         cwd="/tmp/project",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         tools=12,
         agents_files=2,
         mcp_servers=1,
@@ -61,7 +61,7 @@ def test_prompt_message_keeps_status_and_input_together():
     assert "1 MCP server" in plain
     assert "3 skills · Tools 12" in plain
     assert "Default  Shift+Tab" in plain
-    assert "deepseek-v4-flash" in plain
+    assert "deepseek-flash" in plain
     assert "█░░░░░░░░░░░ 1%" in plain
     assert "/tmp/project" in plain
     assert "\n\n* " in plain
@@ -118,7 +118,7 @@ def test_shift_tab_input_toggles_live_permission_mode(tmp_path):
 def test_bottom_toolbar_uses_runtime_summary_segments():
     toolbar = _bottom_toolbar(
         "/Users/me/project",
-        "deepseek-v4-flash",
+        "deepseek-flash",
         {
             "turns": 1,
             "total_tokens": 13187,
@@ -128,7 +128,7 @@ def test_bottom_toolbar_uses_runtime_summary_segments():
         },
     )
 
-    assert ("class:toolbar.model", "deepseek-v4-flash") in toolbar
+    assert ("class:toolbar.model", "deepseek-flash") in toolbar
     assert ("class:toolbar.ctx.bar", "█░░░░░░░░░░░") in toolbar
     assert ("class:toolbar.ctx.value", "1%") in toolbar
     assert ("class:toolbar.cache", "Cache hit 97%") in toolbar
@@ -430,8 +430,8 @@ def test_missing_usage_keeps_toolbar_tokens_unavailable():
     renderer.handle({"type": "done", "total_turns": 1, "total_tokens": 0})
 
     assert "Run Summary" not in stream.getvalue()
-    toolbar = _bottom_toolbar("/tmp/project", "deepseek-v4-flash", renderer.toolbar_status())
-    assert ("class:toolbar.model", "deepseek-v4-flash") in toolbar
+    toolbar = _bottom_toolbar("/tmp/project", "deepseek-flash", renderer.toolbar_status())
+    assert ("class:toolbar.model", "deepseek-flash") in toolbar
     assert ("class:toolbar.ctx.bar", "░░░░░░░░░░░░") in toolbar
     assert ("class:toolbar.ctx.value", "0%") in toolbar
     assert ("class:toolbar.cache", "Cache hit —") in toolbar

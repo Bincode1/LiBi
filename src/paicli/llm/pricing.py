@@ -61,8 +61,8 @@ class CostBreakdown:
 
 
 DEEPSEEK_V4_PRICE_PROFILES: dict[str, ModelPriceProfile] = {
-    "deepseek-v4-flash": ModelPriceProfile(
-        model="deepseek-v4-flash",
+    "deepseek-flash": ModelPriceProfile(
+        model="deepseek-flash",
         context_window=1_000_000,
         prices={
             "usd": PerMillionTokenPrices(

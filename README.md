@@ -104,7 +104,7 @@ PaiCLI 的配置优先级如下：
 
 ```dotenv
 PAICLI_PROVIDER=deepseek
-PAICLI_MODEL=deepseek-v4-flash
+PAICLI_MODEL=deepseek-flash
 DEEPSEEK_API_KEY=your_key_here
 ```
 
@@ -112,9 +112,19 @@ DEEPSEEK_API_KEY=your_key_here
 
 ```dotenv
 PAICLI_PROVIDER=deepseek
-PAICLI_MODEL=deepseek-v4-flash
+PAICLI_MODEL=deepseek-flash
 PAICLI_API_KEY=your_key_here
 ```
+
+DeepSeek 的思考模式默认关闭。如需开启，可在 `.env` 或环境变量中设置：
+
+```dotenv
+PAICLI_THINKING=true
+```
+
+也可以在 `~/.paicli/config.json` 或项目级 `.paicli/config.json` 中配置
+`{"llm": {"thinking_enabled": true}}`。该开关只对 DeepSeek provider 的请求发送
+`thinking.type` 参数。
 
 当前支持的 provider-specific API Key 包括：
 
@@ -127,7 +137,7 @@ PAICLI_API_KEY=your_key_here
 通过命令行临时覆盖 provider 和 model：
 
 ```bash
-uv run paicli --provider deepseek --model deepseek-v4-flash
+uv run paicli --provider deepseek --model deepseek-flash
 ```
 
 连接本地 OpenAI-compatible 服务：
@@ -246,7 +256,7 @@ Prompt 分为可缓存的静态前缀和逐请求重建的动态后缀。静态�
 
 ## 模型、Token 与费用
 
-默认 provider/model 是 `deepseek/deepseek-v4-flash`。DeepSeek V4 Flash/Pro 的内置 profile 使用 1M 上下文，并带有截至 2026-07-17 的官方每百万 Token 价格；价格会变化，因此可以用 `llm.context_window` 和 `llm.prices` 覆盖，未知 OpenAI-compatible 模型应显式配置。
+默认 provider/model 是 `deepseek/deepseek-flash`。DeepSeek V4 Flash/Pro 的内置 profile 使用 1M 上下文，并带有截至 2026-07-17 的官方每百万 Token 价格；价格会变化，因此可以用 `llm.context_window` 和 `llm.prices` 覆盖，未知 OpenAI-compatible 模型应显式配置。
 
 流式请求开启 `stream_options.include_usage`，并解析 `choices=[]` 的 usage-only 块、cache hit/miss 和 reasoning Token。REPL 用 `/usage` 查看最近一次普通 ReAct，单次 CLI 用 `--json` 获取完整 usage/cost。成本以供应商返回的实际 Token 为准，不能只用“代码行数”精确推算。
 

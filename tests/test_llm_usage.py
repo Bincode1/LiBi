@@ -25,6 +25,42 @@ def test_streaming_payload_requests_usage() -> None:
 
     assert payload["stream"] is True
     assert payload["stream_options"] == {"include_usage": True}
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+def test_deepseek_thinking_can_be_enabled() -> None:
+    client = OpenAICompatibleClient(
+        provider_name="deepseek",
+        model="deepseek-flash",
+        api_key="key",
+        base_url="https://api.deepseek.com/v1",
+        thinking_enabled=True,
+    )
+
+    payload = client._build_payload(
+        [Message(role="user", content="hello")],
+        [],
+        system_prompt="system",
+    )
+
+    assert payload["thinking"] == {"type": "enabled"}
+
+
+def test_non_deepseek_payload_does_not_send_deepseek_thinking_option() -> None:
+    client = OpenAICompatibleClient(
+        provider_name="openai-compatible",
+        model="private-coder",
+        api_key="key",
+        base_url="https://llm.example/v1",
+    )
+
+    payload = client._build_payload(
+        [Message(role="user", content="hello")],
+        [],
+        system_prompt="system",
+    )
+
+    assert "thinking" not in payload
 
 
 def test_connection_error_becomes_recoverable_error_event(monkeypatch) -> None:
@@ -213,7 +249,7 @@ def test_cache_usage_supports_compat_fields_and_only_derives_miss_when_hit_is_kn
 
 
 def test_deepseek_v4_profiles_and_cost_formula() -> None:
-    flash = get_builtin_price_profile("deepseek-v4-flash")
+    flash = get_builtin_price_profile("deepseek-flash")
     pro = get_builtin_price_profile("deepseek-v4-pro")
     assert flash is not None
     assert pro is not None
@@ -243,7 +279,7 @@ def test_deepseek_v4_profiles_and_cost_formula() -> None:
 
 
 def test_uncategorized_legacy_input_uses_cache_miss_price() -> None:
-    profile = get_builtin_price_profile("deepseek-v4-flash")
+    profile = get_builtin_price_profile("deepseek-flash")
     assert profile is not None
 
     cost = calculate_cost({"input_tokens": 1_000, "output_tokens": 0}, profile)
@@ -300,7 +336,7 @@ def test_deepseek_builtin_prices_allow_partial_config_override() -> None:
     client = create_llm_client(
         LlmConfig(
             provider="deepseek",
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             context_window=900_000,
             prices={"usd": {"output": 9.0}},
         )
@@ -338,7 +374,7 @@ async def _collect_agent_events(agent: Agent) -> list[dict]:
 def _client() -> OpenAICompatibleClient:
     return OpenAICompatibleClient(
         provider_name="deepseek",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         api_key="key",
         base_url="https://api.deepseek.com/v1",
     )

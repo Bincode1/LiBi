@@ -81,10 +81,10 @@ class ModelProfile:
 
 DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
     ModelProfile(
-        id="deepseek-v4-flash",
+        id="deepseek-flash",
         name="DeepSeek V4 Flash",
         provider="deepseek",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         base_url="https://api.deepseek.com",
         context_window=1_000_000,
         description="Fast, cost-efficient Agent model with thinking support",

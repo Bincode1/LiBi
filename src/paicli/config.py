@@ -16,7 +16,7 @@ def _home() -> Path:
 @dataclass(slots=True)
 class LlmConfig:
     provider: str = "deepseek"
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-flash"
     api_key: str = ""
     base_url: str | None = None
     context_window: int | None = None
@@ -25,6 +25,7 @@ class LlmConfig:
     prices: dict[str, dict[str, float]] = field(default_factory=dict)
     max_tokens: int = 8192
     temperature: float = 0.7
+    thinking_enabled: bool = False
     timeout: float = 120.0
 
 
@@ -224,6 +225,14 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         if raw not in (None, ""):
             with suppress(TypeError, ValueError):
                 llm[config_key] = caster(raw)
+
+    thinking = env.get("PAICLI_THINKING")
+    if thinking is not None:
+        normalized_thinking = thinking.strip().lower()
+        if normalized_thinking in {"1", "true", "yes", "on", "enabled"}:
+            llm["thinking_enabled"] = True
+        elif normalized_thinking in {"0", "false", "no", "off", "disabled"}:
+            llm["thinking_enabled"] = False
 
     provider = str(llm.get("provider") or "").lower()
     if not llm.get("api_key"):

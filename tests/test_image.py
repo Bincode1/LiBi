@@ -24,7 +24,7 @@ def test_non_vision_model_omits_image_payload(tmp_path):
     content = parse_image_references(f"look @image:{image_path.name}", str(tmp_path))
     client = OpenAICompatibleClient(
         provider_name="deepseek",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         api_key="key",
         base_url="https://example.com/v1",
     )

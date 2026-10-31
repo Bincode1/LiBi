@@ -19,6 +19,7 @@ class OpenAICompatibleClient:
     base_url: str
     max_tokens: int = 8192
     temperature: float = 0.7
+    thinking_enabled: bool = False
     timeout: float = 120.0
     max_context_window: int = 128_000
     prompt_cache: bool = False
@@ -131,6 +132,8 @@ class OpenAICompatibleClient:
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
+        if self.provider_name.lower() == "deepseek":
+            payload["thinking"] = {"type": "enabled" if self.thinking_enabled else "disabled"}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"

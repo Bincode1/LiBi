@@ -29,11 +29,11 @@ def test_selector_tabs_between_default_and_custom_models():
         defaults=list(DEFAULT_MODEL_PROFILES),
         custom=[custom],
         current_provider="deepseek",
-        current_model="deepseek-v4-flash",
+        current_model="deepseek-flash",
     )
 
     assert state.tab == "default"
-    assert state.selected_action().profile.model == "deepseek-v4-flash"
+    assert state.selected_action().profile.model == "deepseek-flash"
 
     state.switch_tab()
     assert state.tab == "custom"
@@ -74,7 +74,7 @@ def test_custom_model_store_round_trips_and_uses_private_permissions(tmp_path):
     profile = ModelProfile.custom_profile(
         name="DeepSeek proxy",
         provider="deepseek",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         base_url="https://proxy.example.com/v1",
         context_window=1_000_000,
         api_key="secret",

@@ -15,7 +15,7 @@ PROVIDER_BASE_URLS = {
 }
 
 MODEL_CONTEXT_WINDOWS = {
-    "deepseek-v4-flash": 1_000_000,
+    "deepseek-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-chat": 1_000_000,
     "deepseek-reasoner": 1_000_000,
@@ -38,6 +38,7 @@ def create_llm_client(config: LlmConfig) -> OpenAICompatibleClient:
             base_url=base_url,
             max_tokens=config.max_tokens,
             temperature=config.temperature,
+            thinking_enabled=config.thinking_enabled,
             timeout=config.timeout,
             max_context_window=context,
             prompt_cache=True,

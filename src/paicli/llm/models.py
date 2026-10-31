@@ -22,7 +22,7 @@ class KnownModel:
     """Provider slug, e.g. ``"deepseek"``, ``"openai"``."""
 
     model: str
-    """Full model identifier as passed to the API, e.g. ``"deepseek-v4-flash"``."""
+    """Full model identifier as passed to the API, e.g. ``"deepseek-flash"``."""
 
     context_window: int
     """Maximum context window in tokens."""
