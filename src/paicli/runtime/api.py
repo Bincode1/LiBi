@@ -18,7 +18,7 @@ from paicli.bootstrap import build_tool_registry
 from paicli.config import PaiCliConfig
 from paicli.llm import create_llm_client
 from paicli.runtime.tasks import TASK_MODES, DurableTaskManager, TaskRecord
-from paicli.session import SessionStore
+from paicli.session import SessionStore, default_runtime_db_path
 
 
 class TaskCanceledError(RuntimeError):
@@ -41,7 +41,7 @@ class RuntimeApiServer:
         self.config = config
         self.api_key = api_key
         self.port = port
-        self.db_path = Path.home() / ".paicli" / "runtime" / "runtime.db"
+        self.db_path = default_runtime_db_path()
         self.task_manager = DurableTaskManager(
             Path.home() / ".paicli" / "tasks" / "tasks.db", scope=self.cwd
         )

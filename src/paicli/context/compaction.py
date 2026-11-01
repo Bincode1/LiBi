@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from paicli.context.manager import estimate_message_tokens, estimate_text_tokens
+from paicli.context.tokens import estimate_message_tokens, estimate_text_tokens
 from paicli.types import Message, Usage
 
 COMPACTION_PROMPT_VERSION = "compaction-v1"

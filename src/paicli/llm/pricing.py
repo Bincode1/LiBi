@@ -188,3 +188,20 @@ def _merge_currency_prices(
 
 def _token_cost(tokens: int, per_million_price: float) -> float:
     return tokens * per_million_price / PER_MILLION_TOKENS
+
+
+def calculate_costs(llm_client: Any, usage: Usage) -> dict[str, Any]:
+    """Compute costs in every supported currency via the client's ``calculate_cost``.
+
+    Returns a ``{currency: breakdown_dict}`` mapping; missing currencies are skipped.
+    """
+    calculator = getattr(llm_client, "calculate_cost", None)
+    if not callable(calculator):
+        return {}
+    result: dict[str, Any] = {}
+    for currency in ("usd", "cny"):
+        try:
+            result[currency] = calculator(usage, currency=currency).to_dict()
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result

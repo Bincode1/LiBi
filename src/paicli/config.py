@@ -58,7 +58,6 @@ class McpConfig:
 
 @dataclass(slots=True)
 class MemoryConfig:
-    max_conversation_history: int = 100
     long_term_enabled: bool = True
     long_term_db_path: str = "~/.paicli/memory.db"
     max_long_term_entries: int = 1_000
@@ -70,11 +69,7 @@ class MemoryConfig:
     compression_target: float = 0.55
     compression_reserve_tokens: int = 1_024
     min_recent_messages: int = 6
-    summary_max_chars: int = 6_000
-    # ``llm`` is the new default for fresh installations.  Existing config files
-    # without this key are migrated from the legacy feature flag in load_config.
     compression_mode: str = "llm"
-    mode_source: str = "new_install_default"
 
 
 @dataclass(slots=True)
@@ -123,7 +118,6 @@ class FeatureConfig:
     skill: bool = True
     memory: bool = True
     audit_log: bool = True
-    context_compression: bool = True
     code_index: bool = True
 
 
@@ -149,57 +143,36 @@ def load_config(
     env_map = env if env is not None else os.environ
     data = _config_to_dict(PaiCliConfig())
 
-    # Preserve the distinction between an explicit opt-in and an upgrade of an
-    # older installation.  This check must happen before defaults are merged.
-    explicit_compression_mode = False
-    loaded_config_file = False
-
     user_config = _read_json(_home() / ".paicli" / "config.json")
     if user_config:
-        loaded_config_file = True
-        explicit_compression_mode = isinstance(user_config.get("memory"), dict) and (
-            "compression_mode" in user_config["memory"]
-        )
         data = _deep_merge(data, user_config)
 
     root = Path(project_root).resolve() if project_root else None
     if root:
         project_config = _read_json(root / ".paicli" / "config.json")
         if project_config:
-            loaded_config_file = True
-            explicit_compression_mode = isinstance(project_config.get("memory"), dict) and (
-                "compression_mode" in project_config["memory"]
-            ) or explicit_compression_mode
             data = _deep_merge(data, project_config)
         project_env = _read_env(root / ".env")
         if project_env:
             data = _apply_env(data, project_env)
 
     if overrides:
-        if isinstance(overrides.get("memory"), dict) and "compression_mode" in overrides["memory"]:
-            explicit_compression_mode = True
         data = _deep_merge(data, overrides)
 
-    if not explicit_compression_mode and loaded_config_file:
-        legacy_enabled = bool(data.get("features", {}).get("context_compression", True))
-        data.setdefault("memory", {})["compression_mode"] = (
-            "legacy_extractive" if legacy_enabled else "disabled"
-        )
-        data["memory"]["mode_source"] = "legacy_feature_migration"
-    elif explicit_compression_mode:
-        data.setdefault("memory", {})["mode_source"] = "explicit"
-    else:
-        data.setdefault("memory", {})["compression_mode"] = "llm"
-        data["memory"]["mode_source"] = "new_install_default"
-
     data = _apply_env(data, env_map)
+    memory = data.get("memory", {})
+    if memory.get("compression_mode") not in {"llm", "disabled"}:
+        raise ValueError("memory.compression_mode must be llm or disabled; extractive compression was removed")
+    removed = {"max_conversation_history", "summary_max_chars", "mode_source"} & memory.keys()
+    if removed:
+        raise ValueError(f"removed memory settings: {', '.join(sorted(removed))}")
+    if "context_compression" in data.get("features", {}):
+        raise ValueError("features.context_compression was removed; use memory.compression_mode=llm or disabled")
     config = _dict_to_config(data)
     if config.prompt.agent_mode not in {"react", "plan"}:
         raise ValueError("prompt.agent_mode must be react or plan; Team mode has been removed")
     config.memory.long_term_db_path = _expand_home(config.memory.long_term_db_path)
     config.policy.audit_log_path = _expand_home(config.policy.audit_log_path)
-    if config.memory.compression_mode not in {"llm", "legacy_extractive", "disabled"}:
-        raise ValueError("memory.compression_mode must be llm, legacy_extractive, or disabled")
     if config.compaction.max_output_tokens <= 0:
         raise ValueError("compaction.max_output_tokens must be positive")
     if config.compaction.temperature < 0:

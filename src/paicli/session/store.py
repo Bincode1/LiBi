@@ -11,6 +11,12 @@ from typing import Any
 from paicli.policy.redaction import Redactor
 from paicli.session.models import CompactionLease, SessionEvent, SessionState, SessionSummary
 
+
+def default_runtime_db_path() -> Path:
+    """Return the canonical runtime SQLite database path under the user's home."""
+    return Path.home() / ".paicli" / "runtime" / "runtime.db"
+
+
 _MODEL_VISIBLE_EVENTS = {
     "user/message",
     "assistant/message",

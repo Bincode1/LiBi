@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
-from contextlib import suppress
+from contextlib import aclosing, suppress
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from paicli.agent.query import query
 from paicli.config import PaiCliConfig
 from paicli.llm.base import LlmClient
+from paicli.llm.pricing import calculate_costs
 from paicli.plan import ExecutionPlan, Planner, Task, TaskStatus
 from paicli.prompt import PromptAssembler
-from paicli.skill import SkillContextBuffer
+from paicli.session import ContextProjector, SessionStore, default_runtime_db_path
 from paicli.snapshot import SnapshotService
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, Usage
@@ -23,6 +25,7 @@ class TaskRunResult:
     text: str
     usage: Usage
     turns: int
+    session_id: str
     error: Exception | None = None
 
     @property
@@ -41,6 +44,8 @@ class PlanExecuteAgent:
         approval_callback=None,
         planner: Planner | None = None,
         max_task_turns: int | None = None,
+        session_store: SessionStore | None = None,
+        session_id: str | None = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -49,9 +54,100 @@ class PlanExecuteAgent:
         self.approval_callback = approval_callback
         self.planner = planner or Planner(llm_client)
         self.max_task_turns = max_task_turns
-        self.history: list[Message] = []
+        self.session_store = session_store
+        self.session_id = session_id
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
+        if self.session_store is None:
+            self.session_store = SessionStore(
+                default_runtime_db_path(),
+                sensitive_values=(self.config.llm.api_key,),
+            )
+        store = self.session_store
+        store.redactor.add_sensitive_values((self.config.llm.api_key,))
+        if self.session_id is None:
+            self.session_id = store.create_session()
+        session_id = self.session_id
+        turn_id = f"turn_{uuid.uuid4().hex}"
+        step_id = f"step_{uuid.uuid4().hex}"
+        store.append(session_id, "turn/started", {"mode": "plan"}, turn_id=turn_id)
+        store.append(session_id, "user/message", {"content": message}, turn_id=turn_id)
+        store.append(session_id, "step/started", {"mode": "plan"}, turn_id=turn_id, step_id=step_id)
+        answer: list[str] = []
+        try:
+            async with aclosing(self._run(message)) as events:
+                async for event in events:
+                    kind = event.get("type")
+                    if kind == "text_delta":
+                        answer.append(str(event.get("text") or ""))
+                    elif kind in {"plan_task_started", "plan_task_done", "plan_task_failed"}:
+                        event_type = {
+                            "plan_task_started": "agent/child_started",
+                            "plan_task_done": "agent/child_completed",
+                            "plan_task_failed": "agent/child_failed",
+                        }[kind]
+                        store.append(
+                            session_id,
+                            event_type,
+                            {
+                                "task_id": event["task_id"],
+                                "child_session_id": event["child_session_id"],
+                                "mode": "plan",
+                            },
+                            turn_id=turn_id,
+                            step_id=step_id,
+                        )
+                    elif kind == "error":
+                        raise event["error"]
+                    elif kind == "done":
+                        store.append(
+                            session_id,
+                            "assistant/message",
+                            {"content": "".join(answer)},
+                            turn_id=turn_id,
+                            step_id=step_id,
+                            source="plan-summary",
+                        )
+                        store.append(
+                            session_id, "step/completed", {}, turn_id=turn_id, step_id=step_id
+                        )
+                        store.append(
+                            session_id,
+                            "turn/completed",
+                            {"mode": "plan", "total_tokens": event["total_tokens"]},
+                            turn_id=turn_id,
+                        )
+                        event = {
+                            **event,
+                            "messages": list(
+                                ContextProjector()
+                                .project_session(store.events(session_id), session_id=session_id)
+                                .messages
+                            ),
+                        }
+                    yield {
+                        **event,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "step_id": step_id,
+                    }
+        except BaseException as exc:
+            status = (
+                "turn/canceled"
+                if isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+                else "turn/failed"
+            )
+            store.append(
+                session_id,
+                "step/failed",
+                {"reason": type(exc).__name__},
+                turn_id=turn_id,
+                step_id=step_id,
+            )
+            store.append(session_id, status, {"reason": type(exc).__name__}, turn_id=turn_id)
+            raise
+
+    async def _run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)
         with suppress(Exception):
             snapshot.create("pre-turn")
@@ -77,14 +173,9 @@ class PlanExecuteAgent:
                     total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
                 elif event.get("type") == "plan_task_done":
                     total_turns += int(event.get("turns") or 0)
-                    continue
                 elif event.get("type") == "text_delta":
                     final_text += str(event.get("text") or "")
                 yield event
-            self.history = [
-                Message(role="user", content=message),
-                Message(role="assistant", content=final_text),
-            ]
         except Exception as exc:  # noqa: BLE001
             yield {"type": "error", "error": exc}
             return
@@ -96,9 +187,12 @@ class PlanExecuteAgent:
             "total_turns": total_turns,
             "total_tokens": total_usage.total_tokens,
             "usage": total_usage.to_dict(),
-            "messages": self.history,
+            "messages": [
+                Message(role="user", content=message),
+                Message(role="assistant", content=final_text),
+            ],
         }
-        costs = _calculate_costs(self.llm_client, total_usage)
+        costs = calculate_costs(self.llm_client, total_usage)
         if costs:
             done["cost"] = costs
         yield done
@@ -155,13 +249,7 @@ class PlanExecuteAgent:
             for task in executable:
                 result = results.get(task.id)
                 if result is None:
-                    result = TaskRunResult(
-                        task=task,
-                        text="",
-                        usage=Usage(),
-                        turns=0,
-                        error=RuntimeError(f"task {task.id} did not produce a result"),
-                    )
+                    raise RuntimeError(f"task {task.id} did not produce a result")
                 async for event in self._apply_task_result(result):
                     yield event
 
@@ -181,6 +269,11 @@ class PlanExecuteAgent:
     async def _apply_task_result(self, result: TaskRunResult) -> AsyncIterator[dict[str, Any]]:
         if result.error:
             result.task.mark_failed(str(result.error))
+            yield {
+                "type": "plan_task_failed",
+                "task_id": result.task.id,
+                "child_session_id": result.session_id,
+            }
             yield {"type": "text_delta", "text": f"失败 [{result.task.id}]：{result.error}\n\n"}
             return
         result.task.mark_completed(result.text)
@@ -192,7 +285,13 @@ class PlanExecuteAgent:
             "type": "usage",
             "usage": result.usage.to_dict(),
         }
-        yield {"type": "plan_task_done", "turns": result.turns, "tokens": result.tokens}
+        yield {
+            "type": "plan_task_done",
+            "turns": result.turns,
+            "tokens": result.tokens,
+            "task_id": result.task.id,
+            "child_session_id": result.session_id,
+        }
 
     async def _pump_task_events(
         self,
@@ -211,52 +310,61 @@ class PlanExecuteAgent:
         plan: ExecutionPlan,
         task: Task,
     ) -> AsyncIterator[dict[str, Any]]:
+        from paicli.agent.agent import Agent
+
+        assert self.session_store is not None and self.session_id is not None
+        child_session_id = self.session_store.create_session(
+            kind="child", parent_session_id=self.session_id
+        )
+        worker = Agent(
+            llm_client=self.llm_client,
+            tool_registry=self.tool_registry.clone(),
+            system_prompt=self._task_system_prompt(plan, task),
+            cwd=self.cwd,
+            config=deepcopy(self.config),
+            approval_callback=self.approval_callback,
+            max_turns=self.max_task_turns,
+            session_store=self.session_store,
+            session_id=child_session_id,
+        )
         task.mark_started()
         yield {
             "type": "plan_task_started",
             "task_id": task.id,
             "task_description": task.description,
+            "child_session_id": child_session_id,
         }
         text = ""
         tool_results: list[str] = []
         usage = Usage()
         turns = 0
         try:
-            async for event in query(
-                llm_client=self.llm_client,
-                tool_registry=self.tool_registry,
-                system_prompt=self._task_system_prompt(plan, task),
-                user_message=_task_context(plan, task),
-                history=[],
-                cwd=self.cwd,
-                config=self.config,
-                approval_callback=self.approval_callback,
-                # Parallel plan tasks must never share one-shot Skill context.
-                skill_context_buffer=SkillContextBuffer(),
-                max_turns=self.max_task_turns,
-            ):
-                if event.get("type") == "text_delta":
-                    text += str(event.get("text") or "")
-                elif event.get("type") == "tool_result":
-                    content = str(event.get("result") or "")
-                    if content:
-                        tool_results.append(content)
-                    yield _with_task_context(event, task)
-                elif event.get("type") in {
-                    "thinking_delta",
-                    "tool_call",
-                    "context_compressed",
-                }:
-                    yield _with_task_context(event, task)
-                elif event.get("type") == "done":
-                    turns += int(event.get("total_turns") or 0)
-                    usage = usage + Usage.from_mapping(event.get("usage") or {})
-                elif event.get("type") == "error":
-                    raise event["error"]
+            async with aclosing(worker.run(_task_context(plan, task))) as events:
+                async for event in events:
+                    if event.get("type") == "text_delta":
+                        text += str(event.get("text") or "")
+                    elif event.get("type") == "tool_result":
+                        content = str(event.get("result") or "")
+                        if content:
+                            tool_results.append(content)
+                        yield _with_task_context(event, task)
+                    elif event.get("type") in {"thinking_delta", "tool_call", "context_compressed"}:
+                        yield _with_task_context(event, task)
+                    elif event.get("type") == "done":
+                        turns += int(event.get("total_turns") or 0)
+                        usage = usage + Usage.from_mapping(event.get("usage") or {})
+                    elif event.get("type") == "error":
+                        raise event["error"]
             result_text = text.strip() or "\n".join(tool_results).strip()
             yield {
                 "type": "plan_task_result",
-                "result": TaskRunResult(task=task, text=result_text, usage=usage, turns=turns),
+                "result": TaskRunResult(
+                    task=task,
+                    text=result_text,
+                    usage=usage,
+                    turns=turns,
+                    session_id=child_session_id,
+                ),
             }
         except Exception as exc:  # noqa: BLE001
             yield {
@@ -266,9 +374,13 @@ class PlanExecuteAgent:
                     text="",
                     usage=usage,
                     turns=turns,
+                    session_id=child_session_id,
                     error=exc,
                 ),
             }
+        finally:
+            if worker.subagent_manager is not None:
+                await worker.subagent_manager.drain()
 
     def _task_system_prompt(self, plan: ExecutionPlan, task: Task) -> str:
         base = PromptAssembler(
@@ -342,16 +454,3 @@ def _preview(text: str, max_len: int = 160) -> str:
     if len(value) <= max_len:
         return value
     return value[: max_len - 3] + "..."
-
-
-def _calculate_costs(llm_client: LlmClient, usage: Usage) -> dict[str, Any]:
-    calculator = getattr(llm_client, "calculate_cost", None)
-    if not callable(calculator):
-        return {}
-    result: dict[str, Any] = {}
-    for currency in ("usd", "cny"):
-        try:
-            result[currency] = calculator(usage, currency=currency).to_dict()
-        except (KeyError, TypeError, ValueError):
-            continue
-    return result

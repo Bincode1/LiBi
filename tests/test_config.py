@@ -72,3 +72,22 @@ def test_removed_team_mode_is_rejected_from_config(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="Team mode has been removed"):
         load_config(project_root=tmp_path)
+
+
+def test_existing_config_uses_llm_compression_default(tmp_path, monkeypatch):
+    monkeypatch.setattr("paicli.config._home", lambda: tmp_path)
+    config_dir = tmp_path / ".paicli"
+    config_dir.mkdir()
+    (config_dir / "config.json").write_text('{"render_mode":"plain"}', encoding="utf-8")
+    assert load_config(project_root=tmp_path, env={}).memory.compression_mode == "llm"
+
+
+@pytest.mark.parametrize("settings", [
+    {"memory": {"compression_mode": "legacy_extractive"}},
+    {"memory": {"summary_max_chars": 6000}},
+    {"memory": {"max_conversation_history": 100}},
+    {"features": {"context_compression": False}},
+])
+def test_removed_compression_settings_fail_with_migration_message(tmp_path, settings):
+    with pytest.raises(ValueError, match="removed"):
+        load_config(project_root=tmp_path, overrides=settings, env={})

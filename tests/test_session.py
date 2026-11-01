@@ -10,7 +10,6 @@ from paicli.agent import Agent, QueryEngine
 from paicli.config import load_config
 from paicli.session import ContextProjector, RequestBuilder, SessionStore
 from paicli.tools import ToolRegistry
-from paicli.types import Message
 
 
 def test_session_store_appends_atomically_and_supports_cursor(tmp_path):
@@ -338,7 +337,12 @@ def test_agent_continues_past_twenty_tool_calls_until_model_finishes(tmp_path, m
 
     assert events[-1]["type"] == "done"
     assert events[-1]["total_turns"] == 22
-    assert agent.history[-1].content == "finished"
+    assert events[-1]["messages"][-1].content == "finished"
+    projected = agent._context_projector.project_session(
+        session_events, session_id=agent.session_id
+    )
+    assert projected.messages[-1].content == "finished"
+    assert not hasattr(agent, "history")
     assert store.state(agent.session_id).status == "completed"
     assert session_events[-1].event_type == "turn/completed"
 
@@ -386,40 +390,52 @@ def test_agent_reuses_session_until_clear_then_starts_new_session(tmp_path, monk
     assert [event.event_type for event in store.events(second_session)].count("user/message") == 1
 
 
-def test_query_engine_ephemeral_history_does_not_call_paid_compaction(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    config = load_config(project_root=tmp_path)
-    config.llm.api_key = "test-only"
-    config.llm.max_tokens = 32
-    config.memory.compression_reserve_tokens = 0
-    config.memory.compression_threshold = 0.1
+def test_query_engine_resumes_from_session_and_replays_requests(tmp_path, monkeypatch):
+    monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
+    config = load_config(project_root=tmp_path, env={})
+    config.memory.compression_mode = "disabled"
+    config.features.skill = False
 
-    class EphemeralClient:
+    class ReplyClient:
         model_name = "fake-model"
         provider_name = "fake-provider"
-        max_context_window = 256
+        max_context_window = 128_000
 
         def __init__(self):
-            self.compaction_calls = 0
+            self.seen_messages = []
 
-        async def complete(self, request):  # noqa: ARG002
-            self.compaction_calls += 1
-            raise AssertionError("ephemeral history must not trigger paid compaction")
-
-        async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        async def chat(self, messages, tools, *, system_prompt):
+            self.seen_messages.append(list(messages))
             yield {"type": "text_delta", "text": "ok"}
             yield {"type": "message_end", "stop_reason": "end_turn"}
 
-    client = EphemeralClient()
+    client = ReplyClient()
+    store = SessionStore(tmp_path / "runtime.db")
+    session_id = store.create_session()
+    store.append(session_id, "user/message", {"content": "past request"})
+    store.append(session_id, "assistant/message", {"content": "past answer"})
     engine = QueryEngine(
         llm_client=client,
         tool_registry=ToolRegistry(),
         config=config,
         cwd=str(tmp_path),
+        session_store=store,
+        session_id=session_id,
     )
-    history = [Message(role="user", content="old " + "x" * 900)]
 
-    result = asyncio.run(engine.ask_complete_async("new", history=history))
+    asyncio.run(engine.ask_complete_async("new"))
+    asyncio.run(engine.ask_complete_async("follow-up"))
 
-    assert result.text == "ok"
-    assert client.compaction_calls == 0
+    assert [m.content for m in client.seen_messages[0]] == ["past request", "past answer", "new"]
+    assert [m.content for m in client.seen_messages[1]][-3:] == ["new", "ok", "follow-up"]
+    events = store.events(session_id)
+    for prepared in (event for event in events if event.event_type == "request/prepared"):
+        replay = ContextProjector().project(
+            events,
+            session_id=session_id,
+            turn_id=prepared.turn_id,
+            step_id=prepared.step_id,
+            through_sequence=prepared.payload["through_sequence"],
+            **prepared.payload["projection"],
+        )
+        assert replay.context_hash == prepared.payload["context_hash"]

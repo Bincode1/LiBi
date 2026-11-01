@@ -177,6 +177,26 @@ class ContextProjector:
         if not turn_events:
             raise ValueError(f"session has no events for turn {turn_id}")
         turn_end_sequence = max(event.sequence for event in turn_events)
+        # Session maintenance can commit after the latest Turn/Step event.
+        next_turn = min(
+            (
+                event.sequence
+                for event in events
+                if event.session_id == session_id
+                and event.event_type == "turn/started"
+                and event.sequence > turn_end_sequence
+            ),
+            default=None,
+        )
+        turn_end_sequence = max(
+            (
+                event.sequence
+                for event in events
+                if event.session_id == session_id
+                and (next_turn is None or event.sequence < next_turn)
+            ),
+            default=turn_end_sequence,
+        )
         relevant = [
             event
             for event in events

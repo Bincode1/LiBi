@@ -4,12 +4,13 @@ import asyncio
 from contextlib import aclosing
 
 from paicli.agent.agent import Agent
+from paicli.agent.events import collect_query_result
 from paicli.config import PaiCliConfig
 from paicli.llm.base import LlmClient
 from paicli.prompt import PromptAssembler
 from paicli.session import SessionStore
 from paicli.tools.registry import ToolRegistry
-from paicli.types import Message, QueryResult, Usage
+from paicli.types import QueryResult
 
 
 class QueryEngine:
@@ -45,7 +46,7 @@ class QueryEngine:
         self._react_loop: asyncio.AbstractEventLoop | None = None
         self._running = False
 
-    async def ask(self, message: str, history: list[Message] | None = None):
+    async def ask(self, message: str):
         if self._running:
             raise RuntimeError("QueryEngine already has an active request.")
         loop = asyncio.get_running_loop()
@@ -69,11 +70,6 @@ class QueryEngine:
             self._react_loop = loop
         agent = self._react_agent
         self._last_agent = agent
-        if history is not None:
-            agent.history = list(history)
-            # Caller-provided history is ephemeral and cannot safely create a
-            # durable paid compaction checkpoint.
-            agent._ephemeral_history_mode = True
         self._running = True
         try:
             async with aclosing(agent.run(message)) as events:
@@ -120,42 +116,26 @@ class QueryEngine:
         self._last_agent = agent
         self.session_store = agent.session_store
         self.session_id = agent.session_id
-        async for event in agent.run(message):
-            yield event
+        async with aclosing(agent.run(message)) as events:
+            async for event in events:
+                yield event
         self.session_store = agent.session_store
         self.session_id = agent.session_id
 
     async def ask_complete_async(
         self,
         message: str,
-        history: list[Message] | None = None,
     ) -> QueryResult:
-        return await self._complete_from_events(self.ask(message, history))
+        return await self._complete_from_events(self.ask(message))
 
     async def plan_complete_async(self, message: str) -> QueryResult:
         return await self._complete_from_events(self.plan(message))
 
-    def ask_complete(self, message: str, history: list[Message] | None = None) -> QueryResult:
-        return asyncio.run(self._complete_and_close(self.ask_complete_async(message, history)))
+    def ask_complete(self, message: str) -> QueryResult:
+        return asyncio.run(self._complete_and_close(self.ask_complete_async(message)))
 
     def plan_complete(self, message: str) -> QueryResult:
         return asyncio.run(self._complete_and_close(self.plan_complete_async(message)))
 
     async def _complete_from_events(self, events) -> QueryResult:
-        text = ""
-        tokens = 0
-        turns = 0
-        usage = Usage()
-        cost = {}
-        async with aclosing(events):
-            async for event in events:
-                if event.get("type") == "text_delta":
-                    text += str(event.get("text") or "")
-                elif event.get("type") == "error":
-                    raise event["error"]
-                elif event.get("type") == "done":
-                    tokens += int(event.get("total_tokens") or 0)
-                    turns += int(event.get("total_turns") or 0)
-                    usage = usage + Usage.from_mapping(event.get("usage") or {})
-                    cost = dict(event.get("cost") or cost)
-        return QueryResult(text=text, total_tokens=tokens, turns=turns, usage=usage, cost=cost)
+        return await collect_query_result(events)

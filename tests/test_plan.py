@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from paicli.agent import PlanExecuteAgent
 from paicli.config import load_config
 from paicli.plan import ExecutionPlan, Planner, Task, TaskType
+from paicli.session import ContextProjector, SessionStore
 from paicli.tools import ToolRegistry, get_builtin_tools
+from paicli.tools.base import Tool, ToolResult, object_schema
 
 
 def test_execution_plan_exposes_dag_batches():
@@ -73,6 +77,7 @@ def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path, monkeypatch):
         tool_registry=registry,
         config=config,
         cwd=str(tmp_path),
+        session_store=SessionStore(tmp_path / "runtime.db"),
     )
 
     async def run():
@@ -113,6 +118,98 @@ def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path, monkeypatch):
     assert {
         event.get("task_id") for event in events if event.get("type") == "plan_task_started"
     } == {"task_1", "task_2"}
+    store = agent.session_store
+    children = [item for item in store.list_sessions(include_children=True) if item.kind == "child"]
+    assert len(children) == 2
+    assert all(item.parent_session_id == agent.session_id for item in children)
+    assert all(item.status == "completed" for item in children)
+    assert len(store.list_sessions()) == 1
+    for child in children:
+        child_events = store.events(child.session_id)
+        assert any(event.event_type == "request/prepared" for event in child_events)
+        assert [
+            m.role
+            for m in ContextProjector()
+            .project_session(child_events, session_id=child.session_id)
+            .messages
+        ] == ["user", "assistant"]
+    parent_events = store.events(agent.session_id)
+    assert sum(event.event_type == "turn/started" for event in parent_events) == 1
+    assert sum(event.event_type == "agent/child_completed" for event in parent_events) == 2
+    assert not any(event.event_type == "request/prepared" for event in parent_events)
+    assert registry.get("subagent") is None
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_plan_worker_records_tools_and_terminal_state(tmp_path, monkeypatch, fails):
+    monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
+    monkeypatch.setattr("paicli.agent.plan_execute.SnapshotService.create", lambda *args: None)
+    config = load_config(project_root=tmp_path, env={})
+    config.memory.compression_mode = "disabled"
+    store = SessionStore(tmp_path / "runtime.db")
+    registry = ToolRegistry()
+
+    async def inspect(payload, context):
+        assert context.session_store is store
+        assert store.session_exists(context.session_id)
+        return ToolResult("worker tool output")
+
+    registry.register(Tool("inspect", "Inspect", object_schema({}), inspect))
+
+    class WorkerClient:
+        model_name = "fake"
+        provider_name = "fake"
+        max_context_window = 128_000
+
+        async def chat(self, messages, tools, *, system_prompt):
+            if not any(message.role == "tool" for message in messages):
+                yield {
+                    "type": "tool_call_delta",
+                    "tool_call": {
+                        "index": 0,
+                        "id": "inspect-call",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    },
+                }
+                yield {"type": "message_end", "stop_reason": "tool_use"}
+            elif fails:
+                raise RuntimeError("worker provider failed")
+            else:
+                yield {"type": "text_delta", "text": "worker answer"}
+                yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    class SingleTaskPlanner:
+        async def stream_plan(self, message):
+            plan = ExecutionPlan(id="one", goal=message)
+            plan.add_task(Task("inspect", "inspect", TaskType.ANALYSIS))
+            yield {"type": "plan_created", "plan": plan}
+
+    agent = PlanExecuteAgent(
+        llm_client=WorkerClient(),
+        tool_registry=registry,
+        config=config,
+        cwd=str(tmp_path),
+        session_store=store,
+        planner=SingleTaskPlanner(),
+    )
+
+    async def run():
+        return [event async for event in agent.run("inspect")]
+
+    events = asyncio.run(run())
+    child = next(
+        item for item in store.list_sessions(include_children=True) if item.kind == "child"
+    )
+    assert child.status == ("failed" if fails else "completed")
+    child_events = store.events(child.session_id)
+    assert sum(event.event_type == "tool/result" for event in child_events) == 1
+    parent = store.events(agent.session_id)
+    assert any(
+        event.event_type == ("agent/child_failed" if fails else "agent/child_completed")
+        for event in parent
+    )
+    assert not any(event.event_type == "tool/result" for event in parent)
+    assert events[-1]["type"] == "done"
 
 
 class FakeClient:

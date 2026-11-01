@@ -6,6 +6,7 @@ from paicli.llm.pricing import (
     ModelPriceProfile,
     PerMillionTokenPrices,
     calculate_cost,
+    calculate_costs,
     get_builtin_price_profile,
     resolve_price_profile,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "OpenAICompatibleClient",
     "PerMillionTokenPrices",
     "calculate_cost",
+    "calculate_costs",
     "create_llm_client",
     "get_builtin_price_profile",
     "resolve_price_profile",

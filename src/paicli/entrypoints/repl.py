@@ -19,7 +19,7 @@ from rich.table import Table
 
 from paicli import __version__
 from paicli.agent import Agent, QueryEngine
-from paicli.bootstrap import build_tool_registry
+from paicli.bootstrap import build_runtime
 from paicli.config import PaiCliConfig, config_to_public_dict
 from paicli.context import estimate_message_tokens
 from paicli.entrypoints.model_selector import ModelSelectorState, run_model_selector
@@ -36,7 +36,6 @@ from paicli.prompt import PromptAssembler
 from paicli.rag import CodeIndex
 from paicli.render import RichRenderer
 from paicli.runtime import DurableTaskManager
-from paicli.session import SessionStore
 from paicli.skill import SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools import ToolRegistry
@@ -109,14 +108,9 @@ async def start_repl(
 ) -> None:
     console = Console()
     permission_mode = PermissionModeController(config)
-    session_store = SessionStore(
-        Path.home() / ".paicli" / "runtime" / "runtime.db",
-        sensitive_values=(config.llm.api_key,),
-    )
+    client, registry, mcp_manager, session_store = await build_runtime(config=config, cwd=cwd)
     if session_id is not None and not session_store.session_exists(session_id):
         raise ValueError(f"session not found: {session_id}")
-    registry, mcp_manager = await build_tool_registry(config=config, cwd=cwd)
-    client = create_llm_client(config.llm)
     system_prompt = PromptAssembler(
         config=config,
         cwd=cwd,
@@ -278,7 +272,14 @@ async def _handle_slash(
             if agent.session_store is not None and agent.session_id is not None
             else None
         )
-        estimated_tokens = sum(estimate_message_tokens(message) for message in agent.history)
+        visible_messages = (
+            agent._context_projector.project_session(
+                agent.session_store.events(session_id), session_id=session_id
+            ).messages
+            if agent.session_store is not None and agent.session_id is not None
+            else ()
+        )
+        estimated_tokens = sum(estimate_message_tokens(message) for message in visible_messages)
         table = Table(title="PaiCLI Context")
         table.add_column("Field")
         table.add_column("Value")
@@ -294,14 +295,14 @@ async def _handle_slash(
         table.add_row("model", f"{config.llm.model} ({config.llm.provider})")
         table.add_row("context window", str(agent.llm_client.max_context_window))
         table.add_row(
-            "visible messages / est. tokens", f"{len(agent.history)} / {estimated_tokens}"
+            "visible messages / est. tokens", f"{len(visible_messages)} / {estimated_tokens}"
         )
         table.add_row("render", config.render_mode)
         table.add_row("memory", f"{len(memories)} recent entries")
         table.add_row("tools", str(len(registry.list_names())))
         table.add_row(
             "compression mode",
-            f"{config.memory.compression_mode} ({config.memory.mode_source})",
+            config.memory.compression_mode,
         )
         table.add_row("compression threshold", f"{config.memory.compression_threshold:.0%}")
         table.add_row("compression target", f"{config.memory.compression_target:.0%}")
@@ -981,10 +982,7 @@ def _render_session_history(
     """Project and render durable messages after a session has been selected."""
     events = session_store.events(session_id)
     projected = agent._context_projector.project_session(events, session_id=session_id)
-    agent.history = list(projected.messages)
-    messages = [
-        message for message in projected.messages if message.role in {"user", "assistant"}
-    ]
+    messages = [message for message in projected.messages if message.role in {"user", "assistant"}]
     if not messages:
         return
     console.print(f"History ({len(messages)} messages)", style="dim")

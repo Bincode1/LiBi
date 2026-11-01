@@ -22,6 +22,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
+from paicli.agent.events import collect_query_result
 from paicli.agent.plan_execute import PlanExecuteAgent
 from paicli.config import PaiCliConfig
 from paicli.context import (
@@ -31,18 +32,28 @@ from paicli.context import (
     CompactionPlanner,
     CompactionPolicy,
     CompactionResult,
-    ContextBudget,
-    ContextWindowManager,
     estimate_message_tokens,
     estimate_text_tokens,
 )
 from paicli.image import parse_image_references
 from paicli.llm.base import LlmClient
+from paicli.llm.pricing import calculate_costs
 from paicli.prompt import PromptAssembler
-from paicli.session import ContextProjector, RequestBuilder, SessionStore
+from paicli.session import (
+    ContextProjector,
+    RequestBuilder,
+    SessionStore,
+    default_runtime_db_path,
+)
 from paicli.skill import SkillContextBuffer, SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools.base import ToolContext
+from paicli.tools.call_parsing import (
+    finalize_tool_calls,
+    merge_tool_delta,
+    tool_input,
+    tool_name_by_id,
+)
 from paicli.tools.executor import ToolExecutor
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, QueryResult, Usage
@@ -53,8 +64,8 @@ AgentMode = Literal["react", "plan"]
 class Agent:
     """A terminal AI agent that connects an LLM to tools for task execution.
 
-    The Agent owns the conversation history, manages context compression, and
-    delegates the actual LLM-tool interaction loop to mode-specific runners.
+    Session events are the canonical conversation record; ContextProjector
+    builds model-visible messages for each request.
     All ``run()`` methods yield the same streaming event protocol so that UI
     layers (REPL, CLI, or programmatic) can render progress uniformly.
 
@@ -99,7 +110,6 @@ class Agent:
         self.max_turns = max_turns
         if mode not in {"react", "plan"}:
             raise ValueError("agent mode must be react or plan")
-        self._owns_session_store = session_store is None
         self.session_store = session_store
         self.session_id = session_id
         if mode == "react" and subagent_manager is None:
@@ -119,7 +129,6 @@ class Agent:
         self.steer_inbox = steer_inbox
         self.compaction_client = compaction_client
         self.last_compaction: dict[str, Any] | None = None
-        self._ephemeral_history_mode = False
         self._context_projector = ContextProjector()
         self._request_builder = RequestBuilder()
 
@@ -135,8 +144,6 @@ class Agent:
             ).build_static()
         )
 
-        # Conversation state.
-        self.history: list[Message] = []
         self.skill_context_buffer = SkillContextBuffer()
 
         # Accumulated usage / cost across all turns of the session.
@@ -182,7 +189,7 @@ class Agent:
 
         try:
             if self.mode == "plan":
-                events = self._run_logged_mode(self._run_plan(message), message, "plan")
+                events = self._run_plan(message)
                 async for event in events:
                     if self.event_sink is not None:
                         await self.event_sink(event)
@@ -198,8 +205,7 @@ class Agent:
             if self.session_store is not None and self.session_id is not None:
                 state = self.session_store.state(self.session_id)
                 if state.active_turn_id:
-                    self.session_store.append(
-                        self.session_id,
+                    self._log(
                         "turn/canceled",
                         {"reason": "cancelled"},
                         turn_id=state.active_turn_id,
@@ -207,26 +213,20 @@ class Agent:
             raise
         except TimeoutError:
             if self.session_store is not None and self.session_id is not None:
-                self.session_store.append(
-                    self.session_id,
-                    "turn/failed",
-                    {"reason": "deadline_exceeded"},
-                )
+                self._log("turn/failed", {"reason": "deadline_exceeded"})
             raise
         except Exception as exc:
             if self.session_store is not None and self.session_id is not None:
                 state = self.session_store.state(self.session_id)
                 if state.active_turn_id:
                     if state.active_step_id:
-                        self.session_store.append(
-                            self.session_id,
+                        self._log(
                             "step/failed",
                             {"reason": type(exc).__name__},
                             turn_id=state.active_turn_id,
                             step_id=state.active_step_id,
                         )
-                    self.session_store.append(
-                        self.session_id,
+                    self._log(
                         "turn/failed",
                         {"reason": type(exc).__name__},
                         turn_id=state.active_turn_id,
@@ -237,24 +237,8 @@ class Agent:
                 snapshot.create("post-turn")
 
     async def run_complete(self, message: str) -> QueryResult:
-        """Run the agent synchronously (collect all events) and return a result."""
-        text = ""
-        tokens = 0
-        turns = 0
-        usage = Usage()
-        cost: dict[str, Any] = {}
-        async for event in self.run(message):
-            event_type = event.get("type")
-            if event_type == "text_delta":
-                text += str(event.get("text") or "")
-            elif event_type == "error":
-                raise event["error"]  # type: ignore[arg-type]
-            elif event_type == "done":
-                tokens = int(event.get("total_tokens") or 0)
-                turns = int(event.get("total_turns") or 0)
-                usage = Usage.from_mapping(event.get("usage") or {})
-                cost = dict(event.get("cost") or {})
-        return QueryResult(text=text, total_tokens=tokens, turns=turns, usage=usage, cost=cost)
+        """Run the agent and collect all events into a single result."""
+        return await collect_query_result(self.run(message))
 
     async def compact(
         self,
@@ -273,11 +257,6 @@ class Agent:
         """
         if self.config.memory.compression_mode == "disabled":
             raise CompactionError("context compaction is disabled", code="disabled")
-        if self.config.memory.compression_mode == "legacy_extractive":
-            raise CompactionError(
-                "LLM compaction is unavailable in legacy_extractive mode",
-                code="legacy_mode",
-            )
         session_id = self.session_id
         if not session_id or self.session_store is None:
             raise CompactionError("no active session", code="no_session")
@@ -413,7 +392,6 @@ class Agent:
 
     def clear_history(self) -> None:
         """Start a fresh visible conversation while retaining its prior event log."""
-        self.history = []
         self.session_id = self._create_new_session()
         self.skill_context_buffer.clear()
         self.last_usage = Usage()
@@ -426,12 +404,10 @@ class Agent:
     async def _run_react(self, message: str) -> AsyncIterator[dict[str, Any]]:
         """Standard ReAct loop (the default and most common mode)."""
         turn_id = f"turn_{uuid.uuid4().hex}"
-        self._seed_session_history()
         session_id = self._ensure_session()
         store = self.session_store
         assert store is not None
-        store.append(
-            session_id,
+        self._log(
             "turn/started",
             {"mode": "react"},
             turn_id=turn_id,
@@ -443,8 +419,7 @@ class Agent:
         )
         if separator:
             message = request_message
-            store.append(
-                session_id,
+            self._log(
                 "skill/context",
                 {
                     "id": "skill-candidates",
@@ -464,8 +439,7 @@ class Agent:
         )
         if separator:
             message = request_message
-            store.append(
-                session_id,
+            self._log(
                 "skill/context",
                 {
                     "id": "loaded-skill-context",
@@ -478,8 +452,7 @@ class Agent:
             )
         else:
             message = with_skill_context
-        store.append(
-            session_id,
+        self._log(
             "user/message",
             {"content": original},
             turn_id=turn_id,
@@ -500,7 +473,10 @@ class Agent:
                     [tool for tool in subagent_tools if tool.name in set(allowlist)]
                 )
             tool_defs = self.tool_registry.definitions()
-        executor = ToolExecutor(self.tool_registry)
+        executor = ToolExecutor(
+            self.tool_registry,
+            audit_log_path=self.config.policy.audit_log_path,
+        )
         context = ToolContext(
             cwd=self.cwd,
             config=self.config,
@@ -533,8 +509,7 @@ class Agent:
         ).build_dynamic(original)
 
         effective_system = f"{self.system_prompt}\n\n{dynamic_prompt}".strip()
-        store.append(
-            session_id,
+        self._log(
             "system/section",
             {
                 "section_id": f"effective-system-{turn_id}",
@@ -550,24 +525,9 @@ class Agent:
             source="prompt-assembler",
         )
 
-        # Context-window manager for history compression.
-        context_manager = ContextWindowManager(
-            ContextBudget(
-                context_window=self.llm_client.max_context_window,
-                max_output_tokens=self.config.llm.max_tokens,
-                compression_threshold=self.config.memory.compression_threshold,
-                compression_target=self.config.memory.compression_target,
-                reserve_tokens=self.config.memory.compression_reserve_tokens,
-            ),
-            max_history_messages=self.config.memory.max_conversation_history,
-            min_recent_messages=self.config.memory.min_recent_messages,
-            summary_max_chars=self.config.memory.summary_max_chars,
-        )
-
         total_usage = Usage()
         turn = 0
         finished = False
-        latest_messages: list[Message] = []
         from paicli.agent.run_controller import RunController
 
         run_controller = RunController(
@@ -586,8 +546,7 @@ class Agent:
                     content = self.steer_inbox.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                store.append(
-                    session_id,
+                self._log(
                     "user/message",
                     {"content": content},
                     turn_id=turn_id,
@@ -605,23 +564,20 @@ class Agent:
             turn_usage = Usage()
             tool_states: dict[int, dict[str, Any]] = {}
             step_id = f"step_{uuid.uuid4().hex}"
-            store.append(
-                session_id,
+            self._log(
                 "step/started",
                 {"mode": "react"},
                 turn_id=turn_id,
                 step_id=step_id,
             )
-            store.append(
-                session_id,
+            self._log(
                 "tool/schema_snapshot",
                 {"tools": tool_defs},
                 turn_id=turn_id,
                 step_id=step_id,
                 source="tool-registry",
             )
-            store.append(
-                session_id,
+            self._log(
                 "runtime/context",
                 {
                     "context_id": f"runtime_{step_id}",
@@ -656,10 +612,8 @@ class Agent:
                 budget=self._budget_metadata(),
             )
 
-            if (
-                not self._ephemeral_history_mode
-                and self.config.memory.compression_mode == "llm"
-                and callable(getattr(self.compaction_client or self.llm_client, "complete", None))
+            if self.config.memory.compression_mode == "llm" and callable(
+                getattr(self.compaction_client or self.llm_client, "complete", None)
             ):
                 llm_policy = CompactionPolicy(
                     context_window=int(self.llm_client.max_context_window),
@@ -696,7 +650,9 @@ class Agent:
                                 "after_tokens": compression.plan.estimated_tokens_after,
                                 "summarized_messages": compression.plan.selected_message_count,
                                 "compaction_id": compression.compaction_id,
-                                "usage": compression.usage.to_dict() if compression.usage else None,
+                                "usage": (
+                                    compression.usage.to_dict() if compression.usage else None
+                                ),
                             },
                             session_id,
                             turn_id,
@@ -718,63 +674,6 @@ class Agent:
                         budget=self._budget_metadata(),
                     )
 
-            # Compress if needed.
-            # The deterministic compressor remains available only through the
-            # explicit legacy-extractive mode. LLM mode uses Agent.compact()
-            # and never silently falls back to extractive summaries.
-            if (
-                self.config.memory.compression_mode == "legacy_extractive"
-                or self._ephemeral_history_mode
-            ):
-                compression = context_manager.prepare(
-                    list(current_view.messages),
-                    system_prompt=current_view.system_prompt,
-                    tool_definitions=list(current_view.tools),
-                )
-                if compression.compressed:
-                    compacted_messages = [_message_payload(item) for item in compression.messages]
-                    source_sequences = list(current_view.source_sequences)
-                    store.append(
-                        session_id,
-                        "compaction/checkpoint",
-                        {
-                            "compaction_id": f"compact_{uuid.uuid4().hex}",
-                            "from_sequence": min(source_sequences, default=0),
-                            "through_sequence": max(source_sequences, default=0),
-                            "source_sequences": source_sequences,
-                            "messages": compacted_messages,
-                            "strategy_version": "extractive-v1",
-                            "estimated_tokens_before": compression.estimated_tokens_before,
-                            "estimated_tokens_after": compression.estimated_tokens_after,
-                        },
-                        turn_id=turn_id,
-                        step_id=step_id,
-                        source="context-window-manager",
-                    )
-                    current_view = self._context_projector.project(
-                        store.events(session_id),
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        step_id=step_id,
-                        scope="session",
-                        route=self.llm_client.provider_name,
-                        adapter_capabilities={
-                            "provider": self.llm_client.provider_name,
-                            "supports_images": bool(
-                                getattr(self.llm_client, "supports_images", False)
-                            ),
-                        },
-                        budget=self._budget_metadata(),
-                    )
-                    yield {
-                        "type": "context_compressed",
-                        "before_tokens": compression.estimated_tokens_before,
-                        "after_tokens": compression.estimated_tokens_after,
-                        "summarized_messages": compression.summarized_messages,
-                        "session_id": session_id,
-                        "turn_id": turn_id,
-                        "step_id": step_id,
-                    }
             current_view = self._context_projector.project(
                 store.events(session_id),
                 session_id=session_id,
@@ -829,16 +728,14 @@ class Agent:
                 turn_id,
                 step_id,
             )
-            store.append(
-                session_id,
+            self._log(
                 "context/summary",
                 context_summary,
                 turn_id=turn_id,
                 step_id=step_id,
                 source="context-projector",
             )
-            store.append(
-                session_id,
+            self._log(
                 "request/prepared",
                 {
                     "request_id": request.request_id,
@@ -884,7 +781,7 @@ class Agent:
                             step_id,
                         )
                     elif event_type == "tool_call_delta":
-                        _merge_tool_delta(tool_states, event["tool_call"])
+                        merge_tool_delta(tool_states, event["tool_call"])
                     elif event_type == "message_end":
                         stop_reason = str(event.get("stop_reason") or "end_turn")
                     elif event_type == "usage":
@@ -898,22 +795,19 @@ class Agent:
                         )
                     elif event_type == "error":
                         error = event["error"]
-                        store.append(
-                            session_id,
+                        self._log(
                             "request/failed",
                             {"request_id": request.request_id, "error_type": type(error).__name__},
                             turn_id=turn_id,
                             step_id=step_id,
                         )
-                        store.append(
-                            session_id,
+                        self._log(
                             "step/failed",
                             {"reason": "provider_error"},
                             turn_id=turn_id,
                             step_id=step_id,
                         )
-                        store.append(
-                            session_id,
+                        self._log(
                             "turn/failed",
                             {"reason": "provider_error"},
                             turn_id=turn_id,
@@ -923,22 +817,19 @@ class Agent:
                         )
                         return
             except Exception as exc:
-                store.append(
-                    session_id,
+                self._log(
                     "request/failed",
                     {"request_id": request.request_id, "error_type": type(exc).__name__},
                     turn_id=turn_id,
                     step_id=step_id,
                 )
-                store.append(
-                    session_id,
+                self._log(
                     "step/failed",
                     {"reason": "provider_exception"},
                     turn_id=turn_id,
                     step_id=step_id,
                 )
-                store.append(
-                    session_id,
+                self._log(
                     "turn/failed",
                     {"reason": "provider_exception"},
                     turn_id=turn_id,
@@ -946,7 +837,7 @@ class Agent:
                 raise
 
             total_usage = total_usage + turn_usage
-            tool_calls = _finalize_tool_calls(tool_states)
+            tool_calls = finalize_tool_calls(tool_states)
             assistant_msg = Message(
                 role="assistant",
                 content=text or "",
@@ -954,23 +845,20 @@ class Agent:
             )
             if thinking and not text:
                 assistant_msg.content = ""
-            store.append(
-                session_id,
+            self._log(
                 "assistant/message",
                 {"content": assistant_msg.content, "tool_calls": tool_calls},
                 turn_id=turn_id,
                 step_id=step_id,
                 source="provider",
             )
-            store.append(
-                session_id,
+            self._log(
                 "request/completed",
                 {"request_id": request.request_id, "usage": turn_usage.to_dict()},
                 turn_id=turn_id,
                 step_id=step_id,
                 source="provider",
             )
-            latest_messages = list(current_view.messages) + [assistant_msg]
             yield _annotate_event(
                 {"type": "turn_complete", "turn": turn, "stop_reason": stop_reason},
                 session_id,
@@ -980,8 +868,7 @@ class Agent:
 
             steered = await consume_steer(step_id) if not tool_calls else False
             if steered and stop_reason != "tool_use" and not tool_calls:
-                store.append(
-                    session_id,
+                self._log(
                     "step/completed",
                     {"reason": "steered"},
                     turn_id=turn_id,
@@ -991,8 +878,7 @@ class Agent:
 
             # If the model didn't request any tools, we're done.
             if stop_reason != "tool_use" and not tool_calls:
-                store.append(
-                    session_id,
+                self._log(
                     "step/completed",
                     {},
                     turn_id=turn_id,
@@ -1010,8 +896,7 @@ class Agent:
                     deliveries = run_controller.collect_deliveries(defer_ack=True)
                     if deliveries:
                         notices = [run_controller.format_delivery(item) for item in deliveries]
-                        store.append(
-                            session_id,
+                        self._log(
                             "user/message",
                             {
                                 "content": "Child agent results:\n" + "\n".join(notices),
@@ -1032,8 +917,7 @@ class Agent:
             for call in tool_calls:
                 name = call.get("function", {}).get("name", "unknown")
                 call_id = str(call.get("id") or "")
-                store.append(
-                    session_id,
+                self._log(
                     "tool/execution_started",
                     {"name": name},
                     turn_id=turn_id,
@@ -1044,7 +928,7 @@ class Agent:
                     {
                         "type": "tool_call",
                         "name": name,
-                        "input": _tool_input(call),
+                        "input": tool_input(call),
                         "tool_call_id": call_id,
                     },
                     session_id,
@@ -1063,7 +947,7 @@ class Agent:
             injected = False
 
             for result in tool_results:
-                tool_name = _tool_name_by_id(tool_calls, result.tool_use_id or "")
+                tool_name = tool_name_by_id(tool_calls, result.tool_use_id or "")
                 yield _annotate_event(
                     {
                         "type": "tool_result",
@@ -1080,8 +964,7 @@ class Agent:
                 if loaded_skill_context and result.tool_use_id == injection_target:
                     model_content = f"{model_content}\n\n{loaded_skill_context}"
                     injected = True
-                store.append(
-                    session_id,
+                self._log(
                     "tool/result",
                     {"name": tool_name, "content": model_content, "is_error": result.is_error},
                     turn_id=turn_id,
@@ -1091,8 +974,7 @@ class Agent:
                 )
 
             if loaded_skill_context:
-                store.append(
-                    session_id,
+                self._log(
                     "skill/context",
                     {
                         "id": "loaded-skill-context",
@@ -1105,8 +987,7 @@ class Agent:
                     source="skill-loader",
                 )
 
-            store.append(
-                session_id,
+            self._log(
                 "step/completed",
                 {"tool_call_count": len(tool_calls)},
                 turn_id=turn_id,
@@ -1123,8 +1004,7 @@ class Agent:
                 f"Agent reached its {self.max_turns}-step limit while work remained, "
                 "before producing a final answer. Send a follow-up to continue."
             )
-            store.append(
-                session_id,
+            self._log(
                 "turn/failed",
                 {"reason": "max_steps_reached", "steps": turn},
                 turn_id=turn_id,
@@ -1138,29 +1018,30 @@ class Agent:
             )
             return
 
-        # The event stream is canonical; this list is a local message projection.
-        store.append(
-            session_id,
+        self._log(
             "turn/completed",
             {"total_tokens": total_usage.total_tokens, "steps": turn},
             turn_id=turn_id,
         )
         final_events = store.events(session_id)
-        if turn:
-            completed_step = next(
+        completed_step = next(
+            (
                 event.step_id
                 for event in reversed(final_events)
                 if event.event_type == "step/completed" and event.turn_id == turn_id
+            ),
+            None,
+        )
+        if completed_step is None:
+            raise RuntimeError(
+                "internal error: no completed step found for the finished turn"
             )
-            final_view = self._context_projector.project(
-                final_events,
-                session_id=session_id,
-                turn_id=turn_id,
-                step_id=completed_step,
-            )
-            self.history = list(final_view.messages)
-        else:
-            self.history = latest_messages
+        final_view = self._context_projector.project(
+            final_events,
+            session_id=session_id,
+            turn_id=turn_id,
+            step_id=completed_step,
+        )
         self.last_usage = total_usage
 
         done_event: dict[str, Any] = {
@@ -1168,51 +1049,50 @@ class Agent:
             "total_turns": turn,
             "total_tokens": total_usage.total_tokens,
             "usage": total_usage.to_dict(),
-            "messages": self.history,
+            "messages": list(final_view.messages),
             "session_id": session_id,
             "turn_id": turn_id,
         }
-        costs = _calculate_costs(self.llm_client, total_usage)
+        costs = calculate_costs(self.llm_client, total_usage)
         if costs:
             done_event["cost"] = costs
             self.last_cost = costs
         yield done_event
 
-    def _seed_session_history(self) -> None:
-        session_id = self._ensure_session()
-        store = self.session_store
-        assert store is not None
-        events = store.events(session_id)
-        if any(
-            event.event_type in {"user/message", "assistant/message", "tool/result"}
-            for event in events
-        ):
-            return
-        if not any(event.event_type == "session/created" for event in events):
-            store.append(session_id, "session/created", {}, source="agent")
-        for message in self.history:
-            if message.role not in {"user", "assistant", "tool"}:
-                continue
-            payload = _message_payload(message)
-            event_type = "tool/result" if message.role == "tool" else f"{message.role}/message"
-            store.append(
-                session_id,
-                event_type,
-                payload,
-                tool_call_id=message.tool_call_id,
-                source="session-history-seed",
-            )
-
     def _ensure_session(self) -> str:
         if self.session_store is None:
             self.session_store = SessionStore(
-                Path.home() / ".paicli" / "runtime" / "runtime.db",
+                default_runtime_db_path(),
                 sensitive_values=(self.config.llm.api_key,),
             )
         self.session_store.redactor.add_sensitive_values((self.config.llm.api_key,))
         if self.session_id is None:
             self.session_id = self.session_store.create_session()
         return self.session_id
+
+    def _log(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        step_id: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        """Append an event to the session store.
+
+        ``session_id`` defaults to the agent's active session. No-op when there
+        is no session store (e.g. stateless ``query()`` invocations).
+        """
+        if self.session_store is None:
+            return
+        sid = session_id or self.session_id
+        if sid is None:
+            return
+        self.session_store.append(
+            sid, event_type, payload, turn_id=turn_id, step_id=step_id, source=source
+        )
 
     def _budget_metadata(self) -> dict[str, int]:
         return {
@@ -1227,130 +1107,14 @@ class Agent:
     def _create_new_session(self) -> str:
         if self.session_store is None:
             self.session_store = SessionStore(
-                Path.home() / ".paicli" / "runtime" / "runtime.db",
+                default_runtime_db_path(),
                 sensitive_values=(self.config.llm.api_key,),
             )
         return self.session_store.create_session()
 
-    async def _run_logged_mode(
-        self,
-        events: AsyncIterator[dict[str, Any]],
-        message: str,
-        mode: str,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """Persist the parent request/result without importing child-agent internals."""
-        session_id = self._ensure_session()
-        store = self.session_store
-        assert store is not None
-        turn_id = f"turn_{uuid.uuid4().hex}"
-        step_id = f"step_{uuid.uuid4().hex}"
-        store.append(session_id, "turn/started", {"mode": mode}, turn_id=turn_id)
-        store.append(
-            session_id,
-            "user/message",
-            {"content": message},
-            turn_id=turn_id,
-            source="cli-or-runtime",
-        )
-        store.append(session_id, "step/started", {"mode": mode}, turn_id=turn_id, step_id=step_id)
-        answer: list[str] = []
-        total_tokens = 0
-        try:
-            async for event in events:
-                event_type = event.get("type")
-                if event_type == "text_delta":
-                    answer.append(str(event.get("text") or ""))
-                elif event_type == "plan_task_started":
-                    store.append(
-                        session_id,
-                        "agent/child_started",
-                        {"task_id": event.get("task_id"), "mode": mode},
-                        turn_id=turn_id,
-                        step_id=step_id,
-                    )
-                elif event_type == "plan_task_done":
-                    store.append(
-                        session_id,
-                        "agent/child_completed",
-                        {
-                            "task_id": event.get("task_id"),
-                            "turns": event.get("turns"),
-                            "tokens": event.get("tokens"),
-                        },
-                        turn_id=turn_id,
-                        step_id=step_id,
-                    )
-                elif event_type == "done":
-                    total_tokens = int(event.get("total_tokens") or 0)
-                elif event_type == "error":
-                    store.append(
-                        session_id,
-                        "step/failed",
-                        {"reason": type(event.get("error")).__name__},
-                        turn_id=turn_id,
-                        step_id=step_id,
-                    )
-                    store.append(
-                        session_id,
-                        "turn/failed",
-                        {"reason": type(event.get("error")).__name__},
-                        turn_id=turn_id,
-                    )
-                if event_type == "done":
-                    content = "".join(answer)
-                    store.append(
-                        session_id,
-                        "assistant/message",
-                        {"content": content},
-                        turn_id=turn_id,
-                        step_id=step_id,
-                        source=f"{mode}-summary",
-                    )
-                    store.append(
-                        session_id,
-                        "step/completed",
-                        {"mode": mode},
-                        turn_id=turn_id,
-                        step_id=step_id,
-                    )
-                    store.append(
-                        session_id,
-                        "turn/completed",
-                        {"mode": mode, "total_tokens": total_tokens},
-                        turn_id=turn_id,
-                    )
-                    self.history = [
-                        Message(role="user", content=message),
-                        Message(role="assistant", content=content),
-                    ]
-                    event = {
-                        **event,
-                        "session_id": session_id,
-                        "turn_id": turn_id,
-                        "step_id": step_id,
-                    }
-                yield {**event, "session_id": session_id, "turn_id": turn_id, "step_id": step_id}
-        except Exception as exc:
-            state = store.state(session_id)
-            if state.active_turn_id:
-                if state.active_step_id:
-                    store.append(
-                        session_id,
-                        "step/failed",
-                        {"reason": type(exc).__name__},
-                        turn_id=turn_id,
-                        step_id=step_id,
-                    )
-                store.append(
-                    session_id,
-                    "turn/failed",
-                    {"reason": type(exc).__name__},
-                    turn_id=turn_id,
-                )
-            raise
-
     async def _run_plan(self, message: str) -> AsyncIterator[dict[str, Any]]:
         """Plan-then-execute mode: the planner creates a DAG, then workers run it."""
+        session_id = self._ensure_session()
         agent = PlanExecuteAgent(
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
@@ -1358,12 +1122,11 @@ class Agent:
             cwd=self.cwd,
             approval_callback=self.approval_callback,
             max_task_turns=self.max_turns,
+            session_store=self.session_store,
+            session_id=session_id,
         )
-        agent.history = list(self.history)
-
         async for event in agent.run(message):
             if event.get("type") == "done":
-                self.history = list(event.get("messages") or [])
                 self.last_usage = Usage.from_mapping(event.get("usage") or {})
                 self.last_cost = dict(event.get("cost") or {})
             yield event
@@ -1385,62 +1148,8 @@ class Agent:
 
 
 # ------------------------------------------------------------------
-# Shared helpers (also used by query.py)
+# ReAct event helpers
 # ------------------------------------------------------------------
-
-
-def _merge_tool_delta(tool_states: dict[int, dict[str, Any]], delta: dict[str, Any]) -> None:
-    index = int(delta.get("index") or 0)
-    state = tool_states.setdefault(
-        index,
-        {
-            "id": delta.get("id") or f"tool_{index}",
-            "type": "function",
-            "function": {"name": "", "arguments": ""},
-        },
-    )
-    if delta.get("id"):
-        state["id"] = delta["id"]
-    function = delta.get("function") or {}
-    if function.get("name"):
-        state["function"]["name"] = function["name"]
-    if function.get("arguments"):
-        state["function"]["arguments"] += function["arguments"]
-
-
-def _finalize_tool_calls(tool_states: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
-    calls = []
-    for index in sorted(tool_states):
-        state = tool_states[index]
-        if state["function"]["name"]:
-            calls.append(state)
-    return calls
-
-
-def _tool_input(call: dict[str, Any]) -> dict[str, Any]:
-    raw = call.get("function", {}).get("arguments") or "{}"
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"raw": raw}
-    return parsed if isinstance(parsed, dict) else {"value": parsed}
-
-
-def _tool_name_by_id(calls: list[dict[str, Any]], tool_call_id: str) -> str:
-    for call in calls:
-        if call.get("id") == tool_call_id:
-            return str(call.get("function", {}).get("name") or "unknown")
-    return "unknown"
-
-
-def _message_payload(message: Message) -> dict[str, Any]:
-    return {
-        "role": message.role,
-        "content": message.content,
-        "name": message.name,
-        "tool_call_id": message.tool_call_id,
-        "tool_calls": message.tool_calls,
-    }
 
 
 def _transform_message_images(message: Message, cwd: str) -> Message:
@@ -1500,17 +1209,3 @@ def _drain_skill_context(skill_context_buffer: SkillContextBuffer) -> str:
     if not skill_context_buffer or skill_context_buffer.is_empty():
         return ""
     return skill_context_buffer.drain()
-
-
-def _calculate_costs(llm_client: LlmClient, usage: Usage) -> dict[str, Any]:
-    calculator = getattr(llm_client, "calculate_cost", None)
-    if not callable(calculator):
-        return {}
-    result: dict[str, Any] = {}
-    for currency in ("usd", "cny"):
-        try:
-            breakdown = calculator(usage, currency=currency)
-        except (KeyError, TypeError, ValueError):
-            continue
-        result[currency] = breakdown.to_dict()
-    return result

@@ -5,9 +5,10 @@ from typing import Any
 
 from paicli.agent import QueryEngine
 from paicli.config import load_config
+from paicli.context import CompactionResponse
+from paicli.session import SessionStore
 from paicli.skill import SkillRegistry
 from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.types import Message
 
 
 class FakeClient:
@@ -75,15 +76,29 @@ class SkillLoadingClient:
 class UsageAndCompressionClient:
     model_name = "fake-model"
     provider_name = "fake-provider"
-    max_context_window = 800
+    max_context_window = 2_000
 
     def __init__(self):
         self.saw_summary = False
 
-    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
-        self.saw_summary = any(
-            "conversation-summary" in str(message.content) for message in messages
+    async def complete(self, request):
+        headings = (
+            "Primary Request and Intent",
+            "Constraints and Preferences",
+            "Key Technical Concepts",
+            "Files and Changes",
+            "Decisions and Rationale",
+            "Progress",
+            "Pending Work and Next Steps",
+            "Critical Context",
         )
+        return CompactionResponse(
+            text="\n".join(f"## {heading}\n(none)" for heading in headings)
+            + "\n### Done\n(none)\n### In Progress\n(none)\n### Blocked\n(none)"
+        )
+
+    async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+        self.saw_summary = any("compacted-summary" in str(message.content) for message in messages)
         yield {"type": "text_delta", "text": "compressed"}
         yield {"type": "message_end", "stop_reason": "end_turn"}
         yield {
@@ -150,6 +165,7 @@ def test_query_integrates_context_compression_and_detailed_usage(tmp_path, monke
     config.llm.max_tokens = 100
     config.memory.compression_reserve_tokens = 20
     config.memory.compression_threshold = 0.6
+    config.memory.compression_mode = "llm"
     client = UsageAndCompressionClient()
     engine = QueryEngine(
         llm_client=client,
@@ -157,16 +173,16 @@ def test_query_integrates_context_compression_and_detailed_usage(tmp_path, monke
         config=config,
         cwd=str(tmp_path),
     )
-    history = []
+    store = SessionStore(tmp_path / "runtime.db")
+    session_id = store.create_session()
     for index in range(8):
-        history.extend(
-            [
-                Message(role="user", content=f"old request {index} " + "x" * 220),
-                Message(role="assistant", content=f"old answer {index} " + "y" * 220),
-            ]
+        store.append(session_id, "user/message", {"content": f"old request {index} " + "x" * 500})
+        store.append(
+            session_id, "assistant/message", {"content": f"old answer {index} " + "y" * 500}
         )
-
-    result = asyncio.run(engine.ask_complete_async("new request", history=history))
+    engine.session_store = store
+    engine.session_id = session_id
+    result = asyncio.run(engine.ask_complete_async("new request"))
 
     assert result.text == "compressed"
     assert client.saw_summary

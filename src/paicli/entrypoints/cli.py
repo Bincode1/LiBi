@@ -157,9 +157,9 @@ def main(
 
     session_store = None
     if resume:
-        from paicli.session import SessionStore
+        from paicli.session import SessionStore, default_runtime_db_path
 
-        session_store = SessionStore(Path.home() / ".paicli" / "runtime" / "runtime.db")
+        session_store = SessionStore(default_runtime_db_path())
         session_id = _select_session(session_store)
 
     from paicli.config import load_config
@@ -170,10 +170,10 @@ def main(
 
     if session_id is not None:
         if session_store is None:
-            from paicli.session import SessionStore
+            from paicli.session import SessionStore, default_runtime_db_path
 
             session_store = SessionStore(
-                Path.home() / ".paicli" / "runtime" / "runtime.db",
+                default_runtime_db_path(),
                 sensitive_values=(config.llm.api_key,),
             )
         if not session_store.session_exists(session_id):
@@ -371,9 +371,7 @@ async def _run_prompt(
 ) -> None:
     """Execute a single prompt and print the result."""
     from paicli.agent import QueryEngine
-    from paicli.bootstrap import build_tool_registry
-    from paicli.llm import create_llm_client
-    from paicli.session import SessionStore
+    from paicli.bootstrap import build_runtime
 
     config.render_mode = "plain"
     if not config.llm.api_key:
@@ -384,19 +382,16 @@ async def _run_prompt(
             err=True,
         )
         raise typer.Exit(1)
-    registry, manager = await build_tool_registry(config=config, cwd=cwd)
+    client, registry, manager, session_store = await build_runtime(config=config, cwd=cwd)
     if manager and manager.last_errors:
         for name, error in manager.last_errors.items():
             typer.echo(f"MCP server {name} failed to load: {error}", err=True)
     engine = QueryEngine(
-        llm_client=create_llm_client(config.llm),
+        llm_client=client,
         tool_registry=registry,
         config=config,
         cwd=cwd,
-        session_store=SessionStore(
-            Path.home() / ".paicli" / "runtime" / "runtime.db",
-            sensitive_values=(config.llm.api_key,),
-        ),
+        session_store=session_store,
         session_id=session_id,
     )
     try:

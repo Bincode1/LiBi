@@ -265,8 +265,8 @@ def test_runtime_session_events_are_not_merged_with_child_sessions(tmp_path):
 
 def test_runtime_routes_react_and_plan_modes():
     class Engine:
-        def ask(self, message, history=None):
-            return ("react", message, history)
+        def ask(self, message):
+            return ("react", message)
 
         def plan(self, message):
             return ("plan", message)

@@ -9,8 +9,11 @@ from paicli.tools.registry import ToolRegistry
 
 
 class ToolExecutor:
-    def __init__(self, registry: ToolRegistry):
+    def __init__(self, registry: ToolRegistry, *, audit_log_path: str | None = None):
         self.registry = registry
+        # Construct the audit log once per executor (one per agent run) instead of
+        # reopening the file handle for every single tool call.
+        self._audit_log = AuditLog(audit_log_path) if audit_log_path else None
 
     async def execute_all(
         self,
@@ -65,7 +68,9 @@ class ToolExecutor:
                 is_error=True,
             )
 
-        audit = AuditLog(context.config.policy.audit_log_path)
+        audit = self._audit_log
+        if audit is None:
+            audit = AuditLog(context.config.policy.audit_log_path)
         approver = "none"
 
         async def notify(kind: str, **fields: Any) -> None:
