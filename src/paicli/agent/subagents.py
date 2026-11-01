@@ -334,7 +334,12 @@ class SubagentManager:
                 is_error=True,
             )
         agent_id = f"agent_{uuid.uuid4().hex[:12]}"
-        session_id = context.session_store.create_session() if context.session_store else None
+        session_id = None
+        if context.session_store and context.session_id:
+            session_id = context.session_store.create_session(
+                kind="child",
+                parent_session_id=context.session_id,
+            )
         if session_id is None:
             return ToolResult(
                 "SESSION_PERSISTENCE_UNAVAILABLE: subagents require a session store.",

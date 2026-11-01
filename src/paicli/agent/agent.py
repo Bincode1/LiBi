@@ -25,6 +25,12 @@ from typing import Any, Literal
 from paicli.agent.plan_execute import PlanExecuteAgent
 from paicli.config import PaiCliConfig
 from paicli.context import (
+    CompactionClient,
+    CompactionCoordinator,
+    CompactionError,
+    CompactionPlanner,
+    CompactionPolicy,
+    CompactionResult,
     ContextBudget,
     ContextWindowManager,
     estimate_message_tokens,
@@ -82,6 +88,7 @@ class Agent:
         agent_id: str = "root",
         event_sink: Callable[[dict[str, Any]], Any] | None = None,
         steer_inbox: asyncio.Queue[str] | None = None,
+        compaction_client: CompactionClient | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -110,6 +117,9 @@ class Agent:
         self.agent_id = agent_id
         self.event_sink = event_sink
         self.steer_inbox = steer_inbox
+        self.compaction_client = compaction_client
+        self.last_compaction: dict[str, Any] | None = None
+        self._ephemeral_history_mode = False
         self._context_projector = ContextProjector()
         self._request_builder = RequestBuilder()
 
@@ -246,6 +256,157 @@ class Agent:
                 cost = dict(event.get("cost") or {})
         return QueryResult(text=text, total_tokens=tokens, turns=turns, usage=usage, cost=cost)
 
+    async def compact(
+        self,
+        focus: str | None = None,
+        *,
+        trigger: str = "manual",
+        force: bool | None = None,
+        allow_active_turn: bool = False,
+        input_context_hash: str | None = None,
+    ) -> CompactionResult:
+        """Compact the durable session history through one isolated LLM request.
+
+        This is a maintenance operation: it never creates a fake turn or chat
+        message.  The session lease fences model-visible writes while the
+        provider request is in flight and the checkpoint commit is atomic.
+        """
+        if self.config.memory.compression_mode == "disabled":
+            raise CompactionError("context compaction is disabled", code="disabled")
+        if self.config.memory.compression_mode == "legacy_extractive":
+            raise CompactionError(
+                "LLM compaction is unavailable in legacy_extractive mode",
+                code="legacy_mode",
+            )
+        session_id = self.session_id
+        if not session_id or self.session_store is None:
+            raise CompactionError("no active session", code="no_session")
+        state = self.session_store.state(session_id)
+        if state.active_turn_id and not allow_active_turn:
+            raise CompactionError("session is busy", code="busy")
+
+        events = self.session_store.events(session_id)
+        view = self._context_projector.project_session(events, session_id=session_id)
+        policy = CompactionPolicy(
+            context_window=int(self.llm_client.max_context_window),
+            normal_max_output_tokens=int(self.config.llm.max_tokens),
+            threshold_ratio=float(self.config.memory.compression_threshold),
+            compression_target=float(self.config.memory.compression_target),
+            reserve_tokens=int(self.config.memory.compression_reserve_tokens),
+            min_recent_messages=int(self.config.memory.min_recent_messages),
+            max_tool_result_chars_in_input=int(
+                self.config.compaction.max_tool_result_chars_in_input
+            ),
+        )
+        planner = CompactionPlanner(policy)
+        should_force = trigger == "manual" if force is None else force
+        plan = planner.plan(
+            view.messages,
+            sources=view.message_sources,
+            trigger=trigger,
+            force=should_force,
+        )
+        if not plan.has_selection:
+            return CompactionResult(
+                None,
+                tuple(view.messages),
+                tuple(view.message_sources),
+                plan,
+                f"compact_attempt_{uuid.uuid4().hex}",
+                None,
+            )
+
+        attempt_id = f"compact_attempt_{uuid.uuid4().hex}"
+        lease = self.session_store.acquire_compaction_lease(
+            session_id,
+            attempt_id=attempt_id,
+            base_sequence=view.through_sequence,
+            surface_hash=view.context_hash,
+        )
+
+        def write_event(event_type: str, payload: dict[str, Any]) -> Any:
+            if event_type == "compaction/started":
+                return self.session_store.append(
+                    session_id,
+                    event_type,
+                    payload,
+                    source="compaction-coordinator",
+                    lease_token=lease.owner_token,
+                )
+            if event_type == "compaction/failed":
+                return self.session_store.fail_compaction(
+                    lease.owner_token,
+                    payload,
+                    source="compaction-coordinator",
+                )
+            # The atomic checkpoint writer below is the single success event.
+            return None
+
+        def commit_checkpoint(payload: dict[str, Any]) -> Any:
+            return self.session_store.commit_compaction_checkpoint(
+                lease.owner_token,
+                payload,
+                source="compaction-coordinator",
+            )
+
+        coordinator = CompactionCoordinator(
+            policy=policy,
+            client=self.compaction_client or self.llm_client,
+            provider=self.config.compaction.provider or self.llm_client.provider_name,
+            model=self.config.compaction.model or self.llm_client.model_name,
+            max_output_tokens=int(self.config.compaction.max_output_tokens),
+            temperature=float(self.config.compaction.temperature),
+            event_writer=write_event,
+        )
+        try:
+            result = await coordinator.compact(
+                view.messages,
+                attempt_id=attempt_id,
+                sources=view.message_sources,
+                input_context_hash=input_context_hash or view.context_hash,
+                projection_kind="session",
+                through_sequence=view.through_sequence,
+                trigger=trigger,
+                focus=focus,
+                force=should_force,
+                checkpoint_writer=commit_checkpoint,
+            )
+            self.last_compaction = {
+                "attempt_id": result.attempt_id,
+                "compaction_id": result.compaction_id,
+                "trigger": trigger,
+                "before_tokens": result.plan.estimated_tokens_before,
+                "after_tokens": result.plan.estimated_tokens_after,
+                "usage": result.usage.to_dict() if result.usage else None,
+            }
+            return result
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                self.session_store.fail_compaction(
+                    lease.owner_token,
+                    {
+                        "attempt_id": attempt_id,
+                        "trigger": trigger,
+                        "failure_code": "cancelled",
+                        "retryable_by_user": True,
+                        "cost_may_be_charged": True,
+                    },
+                )
+            raise
+        except Exception:
+            with suppress(Exception):
+                self.session_store.fail_compaction(
+                    lease.owner_token,
+                    {
+                        "attempt_id": attempt_id,
+                        "trigger": trigger,
+                        "failure_code": "coordinator_error",
+                        "retryable_by_user": True,
+                        "cost_may_be_charged": False,
+                    },
+                )
+            raise
+
     # ------------------------------------------------------------------
     # History management
     # ------------------------------------------------------------------
@@ -265,7 +426,7 @@ class Agent:
     async def _run_react(self, message: str) -> AsyncIterator[dict[str, Any]]:
         """Standard ReAct loop (the default and most common mode)."""
         turn_id = f"turn_{uuid.uuid4().hex}"
-        self._import_legacy_history()
+        self._seed_session_history()
         session_id = self._ensure_session()
         store = self.session_store
         assert store is not None
@@ -495,8 +656,76 @@ class Agent:
                 budget=self._budget_metadata(),
             )
 
+            if (
+                not self._ephemeral_history_mode
+                and self.config.memory.compression_mode == "llm"
+                and callable(getattr(self.compaction_client or self.llm_client, "complete", None))
+            ):
+                llm_policy = CompactionPolicy(
+                    context_window=int(self.llm_client.max_context_window),
+                    normal_max_output_tokens=int(self.config.llm.max_tokens),
+                    threshold_ratio=float(self.config.memory.compression_threshold),
+                    compression_target=float(self.config.memory.compression_target),
+                    reserve_tokens=int(self.config.memory.compression_reserve_tokens),
+                    min_recent_messages=int(self.config.memory.min_recent_messages),
+                    max_tool_result_chars_in_input=int(
+                        self.config.compaction.max_tool_result_chars_in_input
+                    ),
+                )
+                estimate = llm_policy.estimate_request(
+                    current_view.messages,
+                    system_prompt=current_view.system_prompt,
+                    tools=current_view.tools,
+                )
+                try:
+                    pressure_limit = llm_policy.pressure_limit
+                except ValueError:
+                    pressure_limit = 0
+                if pressure_limit and estimate.tokens >= pressure_limit:
+                    compression = await self.compact(
+                        trigger="pressure",
+                        force=True,
+                        allow_active_turn=True,
+                        input_context_hash=current_view.context_hash,
+                    )
+                    if compression.compaction_id:
+                        yield _annotate_event(
+                            {
+                                "type": "context_compressed",
+                                "before_tokens": compression.plan.estimated_tokens_before,
+                                "after_tokens": compression.plan.estimated_tokens_after,
+                                "summarized_messages": compression.plan.selected_message_count,
+                                "compaction_id": compression.compaction_id,
+                                "usage": compression.usage.to_dict() if compression.usage else None,
+                            },
+                            session_id,
+                            turn_id,
+                            step_id,
+                        )
+                    current_view = self._context_projector.project(
+                        store.events(session_id),
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                        scope="session",
+                        route=self.llm_client.provider_name,
+                        adapter_capabilities={
+                            "provider": self.llm_client.provider_name,
+                            "supports_images": bool(
+                                getattr(self.llm_client, "supports_images", False)
+                            ),
+                        },
+                        budget=self._budget_metadata(),
+                    )
+
             # Compress if needed.
-            if self.config.features.context_compression:
+            # The deterministic compressor remains available only through the
+            # explicit legacy-extractive mode. LLM mode uses Agent.compact()
+            # and never silently falls back to extractive summaries.
+            if (
+                self.config.memory.compression_mode == "legacy_extractive"
+                or self._ephemeral_history_mode
+            ):
                 compression = context_manager.prepare(
                     list(current_view.messages),
                     system_prompt=current_view.system_prompt,
@@ -909,7 +1138,7 @@ class Agent:
             )
             return
 
-        # The event stream is canonical; this list remains a compatibility projection.
+        # The event stream is canonical; this list is a local message projection.
         store.append(
             session_id,
             "turn/completed",
@@ -949,7 +1178,7 @@ class Agent:
             self.last_cost = costs
         yield done_event
 
-    def _import_legacy_history(self) -> None:
+    def _seed_session_history(self) -> None:
         session_id = self._ensure_session()
         store = self.session_store
         assert store is not None
@@ -971,7 +1200,7 @@ class Agent:
                 event_type,
                 payload,
                 tool_call_id=message.tool_call_id,
-                source="legacy-history-adapter",
+                source="session-history-seed",
             )
 
     def _ensure_session(self) -> str:

@@ -71,6 +71,9 @@ class QueryEngine:
         self._last_agent = agent
         if history is not None:
             agent.history = list(history)
+            # Caller-provided history is ephemeral and cannot safely create a
+            # durable paid compaction checkpoint.
+            agent._ephemeral_history_mode = True
         self._running = True
         try:
             async with aclosing(agent.run(message)) as events:

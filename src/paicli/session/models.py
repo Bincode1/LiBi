@@ -5,6 +5,8 @@ from typing import Any
 
 from paicli.types import Message
 
+MessageSource = dict[str, list[object]]
+
 
 @dataclass(slots=True, frozen=True)
 class SessionEvent:
@@ -30,6 +32,28 @@ class SessionState:
     active_turn_id: str | None = None
     active_step_id: str | None = None
     latest_compaction_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionSummary:
+    session_id: str
+    created_at: str
+    updated_at: str
+    status: str
+    last_sequence: int
+    kind: str = "root"
+    parent_session_id: str | None = None
+    latest_user_message: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class CompactionLease:
+    session_id: str
+    owner_token: str
+    attempt_id: str
+    base_sequence: int
+    surface_hash: str
+    expires_at: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -70,6 +94,10 @@ class ContextView:
     compaction_id: str | None
     context_hash: str
     through_sequence: int = 0
+    # One provenance entry per projected message.  ``event_sequences`` refer to
+    # durable Session events; ``checkpoint_ids`` identify prior synthetic
+    # summaries when an event-level lineage is unavailable.
+    message_sources: tuple[MessageSource, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)

@@ -120,7 +120,7 @@ def test_legacy_team_task_fails_explicitly(tmp_path):
         asyncio.run(server._run_task(task))
 
 
-def test_runtime_thread_history_persists_between_turns(tmp_path, monkeypatch):
+def test_runtime_session_history_reads_canonical_events(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     server = RuntimeApiServer(
         cwd=str(tmp_path),
@@ -128,16 +128,13 @@ def test_runtime_thread_history_persists_between_turns(tmp_path, monkeypatch):
         api_key="test-key",
         workers=1,
     )
-    thread_id = server._create_thread()
-    server._append_thread_message(thread_id, "user", "first question")
-    server._append_thread_message(thread_id, "assistant", "first answer")
+    session_id = server._create_session()
+    server.session_store.append(session_id, "user/message", {"content": "first question"})
+    server.session_store.append(session_id, "assistant/message", {"content": "first answer"})
 
-    history = server._thread_history(thread_id)
+    history = server.session_store.events(session_id)
 
-    assert [(message.role, message.content) for message in history] == [
-        ("user", "first question"),
-        ("assistant", "first answer"),
-    ]
+    assert [event.event_type for event in history[-2:]] == ["user/message", "assistant/message"]
 
 
 def test_runtime_initialization_failure_closes_canonical_turn(tmp_path, monkeypatch):
@@ -147,7 +144,7 @@ def test_runtime_initialization_failure_closes_canonical_turn(tmp_path, monkeypa
     server = RuntimeApiServer(
         cwd=str(tmp_path), config=config, api_key="unit-runtime-placeholder", workers=1
     )
-    thread_id = server._create_thread()
+    session_id = server._create_session()
 
     async def fail_registry(**_kwargs):
         raise RuntimeError("registry initialization failed")
@@ -156,18 +153,18 @@ def test_runtime_initialization_failure_closes_canonical_turn(tmp_path, monkeypa
 
     async def run():
         with pytest.raises(RuntimeError, match="registry initialization failed"):
-            await server._run_turn(thread_id, "hello")
+            await server._run_turn(session_id, "hello")
 
     import asyncio
 
     asyncio.run(run())
     lifecycle = [
         event
-        for event in server.session_store.events(thread_id)
+        for event in server.session_store.events(session_id)
         if event.event_type in {"turn/started", "turn/failed", "turn/completed"}
     ]
     assert [event.event_type for event in lifecycle] == ["turn/started", "turn/failed"]
-    state = server.session_store.state(thread_id)
+    state = server.session_store.state(session_id)
     assert state.status == "failed"
     assert state.active_turn_id is None
 
@@ -176,27 +173,25 @@ def test_runtime_event_sse_resumes_after_cursor(tmp_path):
     class Request:
         def __init__(self):
             self.wfile = io.BytesIO()
-            self.headers = []
+            self.headers = {}
             self.status = None
 
         def send_response(self, status):
             self.status = status
 
-        def send_header(self, key, value):
-            self.headers.append((key, value))
+        def send_header(self, _key, _value):
+            pass
 
         def end_headers(self):
             pass
 
     server = RuntimeApiServer.__new__(RuntimeApiServer)
-    server.db_path = tmp_path / "runtime.db"
-    server._ensure_schema()
-    server.session_store = SessionStore(server.db_path)
-    first = server.session_store.append("thread-a", "turn/started", {}, source="runtime")
-    second = server.session_store.append("thread-a", "turn/completed", {}, source="runtime")
+    server.session_store = SessionStore(tmp_path / "runtime.db")
+    first = server.session_store.append("session-a", "turn/started", {}, source="runtime")
+    second = server.session_store.append("session-a", "turn/completed", {}, source="runtime")
     request = Request()
 
-    server._send_events(request, "thread-a", after_sequence=first.sequence)
+    server._send_events(request, "session-a", after_sequence=first.sequence)
 
     body = request.wfile.getvalue().decode("utf-8")
     assert request.status == 200
@@ -207,7 +202,7 @@ def test_runtime_event_sse_resumes_after_cursor(tmp_path):
 def test_runtime_events_accepts_last_event_id_header(tmp_path):
     class Request:
         command = "GET"
-        path = "/v1/threads/thread-a/events"
+        path = "/v1/sessions/session-a/events"
         headers = {"last-event-id": "1", "content-length": "0"}
 
         def __init__(self):
@@ -225,11 +220,9 @@ def test_runtime_events_accepts_last_event_id_header(tmp_path):
             pass
 
     server = RuntimeApiServer.__new__(RuntimeApiServer)
-    server.db_path = tmp_path / "runtime.db"
-    server._ensure_schema()
-    server.session_store = SessionStore(server.db_path)
-    server.session_store.append("thread-a", "turn/started", {}, source="runtime")
-    second = server.session_store.append("thread-a", "turn/completed", {}, source="runtime")
+    server.session_store = SessionStore(tmp_path / "runtime.db")
+    server.session_store.append("session-a", "turn/started", {}, source="runtime")
+    second = server.session_store.append("session-a", "turn/completed", {}, source="runtime")
     server._authorized = lambda _request: True
     request = Request()
 
@@ -241,16 +234,16 @@ def test_runtime_events_accepts_last_event_id_header(tmp_path):
     assert "turn/started" not in body
 
 
-def test_runtime_console_json_events_include_child_sessions(tmp_path):
+def test_runtime_session_events_are_not_merged_with_child_sessions(tmp_path):
     server = RuntimeApiServer.__new__(RuntimeApiServer)
-    server.db_path = tmp_path / "runtime.db"
-    server._ensure_schema()
-    server.session_store = SessionStore(server.db_path)
-    server.session_store.create_session("root-thread")
-    server.session_store.create_session("child-session")
+    server.session_store = SessionStore(tmp_path / "runtime.db")
+    server.session_store.create_session("root-session")
+    server.session_store.create_session(
+        "child-session", kind="child", parent_session_id="root-session"
+    )
     server.session_store.append(
-        "root-thread",
-        "agent/subagent_catalog",
+        "root-session",
+        "agent/child_started",
         {"child_id": "child-1", "child_session_id": "child-session"},
         source="subagent-manager",
     )
@@ -261,45 +254,13 @@ def test_runtime_console_json_events_include_child_sessions(tmp_path):
         source="tool-executor",
     )
 
-    payload = server._events_json("root-thread", 0)
+    payload = server._events_json("root-session", 0)
 
-    assert any(
-        event.get("agent_id") == "child-1" and event["type"] == "tool/execution_started"
+    assert not any(
+        event.get("payload", {}).get("child_session_id") == "child-session"
+        and event["type"] == "tool/execution_started"
         for event in payload["events"]
     )
-
-
-def test_runtime_history_sync_keeps_legacy_messages_when_projection_fails(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    server = RuntimeApiServer(
-        cwd=str(tmp_path),
-        config=load_config(project_root=tmp_path),
-        api_key="test-key",
-        workers=1,
-    )
-    thread_id = server._create_thread()
-    server._append_thread_message(thread_id, "user", "legacy")
-    server.session_store.append(thread_id, "turn/started", {}, turn_id="turn-a")
-    server.session_store.append(thread_id, "user/message", {"content": "new"}, turn_id="turn-a")
-    server.session_store.append(thread_id, "turn/completed", {}, turn_id="turn-a")
-    server.session_store.append(thread_id, "step/completed", {}, turn_id="turn-a", step_id="step-a")
-
-    def fail_projection(*args, **kwargs):
-        raise ValueError("projection failed")
-
-    server.session_store.events = fail_projection
-    try:
-        server._sync_thread_messages(thread_id)
-    except ValueError as exc:
-        assert "projection failed" in str(exc)
-    else:
-        raise AssertionError("projection failure was swallowed")
-
-    with server._connect() as conn:
-        rows = conn.execute(
-            "select role, content from messages where thread_id = ?", (thread_id,)
-        ).fetchall()
-    assert rows == [("user", "legacy")]
 
 
 def test_runtime_routes_react_and_plan_modes():
@@ -312,9 +273,9 @@ def test_runtime_routes_react_and_plan_modes():
 
     engine = Engine()
 
-    assert _engine_events(engine, "react", "x", history=["h"])[0] == "react"
+    assert _engine_events(engine, "react", "x")[0] == "react"
     assert _engine_events(engine, "plan", "x")[0] == "plan"
-    with pytest.raises(ValueError, match="no longer supported"):
+    with pytest.raises(ValueError, match="mode must be one of"):
         _engine_events(engine, "team", "x")
 
 

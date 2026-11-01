@@ -30,20 +30,14 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
-from rich.console import Console
 
 from paicli import __version__
-from paicli.agent import QueryEngine
-from paicli.bootstrap import build_tool_registry
-from paicli.config import get_config_paths, load_config
-from paicli.entrypoints.repl import start_repl
-from paicli.llm import create_llm_client
-from paicli.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
-from paicli.runtime import RuntimeApiServer
-from paicli.runtime.api import runtime_api_key
+
+if TYPE_CHECKING:
+    from paicli.session import SessionStore
 
 app = typer.Typer(
     name="paicli",
@@ -53,7 +47,6 @@ app = typer.Typer(
 )
 mcp_app = typer.Typer(help="MCP server management")
 app.add_typer(mcp_app, name="mcp")
-console = Console()
 
 
 def _version_callback(value: bool) -> None:
@@ -70,6 +63,22 @@ def main(
         str | None,
         typer.Option("-p", "--prompt", help="Single prompt (non-interactive mode)"),
     ] = None,
+    session_id: Annotated[
+        str | None,
+        typer.Option(
+            "--session-id",
+            "--session",
+            help="Resume an existing persisted session by ID",
+        ),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "-r",
+            "--resume",
+            help="List persisted sessions and choose one to resume",
+        ),
+    ] = False,
     # --- LLM configuration ---
     api_key: Annotated[
         str | None,
@@ -140,9 +149,38 @@ def main(
     if plain:
         overrides["render_mode"] = "plain"
 
+    if resume and session_id is not None:
+        raise typer.BadParameter(
+            "use either --resume or --session-id, not both",
+            param_hint="--resume",
+        )
+
+    session_store = None
+    if resume:
+        from paicli.session import SessionStore
+
+        session_store = SessionStore(Path.home() / ".paicli" / "runtime" / "runtime.db")
+        session_id = _select_session(session_store)
+
+    from paicli.config import load_config
+
     config = load_config(project_root=root, overrides=overrides)
     if plain:
         config.render_mode = "plain"
+
+    if session_id is not None:
+        if session_store is None:
+            from paicli.session import SessionStore
+
+            session_store = SessionStore(
+                Path.home() / ".paicli" / "runtime" / "runtime.db",
+                sensitive_values=(config.llm.api_key,),
+            )
+        if not session_store.session_exists(session_id):
+            raise typer.BadParameter(
+                f"session not found: {session_id}",
+                param_hint="--session-id",
+            )
 
     if prompt is not None:
         selected_mode = (mode or config.prompt.agent_mode or "react").lower()
@@ -155,10 +193,16 @@ def main(
                 config,
                 mode=selected_mode,
                 json_output=json_output,
+                session_id=session_id,
             )
         )
     else:
-        asyncio.run(start_repl(str(root), config))
+        from paicli.entrypoints.repl import start_repl
+
+        try:
+            asyncio.run(start_repl(str(root), config, session_id=session_id))
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--session-id") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +215,10 @@ def doctor(
     cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
 ) -> None:
     """Inspect the system: Python, uv, Node, API key, and config."""
+    from rich.console import Console
+
+    from paicli.config import get_config_paths, load_config
+
     root = (cwd or Path.cwd()).resolve()
     config = load_config(project_root=root)
     checks = {
@@ -185,7 +233,7 @@ def doctor(
         "cwd": str(root),
         "config_paths": [str(path) for path in get_config_paths(root)],
     }
-    console.print_json(json.dumps(checks, ensure_ascii=False))
+    Console().print_json(json.dumps(checks, ensure_ascii=False))
 
 
 @app.command("serve")
@@ -199,6 +247,10 @@ def runtime_serve(
     cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
 ) -> None:
     """Start the durable task runtime server (HTTP API)."""
+    from paicli.config import load_config
+    from paicli.runtime import RuntimeApiServer
+    from paicli.runtime.api import runtime_api_key
+
     _ = http
     root = (cwd or Path.cwd()).resolve()
     config = load_config(project_root=root)
@@ -216,6 +268,9 @@ def task_worker(
     cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
 ) -> None:
     """Consume durable background tasks without the HTTP API server."""
+    from paicli.config import load_config
+    from paicli.runtime import RuntimeApiServer
+
     if workers < 1:
         raise typer.BadParameter("workers must be at least 1")
     root = (cwd or Path.cwd()).resolve()
@@ -243,6 +298,8 @@ def mcp_serve(
     cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
 ) -> None:
     """Expose PaiCLI tools via the Model Context Protocol."""
+    from paicli.mcp import serve_http, serve_stdio
+
     root = str((cwd or Path.cwd()).resolve())
     if transport == "http":
         serve_http(port=port, cwd=root)
@@ -267,6 +324,8 @@ def mcp_init_chrome(
     slim: Annotated[bool, typer.Option("--slim", help="Use Chrome DevTools slim mode")] = False,
 ) -> None:
     """Write Chrome DevTools MCP config to the project or user scope."""
+    from paicli.mcp import write_chrome_devtools_config
+
     if scope not in {"user", "project"}:
         raise typer.BadParameter("scope must be user or project")
     root = None if scope == "user" else (cwd or Path.cwd()).resolve()
@@ -284,6 +343,8 @@ def mcp_list(
     cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
 ) -> None:
     """List configured MCP servers."""
+    from paicli.mcp import load_mcp_server_specs
+
     root = (cwd or Path.cwd()).resolve()
     specs = load_mcp_server_specs(root)
     if not specs:
@@ -306,8 +367,14 @@ async def _run_prompt(
     *,
     mode: str = "react",
     json_output: bool = False,
+    session_id: str | None = None,
 ) -> None:
     """Execute a single prompt and print the result."""
+    from paicli.agent import QueryEngine
+    from paicli.bootstrap import build_tool_registry
+    from paicli.llm import create_llm_client
+    from paicli.session import SessionStore
+
     config.render_mode = "plain"
     if not config.llm.api_key:
         typer.echo(
@@ -326,6 +393,11 @@ async def _run_prompt(
         tool_registry=registry,
         config=config,
         cwd=cwd,
+        session_store=SessionStore(
+            Path.home() / ".paicli" / "runtime" / "runtime.db",
+            sensitive_values=(config.llm.api_key,),
+        ),
+        session_id=session_id,
     )
     try:
         if mode == "plan":
@@ -369,3 +441,35 @@ def _version_of(command: str) -> str:
     except Exception:  # noqa: BLE001
         return "unknown"
     return (result.stdout or result.stderr).strip() or "unknown"
+
+
+def _select_session(session_store: SessionStore) -> str:
+    """Interactively choose a persisted session for REPL or single-shot use."""
+    typer.echo("Loading persisted sessions...", err=True)
+    sessions = session_store.list_sessions(limit=20)
+    if not sessions:
+        typer.echo("No persisted sessions found.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo("Resume a PaiCLI session (20 most recent)")
+    typer.echo(" #  Session                    Updated                    Status      Events")
+    typer.echo("--  -------------------------  -------------------------  ----------  ------")
+    for index, item in enumerate(sessions, start=1):
+        typer.echo(
+            f"{index:>2}  {_short_session_id(item.session_id):<25}  "
+            f"{item.updated_at[:25]:<25}  {item.status:<10}  {item.last_sequence:>6}"
+        )
+
+    while True:
+        selected = typer.prompt("Select a session number (q to cancel)", default="1").strip()
+        if selected.lower() == "q":
+            raise typer.Exit()
+        if selected.isdigit() and 1 <= int(selected) <= len(sessions):
+            return sessions[int(selected) - 1].session_id
+        typer.echo(f"Please enter a number from 1 to {len(sessions)}, or q.", err=True)
+
+
+def _short_session_id(session_id: str, *, width: int = 25) -> str:
+    if len(session_id) <= width:
+        return session_id
+    return session_id[: width - 3] + "..."

@@ -10,6 +10,7 @@ from paicli.agent import Agent, QueryEngine
 from paicli.config import load_config
 from paicli.session import ContextProjector, RequestBuilder, SessionStore
 from paicli.tools import ToolRegistry
+from paicli.types import Message
 
 
 def test_session_store_appends_atomically_and_supports_cursor(tmp_path):
@@ -22,11 +23,57 @@ def test_session_store_appends_atomically_and_supports_cursor(tmp_path):
     assert store.state("session-a").active_turn_id == "turn-a"
 
 
+def test_session_store_can_check_resume_target(tmp_path):
+    store = SessionStore(tmp_path / "runtime.db")
+    session_id = store.create_session("resume-me")
+
+    assert store.session_exists(session_id)
+    assert not store.session_exists("missing-session")
+    assert not store.session_exists(" ")
+
+
+def test_session_store_lists_sessions_by_recent_activity(tmp_path):
+    store = SessionStore(tmp_path / "runtime.db")
+    older = store.create_session("older")
+    newer = store.create_session("newer")
+    store.append(older, "user/message", {"content": "old question"})
+    store.append(newer, "user/message", {"content": "new question"})
+
+    sessions = store.list_sessions()
+
+    assert [item.session_id for item in sessions] == [newer, older]
+    assert sessions[0].status == "created"
+    assert sessions[0].last_sequence == 1
+    assert sessions[0].latest_user_message is None
+
+
+def test_session_store_lists_root_sessions_without_loading_payloads(tmp_path, monkeypatch):
+    store = SessionStore(tmp_path / "runtime.db")
+    parent = store.create_session("parent")
+    child = store.create_session("child", kind="child", parent_session_id=parent)
+    store.append(
+        parent,
+        "agent/child_started",
+        {"child_id": "agent-1", "child_session_id": child},
+    )
+    store.append(child, "user/message", {"content": "internal child task"})
+
+    def fail_if_history_is_loaded(_session_id, *, after_sequence=0):
+        raise AssertionError("session list must not load event history")
+
+    monkeypatch.setattr(store, "events", fail_if_history_is_loaded)
+    assert [item.session_id for item in store.list_sessions()] == [parent]
+    assert [item.session_id for item in store.list_sessions(include_children=True)] == [
+        child,
+        parent,
+    ]
+
+
 def test_session_store_extends_existing_runtime_event_table(tmp_path):
     db = tmp_path / "runtime.db"
     with sqlite3.connect(db) as conn:
         conn.execute(
-            "create table events (id integer primary key, thread_id text, type text, "
+            "create table events (id integer primary key, session_id text, type text, "
             "payload text, created_at text)"
         )
         conn.execute("insert into events values (1, 'thread-a', 'thread.created', '{}', 'now')")
@@ -48,7 +95,7 @@ def test_session_store_migration_preserves_order_with_mixed_events(tmp_path):
     db = tmp_path / "runtime.db"
     with sqlite3.connect(db) as conn:
         conn.execute(
-            "create table events (id integer primary key, thread_id text, type text, "
+            "create table events (id integer primary key, session_id text, type text, "
             "payload text, created_at text, sequence integer)"
         )
         conn.execute("insert into events values (1, 'thread-a', 'old.event', '{}', 'now', null)")
@@ -294,3 +341,85 @@ def test_agent_continues_past_twenty_tool_calls_until_model_finishes(tmp_path, m
     assert agent.history[-1].content == "finished"
     assert store.state(agent.session_id).status == "completed"
     assert session_events[-1].event_type == "turn/completed"
+
+
+def test_agent_reuses_session_until_clear_then_starts_new_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(project_root=tmp_path)
+    config.llm.api_key = "test-only"
+
+    class ReplyClient:
+        model_name = "fake-model"
+        provider_name = "fake-provider"
+        max_context_window = 4_000
+
+        async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+            yield {"type": "text_delta", "text": "ok"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    store = SessionStore(tmp_path / "runtime.db")
+    agent = Agent(
+        llm_client=ReplyClient(),
+        tool_registry=ToolRegistry(),
+        config=config,
+        cwd=str(tmp_path),
+        session_store=store,
+    )
+
+    async def run_once(message: str):
+        return [event async for event in agent.run(message)]
+
+    asyncio.run(run_once("first"))
+    first_session = agent.session_id
+    asyncio.run(run_once("second"))
+    assert agent.session_id == first_session
+    assert sum(event.event_type == "user/message" for event in store.events(first_session)) == 2
+
+    agent.clear_history()
+    second_session = agent.session_id
+    assert second_session != first_session
+    assert store.events(first_session)
+    assert store.events(second_session) == []
+
+    asyncio.run(run_once("after clear"))
+    assert agent.session_id == second_session
+    assert [event.event_type for event in store.events(second_session)].count("user/message") == 1
+
+
+def test_query_engine_ephemeral_history_does_not_call_paid_compaction(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(project_root=tmp_path)
+    config.llm.api_key = "test-only"
+    config.llm.max_tokens = 32
+    config.memory.compression_reserve_tokens = 0
+    config.memory.compression_threshold = 0.1
+
+    class EphemeralClient:
+        model_name = "fake-model"
+        provider_name = "fake-provider"
+        max_context_window = 256
+
+        def __init__(self):
+            self.compaction_calls = 0
+
+        async def complete(self, request):  # noqa: ARG002
+            self.compaction_calls += 1
+            raise AssertionError("ephemeral history must not trigger paid compaction")
+
+        async def chat(self, messages, tools, *, system_prompt):  # noqa: ARG002
+            yield {"type": "text_delta", "text": "ok"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    client = EphemeralClient()
+    engine = QueryEngine(
+        llm_client=client,
+        tool_registry=ToolRegistry(),
+        config=config,
+        cwd=str(tmp_path),
+    )
+    history = [Message(role="user", content="old " + "x" * 900)]
+
+    result = asyncio.run(engine.ask_complete_async("new", history=history))
+
+    assert result.text == "ok"
+    assert client.compaction_calls == 0

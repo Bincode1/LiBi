@@ -76,6 +76,8 @@ async def query(
         turn_usage = Usage()
         tool_states: dict[int, dict[str, Any]] = {}
 
+        # Caller-provided history is ephemeral and has no durable Session
+        # checkpoint, so it never infers a paid LLM compaction request.
         if config.features.context_compression:
             compression = context_manager.prepare(
                 messages,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
@@ -116,6 +116,49 @@ class OpenAICompatibleClient:
                     "Check the network, VPN/proxy, and provider status, then retry."
                 ),
             }
+
+    async def complete(self, request: Any) -> Any:
+        """Execute an isolated compaction request with explicit route parameters."""
+        from paicli.context.compaction import CompactionResponse
+
+        if getattr(request, "purpose", None) != "compaction":
+            raise ValueError("OpenAICompatibleClient.complete only accepts compaction requests")
+        client = replace(
+            self,
+            provider_name=str(request.provider or self.provider_name),
+            model=str(request.model or self.model),
+            max_tokens=int(request.max_tokens),
+            temperature=float(request.temperature),
+        )
+        text: list[str] = []
+        usage = None
+        finish_reason = None
+        async for event in client.chat(
+            list(request.messages), [], system_prompt=request.system_prompt
+        ):
+            kind = event.get("type")
+            if kind == "text_delta":
+                text.append(str(event.get("text") or ""))
+            elif kind == "usage":
+                usage = Usage.from_mapping(event.get("usage") or {})
+            elif kind == "message_end":
+                finish_reason = str(event.get("stop_reason") or "end_turn")
+            elif kind == "tool_call_delta":
+                finish_reason = "tool_use"
+            elif kind == "error":
+                raise RuntimeError(str(event.get("error") or "provider error"))
+        return CompactionResponse(
+            text="".join(text),
+            finish_reason=finish_reason,
+            usage=usage,
+            provider=client.provider_name,
+            model=client.model,
+            parameters={
+                "max_tokens": client.max_tokens,
+                "temperature": client.temperature,
+                "tools": [],
+            },
+        )
 
     def _build_payload(
         self,

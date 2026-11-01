@@ -11,6 +11,7 @@ from typing import Any
 
 from paicli.session.models import (
     ContextView,
+    MessageSource,
     PromptSection,
     RuntimeContextSnapshot,
     SessionEvent,
@@ -58,6 +59,99 @@ class ContextProjector:
 
     projection_version = "context-projector-v2"
 
+    def project_session(
+        self,
+        events: list[SessionEvent],
+        *,
+        session_id: str,
+        through_sequence: int | None = None,
+    ) -> ContextView:
+        """Project only the durable session history, without step overlays.
+
+        This projection is used by maintenance operations such as compaction.
+        It deliberately excludes system/developer/runtime/tool-schema events and
+        does not require a synthetic Turn/Step to exist.
+        """
+        if through_sequence is not None and through_sequence < 0:
+            raise ValueError("context sequence cutoff cannot be negative")
+        selected = [
+            event
+            for event in events
+            if event.session_id == session_id
+            and (through_sequence is None or event.sequence <= through_sequence)
+        ]
+        self._validate_events(selected, session_id)
+        checkpoint = self._latest_checkpoint(
+            selected, session_id, through_sequence or (selected[-1].sequence if selected else 0)
+        )
+        messages: list[Message] = []
+        message_sources: list[MessageSource] = []
+        source_sequences: list[int] = []
+        checkpoint_sequence = 0
+        compaction_id: str | None = None
+        if checkpoint is not None:
+            checkpoint_sequence = checkpoint.sequence
+            messages = [_message_from_payload(item) for item in checkpoint.payload["messages"]]
+            message_sources = _checkpoint_sources(checkpoint, len(messages))
+            source_sequences.extend(
+                int(value) for value in checkpoint.payload.get("source_sequences", [])
+            )
+            compaction_id = str(checkpoint.payload.get("compaction_id") or checkpoint.event_id)
+
+        for event in selected:
+            if event.sequence <= checkpoint_sequence:
+                continue
+            if event.event_type in {"user/message", "assistant/message", "tool/result"}:
+                messages.append(self._message_from_event(event))
+                source_sequences.append(event.sequence)
+                message_sources.append(_event_source(event.sequence))
+            elif event.event_type in {"memory/context", "skill/context"}:
+                if event.payload.get("visibility", "model") != "model":
+                    continue
+                text = event.payload.get("content")
+                if not isinstance(text, str):
+                    raise ValueError(f"{event.event_type} content must be text")
+                label = "memory" if event.event_type == "memory/context" else "skill"
+                source = str(event.payload.get("source") or event.payload.get("id") or label)
+                messages.append(
+                    Message(
+                        role="user", content=f"[{label}-context: {source}; untrusted data]\n{text}"
+                    )
+                )
+                source_sequences.append(event.sequence)
+                message_sources.append(_event_source(event.sequence))
+
+        self._validate_tool_pairs(messages)
+        normalized = tuple(_copy_message(message) for message in messages)
+        normalized_sources = tuple(_normalize_source(item) for item in message_sources)
+        facts = {
+            "projection_version": self.projection_version,
+            "projection_kind": "session",
+            "session_id": session_id,
+            "messages": [_message_payload(message) for message in normalized],
+            "message_sources": normalized_sources,
+            "source_sequences": sorted(set(source_sequences)),
+            "compaction_id": compaction_id,
+            "through_sequence": selected[-1].sequence if selected else 0,
+        }
+        context_hash = hashlib.sha256(_stable_json(facts).encode("utf-8")).hexdigest()
+        return ContextView(
+            session_id=session_id,
+            turn_id="",
+            step_id="",
+            projection_version=self.projection_version,
+            system_prompt="",
+            messages=normalized,
+            tools=(),
+            runtime_contexts=(),
+            tool_history=(),
+            source_sequences=tuple(sorted(set(source_sequences))),
+            compaction_id=compaction_id,
+            context_hash=context_hash,
+            through_sequence=selected[-1].sequence if selected else 0,
+            message_sources=normalized_sources,
+        )
+
     def project(
         self,
         events: list[SessionEvent],
@@ -90,9 +184,11 @@ class ContextProjector:
         ]
         checkpoint = self._latest_checkpoint(events, session_id, turn_end_sequence)
         messages: list[Message] = []
+        message_sources: list[MessageSource] = []
         source_sequences: list[int] = []
         if checkpoint is not None:
             messages = [_message_from_payload(item) for item in checkpoint.payload["messages"]]
+            message_sources = _checkpoint_sources(checkpoint, len(messages))
             source_sequences.extend(
                 int(value) for value in checkpoint.payload.get("source_sequences", [])
             )
@@ -130,6 +226,7 @@ class ContextProjector:
                     message.content = f"{context}\n\n---\nUser request:\n{message.content}"
                     pending_skill_candidates.clear()
                 messages.append(message)
+                message_sources.append(_event_source(event.sequence))
                 source_sequences.append(event.sequence)
                 if event.event_type == "tool/result":
                     tool_history.append(
@@ -147,6 +244,7 @@ class ContextProjector:
                     raise ValueError("developer message content must be text")
                 if supports_developer:
                     messages.append(Message(role="developer", content=content))
+                    message_sources.append(_event_source(event.sequence))
                 else:
                     developer_messages.append(content)
                 source_sequences.append(event.sequence)
@@ -199,6 +297,7 @@ class ContextProjector:
                         content=projected,
                     )
                 )
+                message_sources.append(_event_source(event.sequence))
                 source_sequences.append(event.sequence)
             elif event.event_type == "tool/schema_snapshot":
                 snapshot_step = event.step_id or str(event.payload.get("step_id") or "")
@@ -248,6 +347,7 @@ class ContextProjector:
             ],
             "tool_history": tool_history,
             "source_sequences": source_sequences,
+            "message_sources": message_sources,
             "compaction_id": (
                 str(checkpoint.payload.get("compaction_id") or checkpoint.event_id)
                 if checkpoint
@@ -274,6 +374,7 @@ class ContextProjector:
             ),
             context_hash=context_hash,
             through_sequence=turn_end_sequence,
+            message_sources=tuple(_normalize_source(item) for item in message_sources),
         )
 
     @staticmethod
@@ -523,6 +624,32 @@ def _message_payload(message: Message) -> dict[str, Any]:
         "tool_call_id": message.tool_call_id,
         "tool_calls": message.tool_calls,
     }
+
+
+def _event_source(sequence: int) -> MessageSource:
+    return {"event_sequences": [int(sequence)], "checkpoint_ids": []}
+
+
+def _normalize_source(source: MessageSource | dict[str, Any]) -> MessageSource:
+    events = source.get("event_sequences", ())
+    checkpoints = source.get("checkpoint_ids", ())
+    if not isinstance(events, list | tuple) or not isinstance(checkpoints, list | tuple):
+        raise ValueError("message provenance fields must be arrays")
+    return {
+        "event_sequences": [int(value) for value in events],
+        "checkpoint_ids": [str(value) for value in checkpoints],
+    }
+
+
+def _checkpoint_sources(checkpoint: SessionEvent, message_count: int) -> list[MessageSource]:
+    raw = checkpoint.payload.get("message_sources")
+    if isinstance(raw, list) and len(raw) == message_count:
+        return [_normalize_source(value) for value in raw]
+    # Old checkpoints did not persist per-message lineage. Treat their whole
+    # snapshot as one indivisible legacy unit rather than inventing sequences.
+    checkpoint_id = str(checkpoint.payload.get("compaction_id") or checkpoint.event_id)
+    legacy = {"event_sequences": [], "checkpoint_ids": [checkpoint_id]}
+    return [dict(legacy) for _ in range(message_count)]
 
 
 def _copy_message(message: Message) -> Message:

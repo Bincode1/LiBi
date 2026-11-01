@@ -39,7 +39,7 @@ PaiCLI Python 是一个运行在终端里的 AI Agent CLI，面向真实项目�
   以及经 HITL 确认的 `save_skill` 流程沉淀
 - Chrome DevTools MCP 配置助手
 - PaiCLI 自身也可以作为 MCP server 暴露内置工具
-- Runtime API，支持有历史的 thread、turn、事件日志，以及带原子抢占、租约恢复、取消保护、
+- Runtime API，支持有历史的 session、turn、事件日志，以及带原子抢占、租约恢复、取消保护、
   项目隔离和 `react|plan` 模式的持久化后台任务
 - 静态项目记忆 + SQLite 动态长期记忆，支持元数据、去重、TTL、容量治理和相关性召回
 - 上下文预算与压缩：达到可用输入预算的 80% 后压缩旧轮次，保留近期消息和完整工具调用对
@@ -68,6 +68,23 @@ uv run paicli --help
 ```bash
 uv run paicli
 ```
+
+启动时可以通过持久化的 Session ID 继续之前的会话：
+
+```bash
+uv run paicli --session-id session_abc123
+uv run paicli --session session_abc123 -p "继续刚才的任务"
+```
+
+也可以直接列出最近使用过的会话并交互选择：
+
+```bash
+uv run paicli -r
+```
+
+命令只读取会话元数据并显示最近 20 个会话，选择编号后才加载对应历史并进入 REPL；输入 `q` 可以取消。更早的会话可使用 `--session-id` 精确恢复。没有已保存会话时，命令会明确提示并退出。
+
+Session ID 可以在 REPL 的 `/context` 输出中查看。指定的 ID 不存在时，CLI 会直接报错，不会自动创建一个新会话。
 
 单次查询：
 
@@ -240,7 +257,7 @@ Skill 按 `builtin -> user -> project` 加载，同名时后层覆盖前层：
 
 PaiCLI 把记忆分成三层：
 
-- 短期记忆：当前 thread/session 的原始消息、工具调用和工具结果
+- 短期记忆：当前 session 的原始消息、工具调用和工具结果
 - 静态长期记忆：`AGENTS.md`、`PAI.md`、`.paicli/PAI.md` 及自定义 prompt 文件；人工维护、可版本控制
 - 动态长期记忆：按项目 scope 隔离的 SQLite 记录；包含 kind、source、importance、confidence、TTL、访问次数和内容哈希
 
@@ -338,17 +355,17 @@ PAICLI_RUNTIME_API_KEY=dev-key \
 uv run paicli serve --http --port 8080
 ```
 
-创建线程：
+创建会话：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/threads \
+curl -sS -X POST http://127.0.0.1:8080/v1/sessions \
   -H 'x-api-key: dev-key'
 ```
 
 发送 turn：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/threads/<thread_id>/turns \
+curl -sS -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
   -H 'content-type: application/json' \
   -H 'x-api-key: dev-key' \
   -d '{"message":"总结这个项目"}'
@@ -357,7 +374,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/threads/<thread_id>/turns \
 读取事件：
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/threads/<thread_id>/events \
+curl -sS http://127.0.0.1:8080/v1/sessions/<session_id>/events \
   -H 'x-api-key: dev-key'
 ```
 

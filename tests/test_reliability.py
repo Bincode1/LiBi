@@ -542,9 +542,9 @@ def test_runtime_turn_closes_idle_children(tmp_path, monkeypatch):
         server = RuntimeApiServer(
             cwd=ctx.cwd, config=ctx.config, api_key="unit-runtime-placeholder"
         )
-        thread = server._create_thread()
+        session_id = server._create_session()
         async with asyncio.timeout(3):
-            await server._run_turn(thread, "delegate inspection")
+            await server._run_turn(session_id, "delegate inspection")
         manager = engines[0]._last_agent.subagent_manager
         assert all(a.settled for a in manager.activations.values())
         assert engines[0]._react_agent is None

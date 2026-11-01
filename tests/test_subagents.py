@@ -683,7 +683,9 @@ def test_session_persistence_failure_rolls_back_activation(tmp_path, monkeypatch
 
 def test_recovery_marks_started_child_orphaned_without_replay(tmp_path):
     context = _context(tmp_path)
-    child_session = context.session_store.create_session()
+    child_session = context.session_store.create_session(
+        kind="child", parent_session_id=context.session_id
+    )
     context.session_store.append(
         context.session_id,
         "agent/child_started",

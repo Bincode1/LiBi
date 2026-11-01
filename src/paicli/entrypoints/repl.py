@@ -36,6 +36,7 @@ from paicli.prompt import PromptAssembler
 from paicli.rag import CodeIndex
 from paicli.render import RichRenderer
 from paicli.runtime import DurableTaskManager
+from paicli.session import SessionStore
 from paicli.skill import SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools import ToolRegistry
@@ -46,6 +47,7 @@ SLASH_COMMANDS = [
     "/exit",
     "/clear",
     "/context",
+    "/compact",
     "/memory",
     "/save",
     "/config",
@@ -99,9 +101,20 @@ class PermissionModeController:
         return self.set("auto" if self.mode == "default" else "default")
 
 
-async def start_repl(cwd: str, config: PaiCliConfig) -> None:
+async def start_repl(
+    cwd: str,
+    config: PaiCliConfig,
+    *,
+    session_id: str | None = None,
+) -> None:
     console = Console()
     permission_mode = PermissionModeController(config)
+    session_store = SessionStore(
+        Path.home() / ".paicli" / "runtime" / "runtime.db",
+        sensitive_values=(config.llm.api_key,),
+    )
+    if session_id is not None and not session_store.session_exists(session_id):
+        raise ValueError(f"session not found: {session_id}")
     registry, mcp_manager = await build_tool_registry(config=config, cwd=cwd)
     client = create_llm_client(config.llm)
     system_prompt = PromptAssembler(
@@ -143,7 +156,12 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
         cwd=cwd,
         config=config,
         approval_callback=approval_broker.request,
+        session_store=session_store,
+        session_id=session_id,
     )
+    if session_id is not None:
+        console.print(f"Resuming session {session_id}", style="dim", markup=False)
+        _render_session_history(session_store, session_id, agent, console)
     if agent.subagent_manager is not None:
         agent.subagent_manager.event_callback = renderer.handle
 
@@ -281,7 +299,31 @@ async def _handle_slash(
         table.add_row("render", config.render_mode)
         table.add_row("memory", f"{len(memories)} recent entries")
         table.add_row("tools", str(len(registry.list_names())))
+        table.add_row(
+            "compression mode",
+            f"{config.memory.compression_mode} ({config.memory.mode_source})",
+        )
+        table.add_row("compression threshold", f"{config.memory.compression_threshold:.0%}")
+        table.add_row("compression target", f"{config.memory.compression_target:.0%}")
+        if agent.last_compaction:
+            table.add_row("last compaction", json.dumps(agent.last_compaction, ensure_ascii=False))
         console.print(table)
+    elif command == "/compact":
+        try:
+            result = await agent.compact(arg or None)
+        except Exception as exc:
+            console.print(f"[red]Compaction failed:[/red] {exc}")
+        else:
+            if not result.compaction_id:
+                console.print(f"Nothing to compact ({result.plan.no_op_reason or 'no-op'}).")
+            else:
+                usage = result.usage.to_dict() if result.usage else "unavailable"
+                console.print(
+                    f"[green]Compacted context[/green] {result.compaction_id}: "
+                    f"{result.plan.estimated_tokens_before} -> "
+                    f"{result.plan.estimated_tokens_after} tokens; "
+                    f"usage={usage}"
+                )
     elif command == "/memory":
         await _memory_command(arg, console, cwd, config)
     elif command == "/save":
@@ -928,3 +970,26 @@ def _format_cache_rate(value: float | None) -> str:
     if value < 0.01:
         return "<1%"
     return f"{value:.0%}"
+
+
+def _render_session_history(
+    session_store: SessionStore,
+    session_id: str,
+    agent: Agent,
+    console: Console,
+) -> None:
+    """Project and render durable messages after a session has been selected."""
+    events = session_store.events(session_id)
+    projected = agent._context_projector.project_session(events, session_id=session_id)
+    agent.history = list(projected.messages)
+    messages = [
+        message for message in projected.messages if message.role in {"user", "assistant"}
+    ]
+    if not messages:
+        return
+    console.print(f"History ({len(messages)} messages)", style="dim")
+    for message in messages:
+        label = "You" if message.role == "user" else "PaiCLI"
+        style = "bold cyan" if message.role == "user" else "bold green"
+        console.print(f"[{style}]{label}[/]", markup=True)
+        console.print(message.content or "", markup=False)
