@@ -14,8 +14,7 @@ from paicli.tools.builtins import load_skill
 from paicli.tools.executor import ToolExecutor
 
 
-def test_skill_registry_layers_and_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_skill_registry_layers_and_state(tmp_path):
     builtin = tmp_path / "builtin"
     user = tmp_path / "user"
     project = tmp_path / "project"
@@ -57,8 +56,7 @@ def test_skill_context_buffer_is_one_shot_and_capped():
     assert buffer.drain() == ""
 
 
-def test_load_skill_pushes_body_into_context_buffer(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_load_skill_pushes_body_into_context_buffer(tmp_path):
     _write_skill(tmp_path / ".paicli" / "skills", "demo", "demo desc", "v1", body="demo body")
     config = load_config(project_root=tmp_path)
     buffer = SkillContextBuffer()
@@ -72,8 +70,7 @@ def test_load_skill_pushes_body_into_context_buffer(tmp_path, monkeypatch):
     assert "demo body" in drained
 
 
-def test_skill_matcher_ranks_explicit_names_and_chinese_english_terms(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_skill_matcher_ranks_explicit_names_and_chinese_english_terms(tmp_path):
     project = tmp_path / "project"
     user = tmp_path / "user"
     builtin = tmp_path / "builtin"
@@ -111,8 +108,7 @@ def test_skill_matcher_ranks_explicit_names_and_chinese_english_terms(tmp_path, 
     assert len(matcher.match("web research", top_k=1)) == 1
 
 
-def test_skill_registry_create_update_and_scope(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_skill_registry_create_update_and_scope(tmp_path):
     project = tmp_path / "project"
     user = tmp_path / "user"
     registry = SkillRegistry(
@@ -167,8 +163,7 @@ def test_skill_registry_rejects_unsafe_names(tmp_path, name):
         registry.create(name, description="unsafe", body="unsafe")
 
 
-def test_save_skill_tool_requires_approval_and_persists_after_approval(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_save_skill_tool_requires_approval_and_persists_after_approval(tmp_path):
     config = load_config(project_root=tmp_path)
     registry = ToolRegistry()
     registry.register_all(get_builtin_tools())

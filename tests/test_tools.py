@@ -10,10 +10,10 @@ from paicli.config import load_config
 from paicli.tools import ToolRegistry, get_builtin_tools
 from paicli.tools.base import ToolContext
 from paicli.tools.builtins import save_memory, search_memory
+from paicli.tools.executor import ToolExecutor
 
 
-def test_read_write_file_tool(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_read_write_file_tool(tmp_path):
     config = load_config(project_root=tmp_path)
     config.policy.hitl_mode = "never"
     registry = ToolRegistry()
@@ -37,15 +37,43 @@ def test_read_write_file_tool(tmp_path, monkeypatch):
     assert "2: world" in read_result.content
 
 
-def test_builtin_tools_include_memory_recall_and_skill_sedimentation():
-    names = {tool.name for tool in get_builtin_tools()}
+@pytest.mark.parametrize("name", ["write_file", "edit_file"])
+@pytest.mark.parametrize("decision", [None, "approve"])
+def test_file_mutations_require_explicit_approval(tmp_path, name, decision):
+    from paicli.config import PaiCliConfig
 
-    assert "search_memory" in names
-    assert "save_skill" in names
+    config = PaiCliConfig()
+    config.policy.audit_log_path = str(tmp_path / "audit.jsonl")
+    target = tmp_path / "note.txt"
+    target.write_text("original", encoding="utf-8")
+    requests = []
+
+    def approve(request):
+        requests.append(request)
+        return decision
+
+    registry = ToolRegistry()
+    registry.register_all(get_builtin_tools())
+    context = ToolContext(
+        cwd=str(tmp_path), config=config, approval_callback=approve if decision else None
+    )
+    payload = (
+        {"path": "note.txt", "content": "updated"}
+        if name == "write_file"
+        else {"path": "note.txt", "old_text": "original", "new_text": "updated"}
+    )
+    call = {"id": "call-file", "name": name, "arguments": payload}
+    result = asyncio.run(ToolExecutor(registry).execute_all([call], context))[0]
+
+    assert result.is_error is (decision != "approve")
+    assert target.read_text(encoding="utf-8") == (
+        "updated" if decision == "approve" else "original"
+    )
+    assert len(requests) == (0 if decision is None else 1)
+    assert registry.get(name).requires_approval
 
 
-def test_memory_tools_save_metadata_and_recall_relevant_items(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_memory_tools_save_metadata_and_recall_relevant_items(tmp_path):
     config = load_config(project_root=tmp_path)
     context = ToolContext(cwd=str(tmp_path), config=config)
 
@@ -67,6 +95,7 @@ def test_memory_tools_save_metadata_and_recall_relevant_items(tmp_path, monkeypa
     assert "preference" in recalled.content
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell shell integration is Windows-specific")
 @pytest.mark.parametrize(
     ("command", "expected_error", "expected_output"),
@@ -78,7 +107,6 @@ def test_memory_tools_save_metadata_and_recall_relevant_items(tmp_path, monkeypa
 )
 def test_bash_tool_uses_powershell_and_preserves_failures(
     tmp_path,
-    monkeypatch,
     command,
     expected_error,
     expected_output,
@@ -86,7 +114,6 @@ def test_bash_tool_uses_powershell_and_preserves_failures(
     if not (shutil.which("pwsh") or shutil.which("powershell.exe")):
         pytest.skip("PowerShell executable is unavailable")
 
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     config = load_config(project_root=tmp_path)
     config.policy.hitl_mode = "never"
     context = ToolContext(cwd=str(tmp_path), config=config)

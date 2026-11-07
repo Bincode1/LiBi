@@ -15,9 +15,10 @@ _SECRET_KEY_PARTS = (
     "private_key",
 )
 _INLINE_CREDENTIAL = re.compile(
-    r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|"
+    r"(?i)(\b(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|"
+    r"secret|password|"
     r"private[_-]?key)\s*[:=]\s*)"
-    r"([^\s,;]+)"
+    r"(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*")
 _URL_CREDENTIAL = re.compile(r"(?i)([?&](?:token|key|secret|password|api_key)=)[^&#\s]+")

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from paicli.policy import AuditLog
@@ -19,6 +22,8 @@ class ToolExecutor:
         self,
         calls: list[dict[str, Any]],
         context: ToolContext,
+        *,
+        on_result: Callable[[ToolResult], None] | None = None,
     ) -> list[ToolResult]:
         read_calls: list[tuple[dict[str, Any], Tool]] = []
         sequential_calls: list[tuple[dict[str, Any], Tool | None]] = []
@@ -31,20 +36,26 @@ class ToolExecutor:
             else:
                 sequential_calls.append((call, tool))
 
+        async def execute(call: dict[str, Any], tool: Tool | None) -> ToolResult:
+            result = await self._execute_single(call, tool, context)
+            if on_result is not None:
+                on_result(result)
+            return result
+
         results: list[ToolResult] = []
         if read_calls:
             semaphore = asyncio.Semaphore(context.config.tools.max_concurrent_read)
 
             async def run_read(call: dict[str, Any], tool: Tool) -> ToolResult:
                 async with semaphore:
-                    return await self._execute_single(call, tool, context)
+                    return await execute(call, tool)
 
             results.extend(
                 await asyncio.gather(*(run_read(call, tool) for call, tool in read_calls))
             )
 
         for call, tool in sequential_calls:
-            results.append(await self._execute_single(call, tool, context))
+            results.append(await execute(call, tool))
 
         return results
 
@@ -71,7 +82,24 @@ class ToolExecutor:
         audit = self._audit_log
         if audit is None:
             audit = AuditLog(context.config.policy.audit_log_path)
+        audit.redactor.add_sensitive_values((context.config.llm.api_key,))
+        if context.session_store is not None:
+            audit.redactor.add_sensitive_values(context.session_store.redactor.sensitive_values)
         approver = "none"
+
+        def record_audit(data: dict[str, Any], outcome: str) -> None:
+            try:
+                audit.record(
+                    tool_name=tool.name,
+                    input_data=data,
+                    outcome=outcome,
+                    approver=approver,
+                    cwd=context.cwd,
+                )
+            except OSError as exc:
+                logging.getLogger(__name__).warning(
+                    "Tool audit write failed: %s", type(exc).__name__
+                )
 
         async def notify(kind: str, **fields: Any) -> None:
             if context.status_callback is not None:
@@ -88,57 +116,40 @@ class ToolExecutor:
         summary = "Tool did not finish."
         try:
             data = tool.validate(payload)
-            approval = context.config.policy.hitl_mode
-            needs_approval = approval not in {"never"} and (
-                approval != "auto" or tool.requires_approval
-            )
+            mode = context.config.policy.hitl_mode
+            needs_approval = mode != "never" and (mode != "auto" or tool.requires_approval)
+            decision: ToolDecision = "approve"
             if needs_approval:
+                approver = "hitl"
                 await notify("approval_waiting")
-            try:
-                decision = await self._approval_decision(tool, data, context)
-            finally:
-                if needs_approval:
+                try:
+                    decision = await self._approval_decision(tool, data, context, tool_call_id)
+                finally:
                     await notify("approval_resolved")
             if decision in {"deny", "skip"}:
                 summary = f"Approval {decision}."
-                approver = "hitl"
-                audit.record(
-                    tool_name=tool.name,
-                    input_data=data,
-                    outcome=decision,
-                    approver=approver,
-                    cwd=context.cwd,
-                )
+                record_audit(data, decision)
                 return ToolResult(
                     tool_use_id=tool_call_id,
                     content=f'Tool "{tool.name}" was {decision}ed by approval policy.',
                     is_error=True,
                 )
-            if tool.requires_approval or context.config.policy.hitl_mode == "always":
-                approver = "hitl"
-
-            result = await tool.execute(data, context)
+            if (
+                not tool.is_read_only
+                and tool.needs_workspace_checkpoint
+                and context.before_workspace_mutation is not None
+            ):
+                context.before_workspace_mutation()
+            result = await tool.execute(data, replace(context, tool_call_id=tool_call_id or None))
             summary = result.content
             result.tool_use_id = tool_call_id
             if not tool.is_read_only and context.config.features.audit_log:
-                audit.record(
-                    tool_name=tool.name,
-                    input_data=data,
-                    outcome="allow" if not result.is_error else "error",
-                    approver=approver,
-                    cwd=context.cwd,
-                )
+                record_audit(data, "allow" if not result.is_error else "error")
             return result
         except Exception as exc:  # noqa: BLE001 - tool errors must flow back to the model
             summary = f"Tool failed ({type(exc).__name__})."
-            if context.config.features.audit_log and tool and not tool.is_read_only:
-                audit.record(
-                    tool_name=tool.name,
-                    input_data=payload,
-                    outcome="error",
-                    approver=approver,
-                    cwd=context.cwd,
-                )
+            if context.config.features.audit_log and not tool.is_read_only:
+                record_audit(payload, "error")
             return ToolResult(
                 tool_use_id=tool_call_id,
                 content=f'Tool "{name}" execution error: {exc}',
@@ -152,12 +163,8 @@ class ToolExecutor:
         tool: Tool,
         payload: dict[str, Any],
         context: ToolContext,
+        tool_call_id: str,
     ) -> ToolDecision:
-        mode = context.config.policy.hitl_mode
-        if mode == "never":
-            return "approve"
-        if mode == "auto" and not tool.requires_approval:
-            return "approve"
         if not context.approval_callback:
             return "deny"
         result = context.approval_callback(
@@ -167,6 +174,7 @@ class ToolExecutor:
                 "session_id": context.session_id,
                 "cwd": context.cwd,
                 "tool_name": tool.name,
+                "tool_call_id": tool_call_id,
                 "input": payload,
                 "danger_level": tool.danger_level,
                 "description": tool.description,

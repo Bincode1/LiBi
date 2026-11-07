@@ -70,12 +70,13 @@ async def serve_stdio(cwd: str | None = None) -> None:
     root = str(Path(cwd or ".").resolve())
     loop = asyncio.get_running_loop()
     while True:
-        line = await loop.run_in_executor(None, input)
+        try:
+            line = await loop.run_in_executor(None, input)
+        except EOFError:
+            break
         try:
             request = json.loads(line)
             response = await _handle_request(request, root)
-        except EOFError:
-            break
         except Exception as exc:  # noqa: BLE001
             response = {"jsonrpc": "2.0", "error": {"message": str(exc)}}
         print(json.dumps(response, ensure_ascii=False), flush=True)

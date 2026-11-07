@@ -5,12 +5,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from paicli.policy.redaction import Redactor
+
 SENSITIVE_KEYS = ("token", "key", "password", "secret", "authorization", "bearer")
 
 
 class AuditLog:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, sensitive_values: tuple[str, ...] = ()):
         self.path = Path(path).expanduser()
+        self.redactor = Redactor(sensitive_values)
 
     def record(
         self,
@@ -40,12 +43,13 @@ class AuditLog:
         events = []
         for line in lines:
             try:
-                events.append(json.loads(line))
+                events.append(self._redact(json.loads(line)))
             except json.JSONDecodeError:
                 continue
         return events
 
     def _redact(self, value: Any) -> Any:
+        value = self.redactor.clean(value)
         if isinstance(value, dict):
             redacted = {}
             for key, item in value.items():

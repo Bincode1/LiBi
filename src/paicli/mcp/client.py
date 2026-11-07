@@ -21,7 +21,10 @@ from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
 class McpClientManager:
     def __init__(self, project_root: str | Path):
         self.project_root = str(Path(project_root).resolve())
-        self.specs = load_mcp_server_specs(self.project_root)
+        self.specs = load_mcp_server_specs(
+            self.project_root,
+            include_project=os.environ.get("PAICLI_TRUST_PROJECT_MCP") == "1",
+        )
         self.last_errors: dict[str, str] = {}
 
     async def load_tools(self) -> list[Tool]:
@@ -199,13 +202,15 @@ class McpClientManager:
             params = StdioServerParameters(
                 command=spec.command,
                 args=spec.args,
-                env={**os.environ, **spec.env},
+                env=spec.env,
                 cwd=spec.cwd or self.project_root,
             )
             with open(os.devnull, "w", encoding="utf-8") as errlog:
                 async with (
                     stdio_client(params, errlog=errlog) as (read, write),
-                    ClientSession(read, write) as session,
+                    ClientSession(
+                        read, write, read_timeout_seconds=timedelta(seconds=spec.timeout)
+                    ) as session,
                 ):
                     await session.initialize()
                     yield session

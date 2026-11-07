@@ -35,6 +35,10 @@ class ToolContext:
     llm_client: Any | None = None
     tool_registry: Any | None = None
     status_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    before_workspace_mutation: Callable[[], None] | None = None
+    turn_id: str | None = None
+    step_id: str | None = None
+    tool_call_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -49,6 +53,7 @@ class Tool:
     requires_approval: bool = False
     timeout: float = 60.0
     required_keys: list[str] = field(default_factory=list)
+    needs_workspace_checkpoint: bool = True
 
     def definition(self) -> dict[str, Any]:
         return {

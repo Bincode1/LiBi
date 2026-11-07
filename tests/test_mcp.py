@@ -10,12 +10,11 @@ import pytest
 from paicli.config import load_config
 from paicli.entrypoints.repl import _count_mcp_servers
 from paicli.mcp import McpClientManager
-from paicli.mcp.server import _handle_request
+from paicli.mcp.server import _handle_request, serve_stdio
 from paicli.tools.base import ToolContext
 
 
-def test_mcp_tools_list(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_mcp_tools_list(tmp_path):
 
     async def run():
         return await _handle_request(
@@ -29,12 +28,65 @@ def test_mcp_tools_list(tmp_path, monkeypatch):
     assert any(tool["name"] == "execute_command" for tool in tools)
 
 
+@pytest.mark.parametrize("method", ["initialize", "notifications/initialized", "unknown"])
+def test_mcp_protocol_methods_preserve_request_id(tmp_path, method):
+    response = asyncio.run(_handle_request({"id": 7, "method": method}, str(tmp_path)))
+    assert response["id"] == 7 and response["jsonrpc"] == "2.0"
+    assert ("error" in response) is (method == "unknown")
+
+
+def test_mcp_tool_call_reads_workspace_and_reports_missing_tool(tmp_path):
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+    response = asyncio.run(
+        _handle_request(
+            {
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": "note.txt"}},
+            },
+            str(tmp_path),
+        )
+    )
+    assert response["result"] == {
+        "content": [{"type": "text", "text": "1: hello"}],
+        "isError": False,
+    }
+    missing = asyncio.run(
+        _handle_request(
+            {"id": 2, "method": "tools/call", "params": {"name": "missing"}}, str(tmp_path)
+        )
+    )
+    assert "not found" in missing["error"]["message"]
+
+
+def test_mcp_stdio_handles_invalid_json_then_next_request_and_eof(tmp_path, monkeypatch, capsys):
+    lines = iter(["{invalid", json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})])
+
+    def read_line():
+        try:
+            return next(lines)
+        except StopIteration:
+            raise EOFError from None
+
+    monkeypatch.setattr("builtins.input", read_line)
+    asyncio.run(serve_stdio(cwd=str(tmp_path)))
+    responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(responses) == 2
+    assert "error" in responses[0]
+    assert responses[1]["id"] == 9
+    assert any(tool["name"] == "read_file" for tool in responses[1]["result"]["tools"])
+
+
+@pytest.mark.integration
 def test_mcp_client_registers_and_calls_stdio_tool(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PAICLI_RUNTIME_API_KEY", "synthetic-mcp-parent-key")
     server = tmp_path / "fake_mcp_server.py"
     server.write_text(
         """
+import os
 from mcp.server.fastmcp import FastMCP
+
+assert "PAICLI_RUNTIME_API_KEY" not in os.environ
 
 mcp = FastMCP("fake")
 
@@ -63,6 +115,9 @@ if __name__ == "__main__":
         encoding="utf-8",
     )
 
+    assert McpClientManager(tmp_path).specs == {}
+    monkeypatch.setenv("PAICLI_TRUST_PROJECT_MCP", "1")
+
     async def run():
         manager = McpClientManager(tmp_path)
         tools = await manager.load_tools()
@@ -78,8 +133,9 @@ if __name__ == "__main__":
     assert result.content == "echo:ok"
 
 
-def test_mcp_client_suppresses_stdio_server_stderr(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+@pytest.mark.integration
+def test_mcp_client_suppresses_stdio_server_stderr(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("PAICLI_TRUST_PROJECT_MCP", "1")
     server = tmp_path / "noisy_mcp_server.py"
     server.write_text(
         """
@@ -141,7 +197,7 @@ def test_http_error_is_concise_and_other_servers_still_load(
     caplog,
     bad_response,
 ):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PAICLI_TRUST_PROJECT_MCP", "1")
     (tmp_path / ".paicli").mkdir()
     (tmp_path / ".paicli" / "mcp.json").write_text(
         json.dumps(

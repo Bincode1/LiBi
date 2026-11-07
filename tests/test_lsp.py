@@ -11,3 +11,12 @@ def test_python_diagnostics(tmp_path):
 
     assert diagnostics
     assert "SyntaxError" in diagnostics[0]
+
+
+def test_valid_python_and_non_python_files_have_no_diagnostics(tmp_path):
+    valid = tmp_path / "good.py"
+    valid.write_text("answer = 42\n", encoding="utf-8")
+    other = tmp_path / "note.txt"
+    other.write_text("def invalid(:", encoding="utf-8")
+    assert diagnose_file(valid) == []
+    assert diagnose_file(other) == []

@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import signal
+import subprocess
+from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from paicli.memory import MemoryManager
@@ -20,12 +24,16 @@ def get_builtin_tools() -> list[Tool]:
     tools = [
         Tool(
             name="read_file",
-            description="Read a text file from the current workspace.",
+            description=(
+                "Read numbered lines from a workspace file. Read the range needed to understand "
+                "the relevant code. Output is capped at 50 KiB of numbered text and includes "
+                "a continuation offset when more lines remain."
+            ),
             parameters=object_schema(
                 {
                     "path": {"type": "string", "description": "Path to read"},
                     "offset": {"type": "number", "description": "Start line, 1-based"},
-                    "limit": {"type": "number", "description": "Maximum number of lines"},
+                    "limit": {"type": "number", "description": "Maximum lines; defaults to 500"},
                 },
                 ["path"],
             ),
@@ -48,6 +56,7 @@ def get_builtin_tools() -> list[Tool]:
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
+            requires_approval=True,
         ),
         Tool(
             name="edit_file",
@@ -78,6 +87,8 @@ def get_builtin_tools() -> list[Tool]:
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
+            requires_approval=True,
+            needs_workspace_checkpoint=False,
         ),
         Tool(
             name="list_dir",
@@ -205,6 +216,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            needs_workspace_checkpoint=False,
         ),
         Tool(
             name="execute_command",
@@ -225,6 +237,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            needs_workspace_checkpoint=False,
         ),
         Tool(
             name="web_search",
@@ -282,6 +295,7 @@ def get_builtin_tools() -> list[Tool]:
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
+            needs_workspace_checkpoint=False,
         ),
         Tool(
             name="search_memory",
@@ -351,6 +365,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="medium",
             requires_approval=True,
+            needs_workspace_checkpoint=False,
         ),
         Tool(
             name="search_code",
@@ -378,6 +393,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            needs_workspace_checkpoint=False,
         ),
     ]
     return tools
@@ -411,13 +427,16 @@ async def _write_file(payload: dict[str, Any], context: ToolContext) -> ToolResu
 
 
 async def _edit_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    dry_run = bool(payload.get("dry_run"))
+    if not dry_run and context.before_workspace_mutation is not None:
+        context.before_workspace_mutation()
     result: FileOpResult = fops.edit_file(
         context.cwd,
         str(payload["path"]),
         str(payload["old_text"]),
         str(payload["new_text"]),
         path_guard_enabled=context.config.policy.path_guard_enabled,
-        dry_run=bool(payload.get("dry_run")),
+        dry_run=dry_run,
     )
     return _to_tool_result(result)
 
@@ -488,6 +507,8 @@ async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
             "PowerShell was not found. Install PowerShell 7 (pwsh) or enable Windows PowerShell.",
             is_error=True,
         )
+    if context.before_workspace_mutation is not None:
+        context.before_workspace_mutation()
     if powershell is None:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -495,6 +516,7 @@ async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=os.environ.copy(),
+            start_new_session=True,
         )
     else:
         proc = await asyncio.create_subprocess_exec(
@@ -507,13 +529,10 @@ async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.CancelledError:
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
+        await _stop_command(proc)
         raise
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _stop_command(proc)
         return ToolResult(f"Command timed out after {timeout:.0f}s", is_error=True)
     output = (stdout + stderr).decode("utf-8", errors="replace")
     if len(output) > 20_000:
@@ -522,6 +541,31 @@ async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
         output or f"(exit {proc.returncode}, no output)",
         is_error=proc.returncode != 0,
     )
+
+
+async def _stop_command(proc: asyncio.subprocess.Process) -> None:
+    # Descendants can outlive the shell and hold its output pipes open.
+    if os.name == "nt" and proc.returncode is None:
+        system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+        with suppress(OSError):
+            killer = await asyncio.create_subprocess_exec(
+                os.path.join(system_root, "System32", "taskkill.exe"),
+                "/PID",
+                str(proc.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            await killer.wait()
+    elif os.name != "nt":
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    if proc.returncode is None:
+        with suppress(ProcessLookupError):
+            proc.kill()
+    await proc.wait()
 
 
 def _powershell_invocation(command: str) -> list[str] | None:
@@ -597,6 +641,10 @@ async def _web_fetch(payload: dict[str, Any], _context: ToolContext) -> ToolResu
 async def _save_memory(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     if not context.config.features.memory or not context.config.memory.long_term_enabled:
         return ToolResult("Long-term memory is disabled.", is_error=True)
+    if context.before_workspace_mutation is not None:
+        path = Path(context.config.memory.long_term_db_path).expanduser().resolve()
+        if path.is_relative_to(Path(context.cwd).resolve()):
+            context.before_workspace_mutation()
     manager = MemoryManager(
         context.config.memory.long_term_db_path,
         scope=context.cwd,
@@ -678,6 +726,8 @@ async def _save_skill(payload: dict[str, Any], context: ToolContext) -> ToolResu
     registry = SkillRegistry(context.cwd)
     scope = str(payload.get("scope") or "project")
     name = str(payload["name"])
+    if scope == "project" and context.before_workspace_mutation is not None:
+        context.before_workspace_mutation()
     try:
         if bool(payload.get("overwrite")):
             skill = registry.update(
@@ -727,6 +777,7 @@ async def _search_code(payload: dict[str, Any], context: ToolContext) -> ToolRes
 
 
 async def _revert_turn(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    # Restore resolves the index before recording its own pre-restore checkpoint.
     record = SnapshotService(context.cwd).restore(str(payload["snapshot"]))
     return ToolResult(f"Restored snapshot {record.id}")
 

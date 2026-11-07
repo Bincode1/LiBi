@@ -8,19 +8,17 @@ definitions so that builtins.py remains a thin wiring layer.
 from __future__ import annotations
 
 import glob as glob_module
-import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from paicli.lsp import diagnose_file
 from paicli.policy import PathGuard
 
-
 # ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
+
 
 @dataclass(slots=True)
 class FileOpResult:
@@ -37,6 +35,7 @@ class FileOpResult:
 
 SKIP_DIRS = frozenset({".git", ".venv", "node_modules", "dist", "build", "target", "__pycache__"})
 MAX_FILE_SIZE = 1_000_000  # 1 MB
+MAX_READ_OUTPUT_BYTES = 50 * 1024
 
 
 def resolve_path(cwd: str, value: str, path_guard_enabled: bool = True) -> Path:
@@ -67,6 +66,7 @@ def _line_numbered(content: str, offset: int = 1) -> str:
 # Read
 # ---------------------------------------------------------------------------
 
+
 def read_file(
     cwd: str,
     path: str,
@@ -75,7 +75,7 @@ def read_file(
     limit: int = 500,
     path_guard_enabled: bool = True,
 ) -> FileOpResult:
-    """Return numbered lines from a text file.
+    """Return a byte-bounded window of numbered lines with a continuation hint.
 
     *offset* is 1-based; *limit* caps the returned lines.
     """
@@ -91,9 +91,27 @@ def read_file(
     offset = max(offset, 1)
     lines = raw.splitlines()
     selected = lines[offset - 1 : offset - 1 + limit]
-    numbered = "\n".join(
-        f"{idx + offset}: {line}" for idx, line in enumerate(selected)
-    )
+    rows: list[str] = []
+    bytes_used = 0
+    shortened = False
+    for number, line in enumerate(selected, offset):
+        row = f"{number}: {line}"
+        encoded = row.encode("utf-8")
+        row_size = len(encoded) + bool(rows)
+        if bytes_used + row_size > MAX_READ_OUTPUT_BYTES:
+            if not rows:
+                rows.append(encoded[:MAX_READ_OUTPUT_BYTES].decode("utf-8", errors="ignore"))
+                shortened = True
+            break
+        rows.append(row)
+        bytes_used += row_size
+    numbered = "\n".join(rows)
+    end = offset + len(rows) - 1
+    if shortened:
+        numbered += f"\n\n[Line {end} was shortened to fit the UTF-8 output budget.]"
+    if rows and end < len(lines):
+        numbered += f"\n\n[Showing lines {offset}-{end} of {len(lines)}. "
+        numbered += f"Use offset={end + 1} to continue.]"
     rel = _relative_to(resolved, cwd)
     return FileOpResult(numbered, display_summary=f"Read {rel}")
 
@@ -119,6 +137,7 @@ def read_file_raw(
 # ---------------------------------------------------------------------------
 # Write
 # ---------------------------------------------------------------------------
+
 
 def write_file(
     cwd: str,
@@ -159,6 +178,7 @@ def write_file(
 # ---------------------------------------------------------------------------
 # Edit (surgical line-based replacement — inspired by Claude Code)
 # ---------------------------------------------------------------------------
+
 
 def edit_file(
     cwd: str,
@@ -243,6 +263,7 @@ def _build_diff_summary(old_text: str, new_text: str) -> str:
 # Directory listing
 # ---------------------------------------------------------------------------
 
+
 def list_directory(
     cwd: str,
     path: str,
@@ -272,6 +293,7 @@ def list_directory(
 # Glob
 # ---------------------------------------------------------------------------
 
+
 def glob_files(
     cwd: str,
     pattern: str,
@@ -280,7 +302,7 @@ def glob_files(
 ) -> FileOpResult:
     """Find files matching *pattern* relative to *cwd*."""
     root = Path(cwd).resolve()
-    if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+    if Path(pattern).anchor or ".." in Path(pattern).parts:
         return FileOpResult("glob pattern must stay inside workspace", is_error=True)
 
     matches = glob_module.glob(str(root / pattern), recursive=True)
@@ -299,6 +321,7 @@ def glob_files(
 # ---------------------------------------------------------------------------
 # Directory tree (recursive, depth-limited)
 # ---------------------------------------------------------------------------
+
 
 def directory_tree(
     cwd: str,
@@ -353,6 +376,7 @@ def _walk_tree(
 # Grep / search
 # ---------------------------------------------------------------------------
 
+
 def grep(
     cwd: str,
     pattern: str,
@@ -388,9 +412,7 @@ def grep(
         for line_number, line in enumerate(lines, start=1):
             found = bool(compiled.search(line)) if compiled else pattern in line
             if found:
-                matches.append(
-                    f"{file_path.relative_to(root)}:{line_number}: {line.strip()}"
-                )
+                matches.append(f"{file_path.relative_to(root)}:{line_number}: {line.strip()}")
                 if len(matches) >= limit:
                     return FileOpResult("\n".join(matches))
 
@@ -400,6 +422,7 @@ def grep(
 # ---------------------------------------------------------------------------
 # File info / metadata
 # ---------------------------------------------------------------------------
+
 
 def get_file_info(
     cwd: str,
@@ -435,6 +458,7 @@ def get_file_info(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _relative_to(path: Path, cwd: str) -> Path:
     """Return *path* relative to *cwd* when possible, otherwise absolute."""
