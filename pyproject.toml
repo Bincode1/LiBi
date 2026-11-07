@@ -22,6 +22,8 @@ paicli = "paicli.entrypoints.cli:app"
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2.0",
+  "pytest-cov>=6.0.0",
+  "pytest-timeout>=2.3.1",
   "ruff>=0.5.0",
 ]
 
@@ -37,7 +39,27 @@ packages = ["src/paicli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+pythonpath = ["src"]
+addopts = "-q --strict-config --strict-markers"
+timeout = 30
+timeout_method = "thread"
+markers = [
+  "integration: public entry-point, bootstrap, worker, local HTTP, or subprocess checks without external services",
+  "slow: extended multi-turn regression kept in the full suite",
+]
+
+[tool.coverage.run]
+source = ["paicli"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+fail_under = 80
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]
 
 [tool.ruff]
 line-length = 100
