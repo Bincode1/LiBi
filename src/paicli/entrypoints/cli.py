@@ -71,10 +71,6 @@ def main(
             help="Resume an existing persisted session by ID",
         ),
     ] = None,
-    adopt_session: Annotated[
-        bool,
-        typer.Option("--adopt-session", help="Bind the selected legacy session to this workspace"),
-    ] = False,
     resume: Annotated[
         bool,
         typer.Option(
@@ -158,9 +154,6 @@ def main(
             "use either --resume or --session-id, not both",
             param_hint="--resume",
         )
-    if adopt_session and session_id is None:
-        raise typer.BadParameter("requires --session-id", param_hint="--adopt-session")
-
     session_store = None
     if resume:
         from paicli.session import SessionStore, default_runtime_db_path
@@ -176,19 +169,14 @@ def main(
 
     if session_id is not None:
         if session_store is None:
-            from paicli.session import SessionStore, TurnInProgressError, default_runtime_db_path
+            from paicli.session import SessionStore, default_runtime_db_path
 
             session_store = SessionStore(
                 default_runtime_db_path(),
                 workspace=root,
                 sensitive_values=(config.llm.api_key,),
             )
-            if adopt_session:
-                try:
-                    session_store.adopt_session(session_id)
-                except (ValueError, TurnInProgressError) as exc:
-                    raise typer.BadParameter(str(exc), param_hint="--adopt-session") from exc
-        if not session_store.session_exists(session_id):
+        if not session_store.session_exists(session_id, root_only=True):
             raise typer.BadParameter(
                 f"session not found: {session_id}",
                 param_hint="--session-id",
@@ -250,7 +238,6 @@ def doctor(
 
 @app.command("serve")
 def runtime_serve(
-    http: Annotated[bool, typer.Option("--http", help="Serve Runtime API over HTTP")] = True,
     port: Annotated[
         int | None, typer.Option("--port", min=1, max=65535, help="Override the configured port")
     ] = None,
@@ -265,7 +252,6 @@ def runtime_serve(
     from paicli.runtime import RuntimeApiServer
     from paicli.runtime.api import RuntimeBindError, runtime_api_key
 
-    _ = http
     root = (cwd or Path.cwd()).resolve()
     try:
         config = load_config(project_root=root)

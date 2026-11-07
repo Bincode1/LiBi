@@ -42,9 +42,16 @@ def test_snapshot_restore_removes_new_files_and_preserves_ignored_directories(tm
     (project / "note.txt").write_text("before", encoding="utf-8")
     (project / ".git").mkdir()
     (project / ".git/config").write_text("original", encoding="utf-8")
+    dotenv = project / ".env"
+    dotenv.write_text("KEY=original", encoding="utf-8")
     service = SnapshotService(project)
     first = service.create("pre-turn")
     assert not (first.path / ".git").exists()
+    assert not (first.path / ".env").exists()
+    (first.path / ".env").write_text("KEY=stale", encoding="utf-8")
+    dotenv.write_text("KEY=current", encoding="utf-8")
+    local_dotenv = project / ".env.local"
+    local_dotenv.write_text("KEY=local", encoding="utf-8")
     (project / "note.txt").unlink()
     (project / "new.txt").write_text("new", encoding="utf-8")
     (project / ".git/config").write_text("current", encoding="utf-8")
@@ -53,6 +60,8 @@ def test_snapshot_restore_removes_new_files_and_preserves_ignored_directories(tm
     assert (project / "note.txt").read_text() == "before"
     assert not (project / "new.txt").exists()
     assert (project / ".git/config").read_text() == "current"
+    assert dotenv.read_text(encoding="utf-8") == "KEY=current"
+    assert local_dotenv.read_text(encoding="utf-8") == "KEY=local"
     assert service.list()[0].phase == "pre-restore"
 
 

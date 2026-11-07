@@ -9,7 +9,6 @@ import type {
   RuntimeClient,
   RuntimeEvent,
   Session,
-  Source,
   Subagent,
 } from '@/lib/types'
 
@@ -31,15 +30,14 @@ interface FeedCheckpoint {
 
 export function useEventFeed(
   client: RuntimeClient,
-  source: Source,
   sessionId: string | undefined,
   retry: number,
   parentId?: string,
 ) {
   const queryClient = useQueryClient()
   const key = useMemo(
-    () => ['session-feed', source, sessionId, parentId] as const,
-    [source, sessionId, parentId],
+    () => ['session-feed', sessionId, parentId] as const,
+    [sessionId, parentId],
   )
   const { data: checkpoint } = useQuery<FeedCheckpoint>({ queryKey: key, queryFn: skipToken })
   const [connection, setConnection] = useState<{
@@ -81,7 +79,7 @@ export function useEventFeed(
             })
             const title = page.state.title
             if (title && !parentId) {
-              queryClient.setQueryData<Session[]>(['sessions', source], (sessions) => {
+              queryClient.setQueryData<Session[]>(['sessions'], (sessions) => {
                 const current = sessions?.find((item) => item.id === sessionId)
                 if (!current || current.title === title || current.last_sequence > page.next_cursor)
                   return sessions
@@ -112,7 +110,7 @@ export function useEventFeed(
       controller.abort()
       clearTimeout(timer)
     }
-  }, [client, key, queryClient, sessionId, retry, parentId, source])
+  }, [client, key, queryClient, sessionId, retry, parentId])
   const current = connection?.key === key && connection.retry === retry ? connection : null
   const syncing = Boolean(sessionId && !current?.error && (!current || !checkpoint))
   return {

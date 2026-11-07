@@ -1,6 +1,5 @@
 import { useState, type ReactNode } from 'react'
 import {
-  Check,
   Bot,
   ChevronDown,
   ChevronRight,
@@ -11,7 +10,7 @@ import {
   X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import type { ChangeFile, Source } from '@/lib/types'
+import type { ChangeFile } from '@/lib/types'
 import type { ToolView } from '@/lib/events'
 
 export type DetailsTab = 'changes' | 'plan' | 'subagents'
@@ -23,7 +22,6 @@ const tabs = [
 ] as const
 
 export function Details({
-  source,
   changes,
   tool,
   onClose,
@@ -33,7 +31,6 @@ export function Details({
   subagents,
   subagentCount,
 }: {
-  source: Source
   changes: ChangeFile[]
   tool: ToolView | null
   onClose: () => void
@@ -152,50 +149,17 @@ export function Details({
                       </div>
                     </div>
                   )}
-                  <div className="detail-note">
-                    <span className="note-dot" />
-                    演示变更 · 未修改实际项目文件
-                  </div>
                 </>
               ) : (
                 <div className="panel-empty">
                   <GitCompareArrows size={28} />
-                  <h3>{source === 'live' ? '文件变更接口待接入' : '这里会显示文件变更'}</h3>
-                  <p>
-                    {source === 'live'
-                      ? '对话与工具结果可以正常查看。接入变更 API 后，将在这里展示真实差异。'
-                      : '打开「让会话列表更有条理」查看示例差异。'}
-                  </p>
+                  <h3>文件变更接口待接入</h3>
+                  <p>对话与工具结果可以正常查看。接入变更 API 后，将在这里展示真实差异。</p>
                 </div>
               )
             ) : (
               <div className="plan-content">
-                {source === 'demo' && changes.length ? (
-                  <>
-                    <h3>优化会话导航</h3>
-                    {[
-                      '检查会话列表与数据结构',
-                      '按时间分组并优化选中状态',
-                      '补充边界测试并验证',
-                    ].map((step, i) => (
-                      <div className="plan-step" key={step}>
-                        <span>
-                          <Check size={12} />
-                        </span>
-                        <div>
-                          <b>0{i + 1}</b>
-                          <p>{step}</p>
-                        </div>
-                      </div>
-                    ))}
-                  </>
-                ) : (
-                  <p className="muted">
-                    {source === 'live'
-                      ? '结构化计划接口待接入，当前可在对话中阅读 Agent 输出的计划。'
-                      : '当前会话没有示例计划。'}
-                  </p>
-                )}
+                <p className="muted">结构化计划接口待接入，当前可在对话中阅读 Agent 输出的计划。</p>
               </div>
             )}
           </div>

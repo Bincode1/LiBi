@@ -151,21 +151,14 @@ def test_cli_session_selection_can_exit(tmp_path, has_session):
     assert result.exit_code == (0 if has_session else 1)
 
 
-def test_cli_can_explicitly_adopt_a_legacy_session(tmp_path, monkeypatch):
+def test_cli_cannot_resume_an_unbound_session(tmp_path):
     store = SessionStore(default_runtime_db_path())
     session_id = store.create_session()
     store.append(session_id, "user/message", {"content": "older question"})
-    calls = []
-
-    async def repl(cwd, _config, *, session_id):
-        calls.append((cwd, session_id))
-
-    monkeypatch.setattr("paicli.entrypoints.repl.start_repl", repl)
     args = ["--cwd", str(tmp_path), "--session-id", session_id]
-    assert runner.invoke(app, args).exit_code != 0
-    result = runner.invoke(app, [*args, "--adopt-session"])
-    assert result.exit_code == 0, result.output
-    assert calls == [(str(tmp_path), session_id)]
+    result = runner.invoke(app, args)
+    assert result.exit_code != 0
+    assert "session not found" in result.output
     assert store.events(session_id)[0].payload == {"content": "older question"}
 
 

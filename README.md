@@ -88,9 +88,7 @@ uv run paicli -r
 
 Session ID 可以在 REPL 的 `/context` 输出中查看。指定的 ID 不存在时，CLI 会直接报错，不会自动创建一个新会话。
 
-会话绑定创建时的工作区。`--resume` 只列出当前工作区的会话。升级前未记录工作区的历史仍保存在原数据库，
-确认归属后可用 `uv run paicli --cwd <工作区> --session-id <会话ID> --adopt-session` 绑定并继续；
-绑定也适用于网页工作台。仍处于运行状态的旧会话需先结束原回合。
+会话绑定创建时的工作区。CLI 的 `--resume`、`--session-id` 和网页工作台仅访问当前工作区的主会话。
 
 单次查询：
 
@@ -407,7 +405,7 @@ curl -sS -X POST http://127.0.0.1:24158/v1/sessions/<session_id>/turns \
 读取事件：
 
 ```bash
-curl -sS http://127.0.0.1:24158/v1/sessions/<session_id>/events \
+curl -sS http://127.0.0.1:24158/v1/sessions/<session_id>/events.json \
   -H 'x-api-key: dev-key'
 ```
 
@@ -432,7 +430,8 @@ Runtime 接收新会话的第一条用户消息后，在后台只尝试生成一
 该视图通过 `subagents` 同步委派任务的状态，通过 `agent/results_received` 标记内部结果投递。
 工作台在主对话显示委派入口，在右侧显示子 agent 的状态和独立执行记录。打开子会话时订阅
 `GET /v1/sessions/<parent_id>/subagents/<child_session_id>/events/stream?cursor=<sequence>`。
-子会话流沿用独立游标，并校验子会话属于当前工作区与指定父会话。子 agent 的审批由主会话提交。
+子会话流沿用独立游标，并校验子会话属于当前工作区与指定父会话。通用会话 API 以根会话为入口，
+子会话通过父会话下的只读流访问，子 agent 的审批由主会话提交。
 `subagent` 工具可通过可选的 `role` 为任务指定展示角色，工作台据此选用头像。
 模型请求失败时，`turn/failed` 可带 `provider_error`，提供错误类型和可用的 HTTP 状态码。
 `events.json` 中的 `request/attempt_failed` 按请求记录每次失败的尝试次数、阶段、耗时、
@@ -487,9 +486,8 @@ PaiCLI 支持在 prompt 里引用图片：
 
 回合首次获准执行可能修改工作区的工具前，创建 `pre-turn` 快照。创建失败时，工具会返回错误并停止写入。已经创建前置快照的回合结束后会尽力创建 `post-turn` 快照。只读、拒绝审批和仅预演的回合无需复制工作区。恢复操作会先保存自己的 `pre-restore` 快照。
 
-新快照保存在 `~/.paicli/snapshots/v2/`，覆盖工作区中可恢复的普通文件。旧格式的快照留在
-原目录，新版只列出和恢复新格式。快照排除 `.git` 及 Git 指针引用的元数据目录，保留
-Git 的 `HEAD`、暂存区和对象库，也保留排除目录和现有链接。
+快照保存在 `~/.paicli/snapshots/v2/`，覆盖工作区中可恢复的普通文件。创建和恢复均跳过
+`.env`、`.env.*`、`.git` 和 Git 指针引用的元数据目录。恢复时保留排除目录和现有链接。
 
 创建、恢复和清理使用同一把工作区锁。恢复先检查路径并保存 `pre-restore`，随后按计划逐项
 替换文件。遇到路径冲突或检测到并发更改时会报错。恢复失败时仅尝试撤销本次已应用的操作，

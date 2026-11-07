@@ -12,7 +12,6 @@ function renderRunningComposer(unmanagedRun: boolean) {
       permissionMode="default"
       setPermissionMode={vi.fn()}
       changingPermission
-      source="live"
       busy
       unmanagedRun={unmanagedRun}
       submitting={false}

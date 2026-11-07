@@ -192,30 +192,6 @@ class SessionStore:
             raise ValueError(f"session not found in this workspace: {session_id}")
         return str(row[0]), int(row[1] or 0)
 
-    def adopt_session(self, session_id: str) -> None:
-        """Assign a settled legacy session tree to an explicitly selected workspace."""
-        if self.workspace is None:
-            raise ValueError("a workspace is required to adopt a session")
-        with closing(self._connect()) as conn, conn:
-            conn.execute("begin immediate")
-            root = conn.execute(
-                "select workspace, status from sessions where id = ? and kind = 'root'",
-                (session_id,),
-            ).fetchone()
-            if root is None or root[0] not in {None, self.workspace}:
-                raise ValueError(f"session cannot be adopted in this workspace: {session_id}")
-            if root[0] == self.workspace:
-                return
-            if root[1] == "running":
-                raise TurnInProgressError("an active legacy session cannot be adopted")
-            conn.execute(
-                "with recursive tree(id) as (select ? union "
-                "select s.id from sessions s join tree on s.parent_session_id = tree.id "
-                "where s.workspace is null) update sessions set workspace = ? "
-                "where id in (select id from tree)",
-                (session_id, self.workspace),
-            )
-
     def start_turn(self, session_id: str, turn_id: str, *, mode: str, message: str) -> int:
         """Claim a session and persist its input before an executor can run it."""
         started: dict[str, Any] = {"mode": mode}
@@ -245,16 +221,17 @@ class SessionStore:
         self._notify_append(session_id)
         return after_sequence
 
-    def session_exists(self, session_id: str) -> bool:
+    def session_exists(self, session_id: str, *, root_only: bool = False) -> bool:
         """Return whether a persisted session can be resumed by its identifier."""
         if not session_id.strip():
             return False
         with closing(self._connect()) as conn:
-            if self.workspace is not None:
+            if self.workspace is not None or root_only:
                 return (
                     conn.execute(
-                        "select 1 from sessions where id = ? and workspace = ?",
-                        (session_id, self.workspace),
+                        "select 1 from sessions where id = ? "
+                        "and (? is null or workspace = ?) and (not ? or kind = 'root')",
+                        (session_id, self.workspace, self.workspace, root_only),
                     ).fetchone()
                     is not None
                 )
@@ -410,10 +387,10 @@ class SessionStore:
 
     def child_parent(self, child_session_id: str) -> str | None:
         with closing(self._connect()) as conn:
-            self._session_row(conn, child_session_id)
             row = conn.execute(
-                "select parent_session_id from sessions where id = ? and kind = 'child'",
-                (child_session_id,),
+                "select parent_session_id from sessions where id = ? and kind = 'child' "
+                "and (? is null or workspace = ?)",
+                (child_session_id, self.workspace, self.workspace),
             ).fetchone()
         return row[0] if row else None
 
@@ -1231,26 +1208,6 @@ class SessionStore:
                     "kind = coalesce(kind, 'root')"
                 )
             conn.execute("update sessions set kind = 'root' where kind is null")
-            # The retired catalog event is read here only to backfill old session metadata.
-            child_rows = conn.execute(
-                "select session_id, payload from events where type in "
-                "('agent/subagent_descriptor', 'agent/child_started', 'agent/subagent_catalog')"
-            ).fetchall()
-            for session_id, raw_payload in child_rows:
-                try:
-                    payload = json.loads(raw_payload)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                child_session_id = str(payload.get("child_session_id") or "")
-                parent_session_id = str(payload.get("parent_session_id") or session_id or "")
-                if not child_session_id or not parent_session_id:
-                    continue
-                conn.execute(
-                    "update sessions set kind = 'child', parent_session_id = ? where id = ?",
-                    (parent_session_id, child_session_id),
-                )
             conn.execute(
                 "create index if not exists idx_events_session_turn_sequence "
                 "on events(session_id, turn_id, sequence)"

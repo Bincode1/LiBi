@@ -5,7 +5,6 @@ import {
   ArrowDown,
   ArrowRight,
   BookOpen,
-  Check,
   ChevronDown,
   CircleAlert,
   CircleHelp,
@@ -38,10 +37,11 @@ import { Details, type DetailsTab } from '@/features/workspace/details'
 import { SubagentsPane } from '@/features/workspace/subagents'
 import { useEventFeed } from '@/hooks/use-event-feed'
 import { ApiError, liveClient, request } from '@/lib/api'
-import { demoClient } from '@/lib/demo'
 import { projectTurns, resolveActiveRun, type PendingTurn, type ToolView } from '@/lib/events'
 import { errorMessage } from '@/lib/utils'
-import type { Mode, PermissionMode, Session, Source, Subagent } from '@/lib/types'
+import type { Mode, PermissionMode, Session, Subagent } from '@/lib/types'
+
+const client = liveClient
 
 const navigationDrawer = '(max-width: 950px)'
 const detailsDrawer = '(max-width: 1275px)'
@@ -60,9 +60,6 @@ export default function App() {
   const navigate = useNavigate(),
     queryClient = useQueryClient()
   const id = useMatch('/sessions/:id')?.params.id
-  const [source, setSource] = useState<Source>(() =>
-    localStorage.getItem('paicli-source') === 'live' ? 'live' : 'demo',
-  )
   const [theme, setTheme] = useState(() =>
     localStorage.getItem('paicli-theme') === 'dark' ? 'dark' : 'light',
   )
@@ -83,10 +80,7 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false),
     [retry, setRetry] = useState(0),
     [notice, setNotice] = useState('')
-  const [newPermissionModes, setNewPermissionModes] = useState<Record<Source, PermissionMode>>({
-    live: 'default',
-    demo: 'default',
-  })
+  const [newPermissionMode, setNewPermissionMode] = useState<PermissionMode>('default')
   const [changingPermission, setChangingPermission] = useState(false)
   const [cancelRequested, setCancelRequested] = useState<string>(),
     [tool, setTool] = useState<ToolView | null>(null),
@@ -95,29 +89,26 @@ export default function App() {
   const [nearBottom, setNearBottom] = useState(true)
   const scrollRef = useRef<HTMLDivElement>(null),
     sendLock = useRef(false)
-  const sourceRef = useRef(source)
-  sourceRef.current = source
-  const client = source === 'demo' ? demoClient : liveClient
-  const draftKey = `${source}:${id ?? 'new'}`,
+  const draftKey = id ?? 'new',
     draft = drafts[draftKey] ?? ''
   const setDraft = (value: string) => setDrafts((previous) => ({ ...previous, [draftKey]: value }))
   const sessions = useQuery({
-    queryKey: ['sessions', source],
+    queryKey: ['sessions'],
     queryFn: ({ signal }) => client.sessions(signal),
     refetchInterval: 3500,
   })
   const health = useQuery({
-    queryKey: ['health', source],
+    queryKey: ['health'],
     queryFn: ({ signal }) => client.health(signal),
     retry: false,
   })
   const changes = useQuery({
-    queryKey: ['changes', source, id],
+    queryKey: ['changes', id],
     queryFn: () => client.changes(id!),
     enabled: Boolean(id) && client.capabilities.changes,
   })
   const tasks = useQuery({
-    queryKey: ['tasks', source],
+    queryKey: ['tasks'],
     queryFn: ({ signal }) => client.tasks(signal),
     enabled: tasksOpen,
     refetchInterval: tasksOpen ? 2500 : false,
@@ -129,8 +120,8 @@ export default function App() {
     retry: false,
   })
   const pending = pendingTurns[draftKey]
-  const feed = useEventFeed(client, source, id, retry)
-  const permissionMode = id ? (feed.permissionMode ?? 'default') : newPermissionModes[source]
+  const feed = useEventFeed(client, id, retry)
+  const permissionMode = id ? (feed.permissionMode ?? 'default') : newPermissionMode
   const turns = useMemo(
     () => projectTurns(feed.events, feed.preview, pending),
     [feed.events, feed.preview, pending],
@@ -168,8 +159,7 @@ export default function App() {
   const activeRun = resolveActiveRun(feed, pending)
   const runId = activeRun?.run_id
   const pendingFinished = Boolean(pending?.run && runId !== pending.run.id)
-  const unmanagedRun =
-    source === 'live' && feed.status === 'running' && !runId && (!pending || pendingFinished)
+  const unmanagedRun = feed.status === 'running' && !runId && (!pending || pendingFinished)
   const busy = Boolean(runId || feed.status === 'running' || (pending && !pendingFinished))
   const stopping = activeRun?.status === 'canceling' || Boolean(runId && cancelRequested === runId)
   const visibleSessions = useMemo(
@@ -202,19 +192,15 @@ export default function App() {
     return () => window.removeEventListener('resize', resize)
   }, [])
   useEffect(() => {
-    localStorage.setItem('paicli-source', source)
-  }, [source])
-  useEffect(() => {
-    if (location.pathname === '/')
-      navigate(source === 'demo' ? '/sessions/demo-workspace' : '/new', { replace: true })
-  }, [navigate, source])
+    if (location.pathname === '/') navigate('/new', { replace: true })
+  }, [navigate])
   useEffect(() => {
     setTool(null)
     setAgentSelection(undefined)
     setRenameDraft(null)
     setNearBottom(true)
     scrollRef.current?.scrollTo({ top: 0 })
-  }, [id, source])
+  }, [id])
   useEffect(() => {
     if (!pending || !pendingFinished) return
     if (optimistic?.status === 'failed' || optimistic?.id === 'pending') {
@@ -275,17 +261,10 @@ export default function App() {
       setRenaming(false)
     }
   }
-  const switchSource = (next: Source) => {
-    if (submitting) return
-    setSource(next)
-    navigate('/new')
-    setSettings(false)
-    setNotice('')
-  }
   const setPermissionMode = async (next: PermissionMode) => {
     if (changingPermission || submitting || next === permissionMode) return
     if (!id) {
-      setNewPermissionModes((previous) => ({ ...previous, [source]: next }))
+      setNewPermissionMode(next)
       return
     }
     setChangingPermission(true)
@@ -302,8 +281,7 @@ export default function App() {
     if (!draft.trim() || busy || feed.syncing || changingPermission || sendLock.current) return
     sendLock.current = true
     setSubmitting(true)
-    const submittedSource = source,
-      message = draft.trim(),
+    const message = draft.trim(),
       key = draftKey
     const queued = { message, afterSequence: feed.cursor }
     setPendingTurns((previous) => ({ ...previous, [key]: queued }))
@@ -316,16 +294,15 @@ export default function App() {
         const session = await client.createSession()
         sessionId = session.id
         if (permissionMode === 'auto') await client.setPermissionMode(sessionId, 'auto')
-        setNewPermissionModes((previous) => ({ ...previous, [submittedSource]: 'default' }))
-        submittedKey = `${submittedSource}:${sessionId}`
+        setNewPermissionMode('default')
+        submittedKey = sessionId
         setPendingTurns((previous) => {
           const next = { ...previous, [submittedKey]: queued }
           delete next[key]
           return next
         })
-        void queryClient.invalidateQueries({ queryKey: ['sessions', submittedSource] })
-        if (sourceRef.current === submittedSource && location.pathname === '/new')
-          navigate(`/sessions/${encodeURIComponent(sessionId)}`)
+        void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+        if (location.pathname === '/new') navigate(`/sessions/${encodeURIComponent(sessionId)}`)
       }
       const result = await client.send(sessionId, message, mode)
       const accepted = {
@@ -336,8 +313,8 @@ export default function App() {
       setPendingTurns((previous) =>
         previous[submittedKey] === queued ? { ...previous, [submittedKey]: accepted } : previous,
       )
-      if (feed.error && sourceRef.current === submittedSource) setRetry((value) => value + 1)
-      void queryClient.invalidateQueries({ queryKey: ['sessions', submittedSource] })
+      if (feed.error) setRetry((value) => value + 1)
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
     } catch (error) {
       setPendingTurns((previous) => {
         const next = { ...previous }
@@ -359,7 +336,7 @@ export default function App() {
     setSubmitting(true)
     try {
       await client.cancelTurn(id, runId)
-      if (source === 'live') setCancelRequested(runId)
+      setCancelRequested(runId)
     } catch (error) {
       notify(errorMessage(error))
       if (error instanceof ApiError && (error.status === 404 || error.status === 409))
@@ -505,7 +482,7 @@ export default function App() {
             <span className="profile-avatar">Y</span>
             <div>
               <strong>个人工作空间</strong>
-              <span>{source === 'demo' ? '交互演示' : '本地 Runtime'}</span>
+              <span>本地 Runtime</span>
             </div>
             <Button
               variant="ghost"
@@ -553,18 +530,12 @@ export default function App() {
           </div>
           <div className="topbar-actions">
             <button
-              className={`source-pill ${source}`}
-              data-offline={source === 'live' && health.isError ? true : undefined}
+              className="source-pill"
+              data-offline={health.isError ? true : undefined}
               onClick={() => setSettings(true)}
             >
               <span />
-              {source === 'demo'
-                ? '演示模式'
-                : health.isError
-                  ? '连接异常'
-                  : health.isPending
-                    ? '连接中'
-                    : '本地连接'}
+              {health.isError ? '连接异常' : health.isPending ? '连接中' : '本地连接'}
               <ChevronDown size={11} />
             </button>
             <span className="topbar-separator" />
@@ -579,12 +550,10 @@ export default function App() {
             </Button>
           </div>
         </header>
-        {source === 'live' && (
-          <div className="live-info">
-            <span className="status-dot" data-offline={health.isError ? true : undefined} />
-            {health.isError ? 'Runtime 未连接，请检查设置' : '通过现有事件 API 同步执行状态'}
-          </div>
-        )}
+        <div className="live-info">
+          <span className="status-dot" data-offline={health.isError ? true : undefined} />
+          {health.isError ? 'Runtime 未连接，请检查设置' : '通过现有事件 API 同步执行状态'}
+        </div>
         <div
           className="conversation-scroll"
           ref={scrollRef}
@@ -636,9 +605,7 @@ export default function App() {
                 </div>
                 <div className="welcome-hint">
                   <BookOpen size={13} />
-                  {source === 'demo'
-                    ? '当前为演示环境，可在设置中连接真实 Agent'
-                    : 'Agent 会使用当前 Runtime 配置的模型与工具'}
+                  Agent 会使用当前 Runtime 配置的模型与工具
                 </div>
               </section>
             ) : (
@@ -650,7 +617,7 @@ export default function App() {
                     {project}
                     <span>·</span>
                     <GitBranch size={12} />
-                    {source === 'demo' ? '示例工作区' : '本地工作区'}
+                    本地工作区
                   </div>
                 </div>
                 {feed.loading && !pending && (
@@ -679,7 +646,7 @@ export default function App() {
                   <Turn
                     key={turn.id}
                     turn={turn}
-                    unmanaged={source === 'live' && (unmanagedRun || !busy)}
+                    unmanaged={unmanagedRun || !busy}
                     canApprove={client.capabilities.approvals}
                     onApprove={approval}
                     agents={agentsByTurn.get(turn.id)}
@@ -723,7 +690,6 @@ export default function App() {
           permissionMode={permissionMode}
           setPermissionMode={(next) => void setPermissionMode(next)}
           changingPermission={changingPermission}
-          source={source}
           busy={busy}
           unmanagedRun={unmanagedRun}
           submitting={submitting}
@@ -737,7 +703,6 @@ export default function App() {
       </main>
       {details && (
         <Details
-          source={source}
           changes={changes.data ?? []}
           tool={visibleTool}
           tab={detailsTab}
@@ -750,7 +715,6 @@ export default function App() {
               agent={visibleAgent}
               rootId={id}
               client={client}
-              source={source}
               approvals={approvals}
               syncing={feed.syncing}
               supported={feed.subagents !== undefined}
@@ -820,35 +784,9 @@ export default function App() {
       <Dialog
         open={settings}
         onOpenChange={setSettings}
-        title="让工作台连接你的 Agent"
-        description="选择交互演示，或使用本地 Python Runtime。"
+        title="本地 Runtime 连接"
+        description="查看工作台连接状态和配置。"
       >
-        <div className="connection-options">
-          <button
-            className={source === 'demo' ? 'active' : ''}
-            disabled={submitting}
-            onClick={() => switchSource('demo')}
-          >
-            <Sparkles size={22} />
-            <div>
-              <strong>交互演示</strong>
-              <p>体验会话、分段输出、审批和示例变更。</p>
-            </div>
-            {source === 'demo' && <Check size={17} />}
-          </button>
-          <button
-            className={source === 'live' ? 'active' : ''}
-            disabled={submitting}
-            onClick={() => switchSource('live')}
-          >
-            <Terminal size={22} />
-            <div>
-              <strong>连接 Runtime</strong>
-              <p>使用当前项目中的真实 Agent 与工具。</p>
-            </div>
-            {source === 'live' && <Check size={17} />}
-          </button>
-        </div>
         <div className="settings-section">
           <h3>本地连接</h3>
           <div className="settings-status">
@@ -863,18 +801,18 @@ export default function App() {
           </div>
           <p>
             在 <code>frontend/.env.local</code> 中设置 <code>PAICLI_WEB_RUNTIME_KEY</code>
-            ，然后重启前端。默认连接本机 8080 端口。
+            ，然后重启前端。默认连接本机 24158 端口。
           </p>
           <p className="muted">密钥由本地代理注入，浏览器不接收或保存密钥。</p>
         </div>
         <div className="settings-section">
           <h3>接口接入状态</h3>
           <div className="capability-row">
-            <span>会话 / 历史 / 异步运行 / 后台任务 / 文字增量 / 网页审批</span>
+            <span>会话 / 历史 / 异步运行与停止 / 后台任务 / 文字增量 / 网页审批</span>
             <span className="cap-ready">已接入</span>
           </div>
           <div className="capability-row">
-            <span>停止 / Diff</span>
+            <span>Diff</span>
             <span className="cap-pending">待后端补齐</span>
           </div>
         </div>
@@ -933,11 +871,7 @@ export default function App() {
         open={tasksOpen}
         onOpenChange={setTasksOpen}
         title="后台任务"
-        description={
-          source === 'demo'
-            ? '演示任务队列，不执行真实操作。'
-            : '提交任务，由本地 Runtime Worker 执行。'
-        }
+        description="提交任务，由本地 Runtime Worker 执行。"
       >
         <form
           className="task-form"

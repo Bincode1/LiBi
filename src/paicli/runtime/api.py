@@ -215,7 +215,7 @@ class RuntimeApiServer:
             return
         try:
             if path.startswith("/v1/sessions/") and not self.session_store.session_exists(
-                _session_id_from_path(path)
+                _session_id_from_path(path), root_only=True
             ):
                 _send_json(request, 404, {"error": "session not found"})
                 return
@@ -318,11 +318,6 @@ class RuntimeApiServer:
                     after_sequence=_stream_cursor(request),
                     conversation=query.get("view", [""])[0] == "conversation",
                 )
-            elif request.command == "GET" and _matches_session_route(path, "/events"):
-                session_id = _session_id_from_path(path)
-                query_cursor = parse_qs(request.path.partition("?")[2]).get("cursor", [None])[0]
-                cursor = query_cursor or request.headers.get("last-event-id") or "0"
-                self._send_events(request, session_id, after_sequence=_parse_cursor(cursor))
             elif request.command == "POST" and path == "/v1/tasks":
                 prompt = str(body.get("message") or body.get("prompt") or "")
                 if not prompt:
@@ -748,25 +743,6 @@ class RuntimeApiServer:
             "schema_version": event.schema_version,
             "source": event.source,
         }
-
-    def _send_events(
-        self,
-        request: BaseHTTPRequestHandler,
-        session_id: str,
-        *,
-        after_sequence: int = 0,
-    ) -> None:
-        events = self.session_store.events(session_id, after_sequence=after_sequence)
-        body = "".join(
-            f"id: {event.sequence}\nevent: {event.event_type}\n"
-            f"data: {json.dumps(event.payload, ensure_ascii=False)}\n\n"
-            for event in events
-        ).encode("utf-8")
-        request.send_response(200)
-        request.send_header("content-type", "text/event-stream")
-        request.send_header("content-length", str(len(body)))
-        request.end_headers()
-        request.wfile.write(body)
 
     def _wake_event_streams(self, session_id: str, *, history_changed: bool = False) -> None:
         with self._event_streams_lock:

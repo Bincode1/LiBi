@@ -123,6 +123,15 @@ def test_session_store_migration_preserves_order_with_mixed_events(tmp_path):
     ]
 
 
+def test_child_session_is_not_a_root_resume_target(tmp_path):
+    store = SessionStore(tmp_path / "runtime.db", workspace=tmp_path)
+    parent = store.create_session()
+    child = store.create_session(kind="child", parent_session_id=parent)
+    assert store.child_parent(child) == parent
+    assert store.session_exists(parent, root_only=True)
+    assert not store.session_exists(child, root_only=True)
+
+
 def test_session_store_redacts_nested_secrets_and_rejects_non_json(tmp_path):
     store = SessionStore(tmp_path / "runtime.db", sensitive_values=("runtime-secret-value",))
     event = store.append(
@@ -270,7 +279,11 @@ def test_context_projector_does_not_duplicate_skill_context_in_checkpoint(tmp_pa
                     "role": "user",
                     "content": "[skill-context: skill; untrusted data]\nRelevant skill facts",
                 },
-            ]
+            ],
+            "message_sources": [
+                {"event_sequences": [2], "checkpoint_ids": []},
+                {"event_sequences": [3], "checkpoint_ids": []},
+            ],
         },
         turn_id="turn-a",
         step_id="step-a",

@@ -313,16 +313,16 @@ class CompactionPlanner:
                 pending.update(str(call.get("id") or "") for call in message.tool_calls)
             elif message.role == "tool":
                 pending.discard(message.tool_call_id or "")
-            legacy_unit = False
+            shared_checkpoint = False
             if sources is not None and index + 1 < len(sources):
                 left = sources[index]
                 right = sources[index + 1]
-                legacy_unit = bool(
+                shared_checkpoint = bool(
                     left.checkpoint_ids
                     and not left.event_sequences
                     and left.checkpoint_ids == right.checkpoint_ids
                 )
-            if not pending and not legacy_unit:
+            if not pending and not shared_checkpoint:
                 safe_boundaries.add(index + 1)
         choices = [item for item in safe_boundaries if item <= candidate]
         return max(choices) if choices else 0

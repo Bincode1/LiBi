@@ -12,7 +12,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Dropdown } from '@/components/ui/dropdown-menu'
-import type { Mode, PermissionMode, Source } from '@/lib/types'
+import type { Mode, PermissionMode } from '@/lib/types'
 export function Composer({
   draft,
   setDraft,
@@ -21,7 +21,6 @@ export function Composer({
   permissionMode,
   setPermissionMode,
   changingPermission,
-  source,
   busy,
   unmanagedRun,
   submitting,
@@ -39,7 +38,6 @@ export function Composer({
   permissionMode: PermissionMode
   setPermissionMode: (mode: PermissionMode) => void
   changingPermission: boolean
-  source: Source
   busy: boolean
   unmanagedRun: boolean
   submitting: boolean
@@ -151,9 +149,7 @@ export function Composer({
               ]}
             />
             <span className="composer-divider" />
-            <span className="model-label">
-              {source === 'demo' ? '演示 Agent' : 'Runtime 默认模型'}
-            </span>
+            <span className="model-label">Runtime 默认模型</span>
           </div>
           {unmanagedRun ? (
             <Button type="button" size="sm" onClick={onNewConversation}>
@@ -197,11 +193,9 @@ export function Composer({
             ? '当前 Runtime 无法管理本轮运行'
             : busy
               ? '权限切换下一轮生效'
-              : source === 'demo'
-                ? '演示模式 · 不会修改真实文件'
-                : permissionMode === 'auto'
-                  ? '完全访问 · 工具自动执行，可访问项目外路径'
-                  : '操作将在本地项目中执行'}
+              : permissionMode === 'auto'
+                ? '完全访问 · 工具自动执行，可访问项目外路径'
+                : '操作将在本地项目中执行'}
         </span>
         <span>
           <CornerDownLeft size={11} />

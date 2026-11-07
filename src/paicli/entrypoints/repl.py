@@ -78,7 +78,7 @@ async def start_repl(
     console = Console()
     permission_mode = PermissionModeController(config)
     client, registry, mcp_manager, session_store = await build_runtime(config=config, cwd=cwd)
-    if session_id is not None and not session_store.session_exists(session_id):
+    if session_id is not None and not session_store.session_exists(session_id, root_only=True):
         raise ValueError(f"session not found: {session_id}")
     system_prompt = PromptAssembler(
         config=config,

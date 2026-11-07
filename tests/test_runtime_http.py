@@ -235,10 +235,10 @@ def test_http_sessions_events_and_sse_have_consistent_cursors(runtime_http):
     empty = client.get(f"/v1/sessions/{sid}/events.json?cursor={answer.sequence}").json()
     assert empty["events"] == []
     assert empty["next_cursor"] == answer.sequence
-    sse = client.get(f"/v1/sessions/{sid}/events", headers={"last-event-id": "2"})
-    assert sse.headers["content-type"] == "text/event-stream"
-    assert f"id: {answer.sequence}\nevent: assistant/message" in sse.text
-    assert "user/message" not in sse.text
+    assert client.get(f"/v1/sessions/{sid}/events").status_code == 404
+    with client.stream("GET", f"/v1/sessions/{sid}/events/stream?cursor=2") as stream:
+        replay = next(_event_stream_pages(stream))
+    assert [event["sequence"] for event in replay["events"]] == [answer.sequence]
 
 
 def test_http_restart_recovers_only_its_owned_interrupted_turn(
@@ -479,7 +479,7 @@ def test_http_rejects_invalid_tasks_and_turns(runtime_http, path, body):
     assert runtime.task_manager.list() == []
 
 
-@pytest.mark.parametrize("suffix", ["events", "events.json", "events/stream"])
+@pytest.mark.parametrize("suffix", ["events.json", "events/stream"])
 def test_http_rejects_invalid_event_cursor(runtime_http, suffix):
     runtime, client = runtime_http
     session_id = runtime._create_session()
@@ -1429,6 +1429,13 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
         unrelated = client.post("/v1/sessions").json()["id"]
         assert client.get(child_stream.replace(root_id, unrelated, 1)).status_code == 404
         assert client.post(child_stream.replace("/events/stream", "/turns")).status_code == 404
+        direct_child = f"/v1/sessions/{search['session_id']}"
+        for suffix in ("turns", "turns/async"):
+            assert (
+                client.post(f"{direct_child}/{suffix}", json={"message": "extra"}).status_code
+                == 404
+            )
+        assert client.get(f"{direct_child}/events.json").status_code == 404
         with client.stream("GET", child_stream) as opened:
             frames = _event_stream_pages(opened)
             child_page = next(frames)

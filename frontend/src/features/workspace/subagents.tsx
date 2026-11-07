@@ -7,7 +7,7 @@ import { SubagentRow } from '@/features/conversation/subagent-activity'
 import { useEventFeed } from '@/hooks/use-event-feed'
 import { subagentIsActive, subagentStatus, toolLabel } from '@/lib/activity'
 import { projectTurns, type ApprovalView, type TurnView } from '@/lib/events'
-import type { RuntimeClient, Source, Subagent } from '@/lib/types'
+import type { RuntimeClient, Subagent } from '@/lib/types'
 
 const empty: Subagent[] = []
 
@@ -103,7 +103,6 @@ function ChildTurn({ turn, index, active }: { turn: TurnView; index: number; act
 function ChildTranscript({
   agent,
   client,
-  source,
   rootId,
   approvals,
   onOpen,
@@ -112,7 +111,6 @@ function ChildTranscript({
 }: {
   agent: Subagent
   client: RuntimeClient
-  source: Source
   rootId: string
   approvals: ApprovalView[]
   onOpen: (agent: Subagent) => void
@@ -120,7 +118,7 @@ function ChildTranscript({
   onBack: () => void
 }) {
   const [retry, setRetry] = useState(0)
-  const feed = useEventFeed(client, source, agent.session_id, retry, rootId)
+  const feed = useEventFeed(client, agent.session_id, retry, rootId)
   const turns = useMemo(() => projectTurns(feed.events, feed.preview), [feed.events, feed.preview])
   const viewport = useRef<HTMLDivElement>(null)
   const nearBottom = useRef(subagentIsActive(agent))
@@ -219,7 +217,6 @@ export function SubagentsPane({
   agents = empty,
   agent,
   client,
-  source,
   rootId,
   approvals,
   onOpen,
@@ -231,7 +228,6 @@ export function SubagentsPane({
   agents?: Subagent[]
   agent?: Subagent
   client: RuntimeClient
-  source: Source
   rootId?: string
   approvals: ApprovalView[]
   onOpen: (agent: Subagent) => void
@@ -263,7 +259,6 @@ export function SubagentsPane({
         key={agent.id}
         agent={agent}
         client={client}
-        source={source}
         rootId={rootId}
         approvals={approvals}
         onOpen={onOpen}
@@ -306,11 +301,9 @@ export function SubagentsPane({
           <Bot size={28} aria-hidden="true" />
           <h3>{syncing ? '正在同步子 agent' : '本会话暂无子 agent'}</h3>
           <p>
-            {source === 'demo'
-              ? '连接 Runtime 后，可以在这里查看实际委派的任务。'
-              : rootId && !syncing && !supported
-                ? '当前连接未提供子 agent 状态。'
-                : 'PaiCLI 委派任务时，进度和交付会显示在这里。'}
+            {rootId && !syncing && !supported
+              ? '当前连接未提供子 agent 状态。'
+              : 'PaiCLI 委派任务时，进度和交付会显示在这里。'}
           </p>
         </div>
       )}

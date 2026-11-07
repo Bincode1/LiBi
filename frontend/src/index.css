@@ -515,9 +515,6 @@ kbd {
   background: var(--green);
   flex-shrink: 0;
 }
-.source-pill.demo > span {
-  background: var(--warning);
-}
 .source-pill[data-offline] > span,
 .status-dot[data-offline] {
   background: var(--red);
@@ -1311,51 +1308,8 @@ kbd {
   white-space: pre;
   padding-left: 3px;
 }
-.detail-note {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 9px;
-  color: var(--muted);
-  margin: 17px 3px;
-}
-.note-dot {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--warning);
-}
 .plan-content {
   padding: 24px 4px;
-}
-.plan-content h3 {
-  margin: 10px 0 26px;
-  font-size: 16px;
-}
-.plan-step {
-  display: flex;
-  gap: 12px;
-  margin-bottom: 26px;
-  align-items: center;
-}
-.plan-step > span {
-  width: 23px;
-  height: 23px;
-  display: grid;
-  place-items: center;
-  background: var(--selected);
-  color: var(--green);
-  border-radius: 50%;
-}
-.plan-step b {
-  font-size: 8px;
-  color: var(--muted);
-  letter-spacing: 1px;
-  font-weight: 400;
-}
-.plan-step p {
-  font-size: 11px;
-  margin: 5px 0 0;
 }
 .tool-detail {
   padding: 10px 20px;
@@ -1677,40 +1631,6 @@ kbd {
   position: absolute;
   top: 18px;
   right: 17px;
-}
-.connection-options {
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
-}
-.connection-options > button {
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  padding: 17px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: transparent;
-  color: var(--secondary);
-  text-align: left;
-}
-.connection-options > button.active {
-  border-color: var(--focus);
-  background: var(--selected);
-}
-.connection-options strong {
-  color: var(--foreground);
-  font-weight: 500;
-  font-size: 12px;
-}
-.connection-options p {
-  font-size: 10px;
-  color: var(--muted);
-  margin: 6px 0 0;
-}
-.connection-options > button > svg:last-child:not(:first-child) {
-  margin-left: auto;
-  color: var(--green);
 }
 .settings-section {
   padding: 20px 0 0;

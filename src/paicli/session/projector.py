@@ -723,13 +723,9 @@ def _normalize_source(source: MessageSource | dict[str, Any]) -> MessageSource:
 
 def _checkpoint_sources(checkpoint: SessionEvent, message_count: int) -> list[MessageSource]:
     raw = checkpoint.payload.get("message_sources")
-    if isinstance(raw, list) and len(raw) == message_count:
-        return [_normalize_source(value) for value in raw]
-    # Old checkpoints did not persist per-message lineage. Treat their whole
-    # snapshot as one indivisible legacy unit rather than inventing sequences.
-    checkpoint_id = str(checkpoint.payload.get("compaction_id") or checkpoint.event_id)
-    legacy = {"event_sequences": [], "checkpoint_ids": [checkpoint_id]}
-    return [dict(legacy) for _ in range(message_count)]
+    if not isinstance(raw, list) or len(raw) != message_count:
+        raise ValueError("checkpoint must record provenance for each message")
+    return [_normalize_source(value) for value in raw]
 
 
 def _shorten_earlier_tool_results(

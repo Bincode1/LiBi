@@ -12,16 +12,14 @@ pnpm install
 pnpm dev
 ```
 
-打开 http://127.0.0.1:24157。前端监听端口在 `vite.config.ts` 的 `workspacePort` 中配置，端口占用时启动会退出。默认进入明确标注的交互演示。可新建会话、切换执行模式、体验分段输出与停止、查看工具步骤、审批示例、搜索会话、管理演示任务和切换主题。输入包含“审批”可触发演示审批。
-
-演示数据仅保存在页面内存中，刷新会恢复初始样例；主题和数据源偏好保存到 localStorage。示例代码差异与测试输出不代表实际修改或测试。
+打开 http://127.0.0.1:24157。前端监听端口在 `vite.config.ts` 的 `workspacePort` 中配置，端口占用时启动会退出。工作台通过本地 Runtime 加载会话和后台任务。主题偏好保存在 localStorage。
 
 ## 连接真实 Runtime
 
 1. 在项目根目录按现有配置方式提供模型凭据，通过环境变量注入 Runtime 访问凭据 `PAICLI_RUNTIME_API_KEY`。
 2. 在根目录运行 `uv run paicli serve --cwd .`。后端按 `.paicli/config.json` 的 `runtime.port` 监听，默认 `24158`，端口占用时启动会退出。修改 Python 后端代码后，重启 Runtime 以加载新代码。
 3. 复制本目录 `.env.example` 为 `.env.local`，将 **同一个 Runtime 访问凭据** 通过 `PAICLI_WEB_RUNTIME_KEY` 提供给 Vite 服务端；可以改用进程环境变量注入。不要把模型密钥用作网页配置。
-4. 重启 `pnpm dev`，在“设置与连接”中选择“连接 Runtime”。
+4. 重启 `pnpm dev`，打开工作台。在“设置与连接”中可以查看桥接状态。
 
 代理目标在 `vite.config.ts` 的 `defaultRuntimeOrigin` 中配置为 `http://127.0.0.1:24158`。只有连接独立测试后端时才需用 `PAICLI_WEB_RUNTIME_URL` 显式覆盖，该值只允许本机 HTTP origin。访问凭据只存在于 Vite 服务端，并通过代理 Header 注入，不进入浏览器 bundle、URL 或浏览器存储。跨源浏览器请求被本地桥接拒绝。
 
@@ -50,7 +48,7 @@ pnpm dev
 
 ## 后端接口预留约定
 
-`src/lib/types.ts` 定义 `RuntimeClient`，`src/lib/api.ts` 是真实适配器，`src/lib/demo.ts` 是同接口的内存演示适配器。UI 通过 capabilities 显式判定能力。未接入操作抛 `CapabilityError`，不请求臆测路径，也不静默切回演示。
+`src/lib/types.ts` 定义 `RuntimeClient`，`src/lib/api.ts` 实现本地 Runtime 适配器。UI 通过 capabilities 判定已接入能力，未接入的操作返回 `CapabilityError`。
 
 后端下一阶段可以按以下**建议接口**补齐（当前尚未调用）：
 
@@ -60,7 +58,7 @@ pnpm dev
 | `GET /v1/sessions/{id}/changes` | 当前会话范围内的文件路径、增删统计与 diff，不用整个工作树冒充 Agent 改动 |
 | `GET /v1/sessions/{id}/plan` | 结构化计划及步骤状态；不是只有文字的计划回答 |
 
-SSE 的 `page` 事件使用与 `events.json` 相同的数据结构。`assistant_preview` 是当前步骤的累计文本 `{ turn_id, step_id, text }`，独立于历史游标。生成完成后，同一步骤的 `assistant/message` 接管显示。演示模式在本地生成 `assistant/text_delta` 时直接通知订阅者。整轮终态由 `turn/completed`、`turn/failed`、`turn/canceled` 确定。`sequence` 只要求同会话有序，不假定数值连续。
+SSE 的 `page` 事件使用与 `events.json` 相同的数据结构。`assistant_preview` 是当前步骤的累计文本 `{ turn_id, step_id, text }`，独立于历史游标。生成完成后，同一步骤的 `assistant/message` 接管显示。整轮终态由 `turn/completed`、`turn/failed`、`turn/canceled` 确定。`sequence` 只要求同会话有序，不假定数值连续。
 异步提交先保存用户消息，再返回 `run_id`、`turn_id` 和 `after_sequence`。前端通过 `turn_id` 匹配 SSE 回合，可在第一帧 SSE 到达前用 `run_id` 停止回合。`active_run` 提供 `{ run_id, status }`，浏览器刷新后可恢复对活跃回合的停止操作。
 
 审批 UI 使用 AI Elements Confirmation，并通过事件信封中的 `approval_id` 对应 `approval/started`、`approval/approved`、`approval/rejected`、`approval/canceled`。审批请求有效期为 5 分钟。浏览器断线后可重新连接并重放事件。同一 Runtime 监听端口重启后会结束它能识别的中断回合及待处理审批。无法确认归属的旧回合会显示说明，并提供新建会话入口。
@@ -82,7 +80,7 @@ pnpm test
 pnpm build
 ```
 
-单元测试覆盖事件重放去重、稀疏序号、并行工具关联、增量与最终文本归并、回合终态、审批、演示取消和 API 错误边界。浏览器验证检查会话、发送/停止、审批、搜索、任务、主题和窄屏布局。
+单元测试覆盖事件重放去重、稀疏序号、并行工具关联、增量与最终文本归并、回合终态、审批和 API 错误边界。浏览器验证检查会话、发送/停止、审批、搜索、任务、主题和窄屏布局。
 
 另以临时数据库启动现有 Python Runtime HTTP Handler，通过带服务端代理的独立 Vite 实例验证了健康、会话创建/查询、异步 Plan turn、事件游标、后台任务创建/查询/取消及跨源拒绝。该联调使用隔离执行器，不调用外部模型，不代表已完成真实模型端到端验证。
 

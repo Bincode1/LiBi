@@ -1,5 +1,4 @@
 export type Mode = 'react' | 'plan'
-export type Source = 'demo' | 'live'
 export type PermissionMode = 'default' | 'auto'
 export interface Session {
   id: string

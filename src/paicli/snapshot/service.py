@@ -459,7 +459,8 @@ class SnapshotService:
 
     def _skip(self, parts: _Parts, protected: _ProtectedPaths) -> bool:
         path = self.project_root.joinpath(*parts)
-        return path.name.casefold() in SKIP_NAMES or path in protected
+        name = path.name.casefold()
+        return name in SKIP_NAMES or name == ".env" or name.startswith(".env.") or path in protected
 
     @classmethod
     def _clear(cls, directory: Directory, *, skip: str | None = None) -> None:
