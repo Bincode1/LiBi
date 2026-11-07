@@ -23,6 +23,7 @@
 - Python：3.11+
 - 包管理与运行：优先使用 `uv`
 - 主要入口：交互式 REPL、单次 Prompt、SDK、MCP Server、Runtime API 和后台 Task Worker。
+- 当前产品交互聚焦终端 CLI；SDK、MCP、Runtime API 和 Task Worker 为程序接入与后台执行提供支持。
 
 ## 常用命令
 
@@ -78,8 +79,8 @@ src/paicli/
 └── rag/         本地代码索引与搜索
 ```
 
-代码定位优先使用 `rg`、按需读取具体文件和行段；RAG `search_code` 是语义辅助，不代替精确文本
-搜索。
+代码定位优先使用 `rg`、按需读取具体文件和行段；`search_code` 使用 SQLite 关键词索引，
+不提供向量语义检索。
 
 ## 修改联动规则
 

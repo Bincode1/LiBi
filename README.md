@@ -2,6 +2,8 @@
 
 PaiCLI Python 是一个运行在终端里的 AI Agent CLI，面向真实项目开发场景：读写文件、搜索代码、执行命令、联网检索、调用 MCP 工具、保存记忆、生成快照、恢复现场，并通过 Runtime API 对外提供线程、turn、事件和后台任务能力。
 
+当前仓库以终端 CLI 为产品入口，支持交互式 REPL、单次 Prompt，以及 SDK、MCP 和后台任务接入。
+
 ![](https://cdn.paicoding.com/stutymore/best-city-ai-agent-jd-20260708142704.png)
 
 这个仓库是 PaiCLI 的 Python 版本。它不是一个空壳 Demo，而是按真实 CLI 产品来做：核心路径有测试覆盖，也经过本地 smoke 和真实终端运行验证。
@@ -44,7 +46,7 @@ PaiCLI Python 是一个运行在终端里的 AI Agent CLI，面向真实项目�
 - 静态项目记忆 + SQLite 动态长期记忆，支持元数据、去重、TTL、容量治理和相关性召回
 - 上下文预算与压缩：达到可用输入预算的 80% 后压缩旧轮次，保留近期消息和完整工具调用对
 - 完整 usage、缓存命中/未命中 Token、reasoning Token 和可配置成本估算
-- Agent run 前后自动创建快照，支持恢复现场
+- 首次获准修改工作区前创建快照，支持恢复现场
 - 支持本地图片和远程图片输入，并根据模型能力自动降级
 
 ## 环境要求
@@ -86,6 +88,10 @@ uv run paicli -r
 
 Session ID 可以在 REPL 的 `/context` 输出中查看。指定的 ID 不存在时，CLI 会直接报错，不会自动创建一个新会话。
 
+会话绑定创建时的工作区。`--resume` 只列出当前工作区的会话。升级前未记录工作区的历史仍保存在原数据库，
+确认归属后可用 `uv run paicli --cwd <工作区> --session-id <会话ID> --adopt-session` 绑定并继续；
+绑定也适用于网页工作台。仍处于运行状态的旧会话需先结束原回合。
+
 单次查询：
 
 ```bash
@@ -97,6 +103,10 @@ uv run paicli -p "帮我总结这个项目"
 ```bash
 uv run paicli --mode plan -p "先读取 README，再验证项目" --json
 ```
+
+当 Bug 检查或代码审查没有指定范围时，默认提示会要求模型从改动、入口和测试证据界定范围，
+批量读取独立的线索，在获得有用证据后报告观察和下一步，并在回答里说明验证结果与覆盖范围。
+`read_file` 的带行号文本每次最多返回 50 KiB，另附续读提示。遇到超长单行时返回标明截断的预览。
 
 检查当前环境：
 
@@ -114,6 +124,9 @@ PaiCLI 的配置优先级如下：
 4. 项目级 `.env`
 5. CLI 参数
 6. 当前进程环境变量
+
+配置文件不存在时使用下一层配置；已存在的 JSON 配置若损坏、不是 JSON 对象或无法读取，
+会明确报错。项目 `.env` 的读取错误也会向上传播，不会静默退回默认配置。
 
 可以像 Java 项目一样，把 DeepSeek Key 写到项目 `.env` 里：
 
@@ -233,6 +246,9 @@ PaiCLI 内置了一组 Agent 可以调用的本地工具和联网工具：
 - `revert_turn`
 
 写文件、执行命令、远程 MCP 写操作、恢复快照等危险动作，会经过 policy、HITL 和 audit 处理。
+默认策略下，`write_file` 和 `edit_file` 必须获得审批。Runtime 网页工作台可在异步回合内审批。
+SDK、单次 Prompt 和无人值守的 Runtime 调用缺少审批回调时会拒绝这些操作。审计日志在写入和 `/audit` 展示时都进行脱敏，覆盖字段、
+正文内的常见凭据及当前已知密钥。
 `save_skill` 也必须经过 HITL；模型可以提议沉淀，但不会静默改变后续行为。
 
 交互模式下按 `Shift+Tab` 可在两种会话权限模式间切换：
@@ -240,6 +256,11 @@ PaiCLI 内置了一组 Agent 可以调用的本地工具和联网工具：
 - `Default`：使用启动时的 HITL、工作区路径和命令安全策略。
 - `Auto (full access)`：当前会话内不再请求审批，并关闭路径与命令守卫；再次按
   `Shift+Tab` 会恢复启动时的默认策略。
+
+网页工作台在输入框下方提供“默认审批 / 完全访问”切换。提交消息时固定本轮的审批、路径和
+命令策略。选择完全访问的回合会自动执行工具，并允许访问项目外路径。运行中切换从下一轮
+生效，当前待处理审批仍由用户批准或拒绝。已处理的审批合并到折叠历史中。权限选择按会话
+隔离，新会话和 Runtime 重启后使用默认策略。
 
 ## Skill 匹配与沉淀
 
@@ -267,17 +288,23 @@ Prompt 分为可缓存的静态前缀和逐请求重建的动态后缀。静态�
 
 可用输入预算按 `context_window - max_output_tokens - reserve_tokens` 计算。默认在该预算的 80% 触发压缩，压到 55% 左右，为后续输出、工具结果和无 tokenizer 估算误差留出空间。压缩摘要只属于短期会话，不会自动晋升为长期记忆。
 
+新模型请求对往轮较长的工具正文保留头尾预览，每项最多 2,000 字符。保留用户消息、回答和工具调用配对，当前回合的工具正文照常投影。完整正文仍可从会话事件历史读取，旧请求继续按原有预算参数重放。
+
 ## 模型、Token 与费用
 
 默认 provider/model 是 `deepseek/deepseek-flash`。DeepSeek V4 Flash/Pro 的内置 profile 使用 1M 上下文，并带有截至 2026-07-17 的官方每百万 Token 价格；价格会变化，因此可以用 `llm.context_window` 和 `llm.prices` 覆盖，未知 OpenAI-compatible 模型应显式配置。
 
 流式请求开启 `stream_options.include_usage`，并解析 `choices=[]` 的 usage-only 块、cache hit/miss 和 reasoning Token。REPL 用 `/usage` 查看最近一次普通 ReAct，单次 CLI 用 `--json` 获取完整 usage/cost。成本以供应商返回的实际 Token 为准，不能只用“代码行数”精确推算。
+SSE 支持 LF、CRLF 和 CR 换行。空流、截断的流、流中错误帧及无效 JSON 会记录为协议错误。
+模型服务快速返回 HTTP 500、502、503 或 504 时，最多自动重试一次。从第一次尝试开始计算的重试窗口最长 5 秒，涵盖退避和重试等待响应头。首次请求及已开始的流式响应继续使用配置的模型超时。
 
 ## 联网工具
 
 `web_search` 使用 DuckDuckGo HTML 搜索，返回标题、URL 和摘要。
 
 `web_fetch` 可以抓取公开 HTTP/HTTPS 页面，并做基础正文提取。它会拒绝 `file://`、loopback、私有网络和内网地址，降低 SSRF 风险。
+每次重定向都会重新验证目标，连接固定使用验证通过的公网 IP，同时保留原域名的 Host 和
+TLS 校验。该工具直接连接公网，不读取环境变量中的 HTTP 代理配置。
 
 如果需要登录态、浏览器状态或 JS 渲染页面，建议使用 Chrome DevTools MCP。
 
@@ -312,6 +339,10 @@ uv run paicli mcp init-chrome --scope project
   }
 }
 ```
+
+项目级 MCP 配置默认停用。确认信任该工作区后，可在启动 PaiCLI 的进程环境设置
+`PAICLI_TRUST_PROJECT_MCP=1`。用户级 MCP 配置仍可自动加载，`mcp.auto_start=false` 关闭自动发现。
+stdio 服务只继承 MCP SDK 的基础环境及该服务 `env` 中显式配置的变量。
 
 连接已有 remote-debugging Chrome：
 
@@ -352,20 +383,22 @@ PaiCLI 内置轻量 Runtime API，适合外部系统接入线程、turn、事件
 
 ```bash
 PAICLI_RUNTIME_API_KEY=dev-key \
-uv run paicli serve --http --port 8080
+uv run paicli serve --cwd .
 ```
+
+Runtime 默认监听 `127.0.0.1:24158`。项目配置 `.paicli/config.json` 的 `runtime.port` 可指定固定端口，`--port` 仅用于显式覆盖。端口被占用时启动会报错并退出。前端默认使用 `127.0.0.1:24157`，由 `frontend/vite.config.ts` 配置并代理到 Runtime。
 
 创建会话：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/sessions \
+curl -sS -X POST http://127.0.0.1:24158/v1/sessions \
   -H 'x-api-key: dev-key'
 ```
 
 发送 turn：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
+curl -sS -X POST http://127.0.0.1:24158/v1/sessions/<session_id>/turns \
   -H 'content-type: application/json' \
   -H 'x-api-key: dev-key' \
   -d '{"message":"总结这个项目"}'
@@ -374,19 +407,49 @@ curl -sS -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
 读取事件：
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/sessions/<session_id>/events \
+curl -sS http://127.0.0.1:24158/v1/sessions/<session_id>/events \
   -H 'x-api-key: dev-key'
 ```
+
+轮询接口 `GET /v1/sessions/<session_id>/events.json?cursor=<sequence>` 返回事件与
+`next_cursor`。游标只推进到本次返回的最后一条事件，避免并发写入造成事件遗漏。
+通过 `POST /v1/sessions/<session_id>/turns/async` 启动回合后，轮询响应中的 `assistant_preview`
+提供当前步骤已生成的文本，并附带 `turn_id` 和 `step_id`。预览独立于历史游标，步骤完成后由
+历史中的 `assistant/message` 接管。
+
+异步回合可通过 `POST /v1/sessions/<session_id>/runs/<run_id>/cancel` 请求停止。事件响应的
+提交时先在 SQLite 同一个事务内接收回合并保存用户消息，再返回 `run_id`、与它相同的 `turn_id` 和提交前的 `after_sequence`。客户端可以立即停止回合。同一工作区的 CLI 和 Runtime 共享会话，每个会话同时只接收一个回合。会话不在当前工作区时返回 `404`。事件响应中的 `active_run` 同步运行状态，支持刷新后继续管理。Runtime 正常关闭时先结束已接收的运行，再释放端口。同一工作区、同一端口重启时会收尾中断的回合及待处理审批，把未返回的工具结果标为未知，原会话随后可以继续。
+
+实时客户端可订阅 `GET /v1/sessions/<session_id>/events/stream?cursor=<sequence>`。
+SSE 的 `page` 消息沿用 `events.json` 的数据结构，先重放历史，再推送新事件和文本预览。
+断开后使用最后收到的 `next_cursor` 重连。
+工作台使用 `view=conversation` 只接收会话界面所需的事件。游标覆盖已读取的历史，包括被筛除的诊断事件。
+该视图通过 `subagents` 同步委派任务的状态，通过 `agent/results_received` 标记内部结果投递。
+工作台在主对话显示委派入口，在右侧显示子 agent 的状态和独立执行记录。打开子会话时订阅
+`GET /v1/sessions/<parent_id>/subagents/<child_session_id>/events/stream?cursor=<sequence>`。
+子会话流沿用独立游标，并校验子会话属于当前工作区与指定父会话。子 agent 的审批由主会话提交。
+`subagent` 工具可通过可选的 `role` 为任务指定展示角色，工作台据此选用头像。
+模型请求失败时，`turn/failed` 可带 `provider_error`，提供错误类型和可用的 HTTP 状态码。
+`events.json` 中的 `request/attempt_failed` 按请求记录每次失败的尝试次数、阶段、耗时、
+错误类型、是否重试和可用的 HTTP 状态码、上游请求 ID。重试成功时，之前的失败仍可追溯。
+
+异步回合可传入 `"interactive_approval": true` 启用交互审批。通过事件取得 `approval/started`
+中的 `approval_id` 后，向 `POST /v1/sessions/<session_id>/approvals/<approval_id>/decision`
+提交 `{"decision":"approve"}` 或 `{"decision":"deny"}`。等待超过 5 分钟会取消请求。
+
+通过 `GET /v1/sessions/<session_id>/permissions` 查询会话权限；向同一路径 POST
+`{"mode":"auto"}` 启用完全访问，或 `{"mode":"default"}` 恢复启动策略。事件响应和 SSE
+的 `permission_mode` 同步下一轮选择的模式。当前回合沿用提交时的权限。
 
 创建并查看后台任务：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/tasks \
+curl -sS -X POST http://127.0.0.1:24158/v1/tasks \
   -H 'content-type: application/json' \
   -H 'x-api-key: dev-key' \
   -d '{"message":"后台总结这个仓库","mode":"plan"}'
 
-curl -sS http://127.0.0.1:8080/v1/tasks \
+curl -sS http://127.0.0.1:24158/v1/tasks \
   -H 'x-api-key: dev-key'
 ```
 
@@ -417,12 +480,9 @@ PaiCLI 支持在 prompt 里引用图片：
 
 ## 快照
 
-每次 Agent run 都会尽力创建项目快照：
+回合首次获准执行可能修改工作区的工具前，创建 `pre-turn` 快照。创建失败时，工具会返回错误并停止写入。已经创建前置快照的回合结束后会尽力创建 `post-turn` 快照。只读、拒绝审批和仅预演的回合无需复制工作区。恢复操作会先保存自己的 `pre-restore` 快照。
 
-- `pre-turn`
-- `post-turn`
-
-快照保存在 `~/.paicli/snapshots/`，不会写入项目 `.git`。
+快照保存在 `~/.paicli/snapshots/`，不会写入项目 `.git`。快照仍覆盖工作区中可恢复的普通文件，便于恢复命令和 MCP 工具等写入路径不固定的操作。恢复前校验快照来源，并保留排除目录和现有链接。
 
 REPL 中可以使用：
 
@@ -460,6 +520,11 @@ uv run python -m ruff format --check .
 uv run python -m pytest
 uv build
 ```
+
+测试环境隔离、链路覆盖说明和分组运行方式见 [tests/README.md](tests/README.md)。
+日常快速回归可用 `uv run --extra dev python -m pytest -m "not integration and not slow"`；
+默认 `pytest` 和 CI 仍运行全部测试，合并前需要完整回归。
+完整覆盖率报告可用 `uv run --extra dev python -m pytest --cov --cov-report=html` 生成。
 
 常用 smoke：
 
