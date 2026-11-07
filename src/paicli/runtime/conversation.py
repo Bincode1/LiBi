@@ -34,6 +34,7 @@ class ChildActivity:
     last_delivery: str | None = None
     delivered_at: str | None = None
     terminal: str | None = None
+    terminal_reason: str | None = None
     ended_at: str | None = None
 
 
@@ -85,6 +86,7 @@ class SubagentCatalog:
                         child.delivered_at = event.created_at
                 else:
                     child.terminal = str(payload.get("status") or "unknown")
+                    child.terminal_reason = payload.get("error_code")
                     child.ended_at = event.created_at
 
     def snapshot(
@@ -110,9 +112,16 @@ class SubagentCatalog:
             if session is None:
                 continue
             owner_active = active_parent_turn is not None and child.turn_id == active_parent_turn
-            status = _child_status(child, session.status, owner_active)
+            idle_expired = child.terminal_reason == "CHILD_IDLE_EXPIRED" or (
+                child.terminal == "timed_out"
+                and child.last_delivery == "completed"
+                and session.status == "completed"
+            )
+            status = (
+                "completed" if idle_expired else _child_status(child, session.status, owner_active)
+            )
             updated_at = child.ended_at or session.updated_at
-            if status in {"completed", "idle"} and child.delivered_at:
+            if not idle_expired and status in {"completed", "idle"} and child.delivered_at:
                 updated_at = child.delivered_at
             tool_name = None
             if status == "running":
@@ -140,12 +149,15 @@ class SubagentCatalog:
                     "updated_at": updated_at,
                     "closed": child.terminal is not None,
                     "tool_name": tool_name,
+                    **({"close_reason": "idle_expired"} if idle_expired else {}),
                 }
             )
         return result
 
 
 def _child_status(child: ChildActivity, session_status: str, owner_active: bool) -> str:
+    if child.terminal == "failed" and child.last_delivery == "partial":
+        return "partial"
     if child.terminal == "orphaned":
         return "interrupted"
     if child.terminal in {"canceled", "disposed"}:

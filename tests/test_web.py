@@ -6,7 +6,35 @@ import socket
 import httpx
 import pytest
 
+from paicli.config import PaiCliConfig
+from paicli.tools import get_builtin_tools
+from paicli.tools.base import ToolContext
+from paicli.web.budget import ResearchBudget
 from paicli.web.fetch import NetworkPolicyError, PublicNetworkTransport, fetch_url
+
+
+def test_child_fetches_share_call_and_evidence_budgets(tmp_path, monkeypatch):
+    requested = []
+
+    async def fetch(url, *, max_length):
+        requested.append((url, max_length))
+        await asyncio.sleep(0)
+        return "evidence"[:max_length]
+
+    monkeypatch.setattr("paicli.tools.builtins.fetch_url", fetch)
+    context = ToolContext(str(tmp_path), PaiCliConfig(), research_budget=ResearchBudget(1, 2, 10))
+    tool = next(tool for tool in get_builtin_tools() if tool.name == "web_fetch")
+
+    async def run():
+        return await asyncio.gather(
+            *(tool.execute({"url": f"https://example.test/{i}"}, context) for i in range(4))
+        )
+
+    results = asyncio.run(run())
+    assert len(requested) == 2
+    evidence = [r.content.split("\n", 1)[0] for r in results if not r.is_error]
+    assert evidence == ["evidence", "ev"]
+    assert sum(result.is_error for result in results) == 2
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from paicli.config import PaiCliConfig
+from paicli.web.budget import ResearchBudget
 
 DangerLevel = Literal["safe", "medium", "high"]
 ToolDecision = Literal["approve", "deny", "skip"]
@@ -39,6 +40,7 @@ class ToolContext:
     turn_id: str | None = None
     step_id: str | None = None
     tool_call_id: str | None = None
+    research_budget: ResearchBudget | None = None
 
 
 @dataclass(slots=True)

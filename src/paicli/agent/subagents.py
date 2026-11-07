@@ -13,14 +13,17 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from paicli.agent.events import OutputLimitError
 from paicli.agent.subagent_events import (
     SUBAGENT_ROLES,
     ObservationBuffer,
     public_event,
     subagent_role,
 )
+from paicli.context import CompactionError
 from paicli.policy.redaction import Redactor
 from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
+from paicli.tools.call_parsing import tool_input
 
 
 class ActivationState(StrEnum):
@@ -445,8 +448,12 @@ class SubagentManager:
                 ActivationState.IDLE_WAITING,
             }:
                 return
+            activation.error_code = (
+                "CHILD_IDLE_EXPIRED"
+                if activation.status == ActivationState.IDLE_WAITING
+                else "CHILD_DEADLINE_EXCEEDED"
+            )
             self.transition(activation, ActivationState.STOPPING)
-            activation.error_code = "CHILD_DEADLINE_EXCEEDED"
         await self._interrupt_provider(activation)
         await asyncio.gather(activation.task, return_exceptions=True)
         await self._wait_for_settlement(activation)
@@ -703,6 +710,39 @@ class SubagentManager:
         activation.result_available = True
         activation.delivered = False
 
+    def _recent_research_evidence(self, session_id: str) -> str:
+        if self.session_store is None:
+            return ""
+        try:
+            events = self.session_store.events(
+                session_id, event_types=("turn/failed", "assistant/message", "tool/result")
+            )
+        except (OSError, sqlite3.Error):
+            return ""
+        if not events or events[-1].event_type != "turn/failed":
+            return ""
+        turn_id = events[-1].turn_id
+        evidence = []
+        sources = {}
+        for event in events:
+            if event.turn_id != turn_id:
+                continue
+            if event.event_type == "assistant/message":
+                for call in event.payload.get("tool_calls", []):
+                    if call.get("function", {}).get("name") == "web_fetch":
+                        sources[call.get("id")] = tool_input(call).get("url", "")
+            elif (
+                event.event_type == "tool/result"
+                and event.payload.get("name") in {"web_fetch", "web_search"}
+                and not event.payload.get("is_error")
+            ):
+                content = str(event.payload.get("content") or "").strip()
+                if content:
+                    source = sources.get(event.tool_call_id)
+                    label = f"Web evidence from {source}" if source else "Web evidence"
+                    evidence.append(f"{label}:\n{content[:1500]}")
+        return "\n\n".join(evidence[-4:])
+
     async def _execute_local(
         self,
         agent_id: str,
@@ -873,6 +913,7 @@ class SubagentManager:
         activation = self.activations[agent_id]
         if activation.settled:
             return
+        delivery_status = None
         try:
             result = task.result()
             if isinstance(result, SubagentResult):
@@ -907,6 +948,8 @@ class SubagentManager:
         except asyncio.CancelledError:
             if activation.error_code == "CHILD_DEADLINE_EXCEEDED":
                 activation.result = "Child deadline exceeded."
+            elif activation.error_code == "CHILD_IDLE_EXPIRED":
+                activation.result = "Child lifetime expired while waiting for instructions."
             else:
                 activation.result = "Subagent canceled."
             if activation.status == ActivationState.STOPPING:
@@ -920,19 +963,35 @@ class SubagentManager:
                 self.transition(activation, ActivationState.STOPPING)
             self.transition(activation, ActivationState.TIMED_OUT)
         except Exception as exc:
-            activation.error_code = "CHILD_EXECUTION_FAILED"
+            partial = ""
+            message = self.redactor.exception(exc, "Child execution failed")
+            if activation.status == ActivationState.STOPPING:
+                activation.error_code = activation.error_code or "CHILD_EXECUTION_FAILED"
+            elif isinstance(exc, OutputLimitError):
+                activation.error_code = "MAX_OUTPUT_TOKENS"
+                message = str(exc)
+                partial = exc.partial_text.strip()
+            elif isinstance(exc, CompactionError):
+                activation.error_code = "COMPACTION_FAILED"
+                message = f"Context compaction failed ({exc.code})."
+                partial = self._recent_research_evidence(activation.session_id)
+            else:
+                activation.error_code = "CHILD_EXECUTION_FAILED"
             activation.diagnostic = {
                 "code": activation.error_code,
                 "category": "execution",
-                "message": self.redactor.exception(exc, "Child execution failed"),
+                "message": message,
                 "exception_type": type(exc).__name__,
                 "retryable": False,
             }
-            activation.result = self.redactor.exception(exc, "Child execution failed")
+            activation.result = message
             if activation.status == ActivationState.STOPPING:
                 self.transition(activation, self._stopped_state(activation))
             else:
                 self.transition(activation, ActivationState.FAILED)
+                if partial:
+                    delivery_status = "partial"
+                    activation.result = f"{message}\n\nPartial results:\n{partial}"
         finally:
             if (
                 activation.timeout_task is not None
@@ -976,7 +1035,9 @@ class SubagentManager:
                 ),
             )
         try:
-            self._create_delivery(activation, str(activation.status), activation.result)
+            self._create_delivery(
+                activation, delivery_status or str(activation.status), activation.result
+            )
             self.session_store.append(
                 activation.parent_session_id,
                 "agent/child_completed"
@@ -1334,7 +1395,7 @@ class SubagentManager:
     def _stopped_state(activation: Activation) -> ActivationState:
         if activation.error_code == "CHILD_DEADLINE_EXCEEDED":
             return ActivationState.TIMED_OUT
-        if activation.error_code in {"DISPOSED", "HOST_DRAIN"}:
+        if activation.error_code in {"DISPOSED", "HOST_DRAIN", "CHILD_IDLE_EXPIRED"}:
             return ActivationState.DISPOSED
         return ActivationState.CANCELED
 
@@ -1622,7 +1683,10 @@ def make_subagent_tool():
     return Tool(
         name="subagent",
         description=(
-            "Delegate a self-contained task to a child agent. Returns immediately with its ID."
+            "Delegate a self-contained task to a child agent. Returns immediately with its ID. "
+            "Finished reports arrive automatically between model requests. "
+            "While waiting, do independent work or end this response without tools so the runtime "
+            "can wait for results. Do not poll or sleep for reports."
         ),
         parameters=object_schema(
             {
@@ -1718,7 +1782,7 @@ def make_subagent_control_tools():
     return [
         Tool(
             name="list_agents",
-            description="List the status of your delegated child agents.",
+            description="Inspect child status. Reports are delivered automatically.",
             parameters=object_schema({}),
             handler=list_handler,
         ),

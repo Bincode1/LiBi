@@ -60,8 +60,12 @@ export function subagentStatus(agent: Subagent) {
       return '等待审批'
     case 'idle':
       return '已交付 · 等待指令'
-    case 'completed':
-      return agent.result_count > 1 ? `已完成 · ${agent.result_count} 轮交付` : '已完成'
+    case 'completed': {
+      const result = agent.result_count > 1 ? `已完成 · ${agent.result_count} 轮交付` : '已完成'
+      return agent.close_reason === 'idle_expired' ? `${result} · 空闲到期` : result
+    }
+    case 'partial':
+      return '已部分交付'
     case 'failed':
       return priorResult ? '续跑失败 · 有历史交付' : '失败'
     case 'timed_out':

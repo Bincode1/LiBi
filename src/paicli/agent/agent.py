@@ -23,7 +23,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
-from paicli.agent.events import collect_query_result
+from paicli.agent.events import OutputLimitError, collect_query_result
 from paicli.agent.plan_execute import PlanExecuteAgent
 from paicli.agent.run_controller import RunController
 from paicli.agent.subagents import SubagentManager, make_subagent_control_tools, make_subagent_tool
@@ -62,6 +62,7 @@ from paicli.tools.call_parsing import (
 from paicli.tools.executor import ToolExecutor
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, QueryResult, Usage
+from paicli.web.budget import ResearchBudget
 
 AgentMode = Literal["react", "plan"]
 
@@ -508,6 +509,7 @@ class Agent:
             self.tool_registry,
             audit_log_path=self.config.policy.audit_log_path,
         )
+        subagent_config = self.config.subagents
         context = ToolContext(
             cwd=self.cwd,
             config=self.config,
@@ -526,6 +528,15 @@ class Agent:
             turn_id=turn_id,
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
+            research_budget=(
+                ResearchBudget(
+                    subagent_config.research_max_searches,
+                    subagent_config.research_max_fetches,
+                    subagent_config.research_max_chars,
+                )
+                if self.agent_id != "root"
+                else None
+            ),
             before_workspace_mutation=snapshot.checkpoint_turn,
             status_callback=(lambda event: self.subagent_manager.tool_status(self.agent_id, event))
             if self.subagent_manager is not None
@@ -542,6 +553,16 @@ class Agent:
         ).build_dynamic(original)
 
         effective_system = f"{self.system_prompt}\n\n{dynamic_prompt}".strip()
+        if context.research_budget is not None and (
+            self.tool_registry.get("web_search") or self.tool_registry.get("web_fetch")
+        ):
+            effective_system += (
+                f"\n\nWeb research per turn: at most {subagent_config.research_max_searches} "
+                f"searches, {subagent_config.research_max_fetches} page fetches and "
+                f"{subagent_config.research_max_chars} characters of evidence. "
+                "Use focused queries and summarize the available evidence when a limit is reached. "
+                "Return concise findings with source links and note any gaps."
+            )
         self._log(
             "system/section",
             {
@@ -605,6 +626,23 @@ class Agent:
                 consumed = True
             return consumed
 
+        def consume_child_deliveries(step_id: str) -> bool:
+            deliveries = run_controller.collect_deliveries(defer_ack=True)
+            if not deliveries:
+                return False
+            self._log(
+                "user/message",
+                {
+                    "content": run_controller.format_deliveries(deliveries),
+                    "delivery_ids": [item.delivery_id for item in deliveries],
+                },
+                turn_id=turn_id,
+                step_id=step_id,
+                source="subagent-delivery",
+            )
+            run_controller.acknowledge_deliveries(deliveries)
+            return True
+
         while self.max_turns is None or turn < self.max_turns:
             turn += 1
             text = ""
@@ -646,6 +684,7 @@ class Agent:
                 source="runtime-context",
             )
 
+            consume_child_deliveries(step_id)
             current_events = refresh_context(step_id)
             projection = {
                 "scope": "session",
@@ -934,7 +973,7 @@ class Agent:
                 yield _annotate_event(
                     {
                         "type": "error",
-                        "error": RuntimeError("Model output reached its token limit."),
+                        "error": OutputLimitError(store.redactor.clean(text)),
                     },
                     session_id,
                     turn_id,
@@ -975,20 +1014,7 @@ class Agent:
                     async for event in run_controller.observe_until_settled():
                         if self.subagent_manager.event_callback is None:
                             yield _annotate_event(event, session_id, turn_id, step_id)
-                    deliveries = run_controller.collect_deliveries(defer_ack=True)
-                    if deliveries:
-                        notices = [run_controller.format_delivery(item) for item in deliveries]
-                        self._log(
-                            "user/message",
-                            {
-                                "content": "Child agent results:\n" + "\n".join(notices),
-                                "delivery_ids": [item.delivery_id for item in deliveries],
-                            },
-                            turn_id=turn_id,
-                            step_id=step_id,
-                            source="subagent-delivery",
-                        )
-                        run_controller.acknowledge_deliveries(deliveries)
+                    if consume_child_deliveries(step_id):
                         self.subagent_manager.raise_background_errors()
                         continue
                 if self.subagent_manager is not None:
