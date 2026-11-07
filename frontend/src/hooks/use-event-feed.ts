@@ -8,6 +8,7 @@ import type {
   PermissionMode,
   RuntimeClient,
   RuntimeEvent,
+  Session,
   Source,
   Subagent,
 } from '@/lib/types'
@@ -23,6 +24,7 @@ interface FeedCheckpoint {
   lastSeenRunId?: string
   permissionMode?: PermissionMode
   status: string
+  title?: string | null
   subagents?: Subagent[]
   subagent?: Subagent | null
 }
@@ -72,10 +74,22 @@ export function useEventFeed(
                 lastSeenRunId: page.active_run?.run_id ?? previous?.lastSeenRunId,
                 permissionMode: page.permission_mode,
                 status: page.state.status,
+                title: page.state.title,
                 subagents: page.subagents,
                 subagent: page.subagent,
               }
             })
+            const title = page.state.title
+            if (title && !parentId) {
+              queryClient.setQueryData<Session[]>(['sessions', source], (sessions) => {
+                const current = sessions?.find((item) => item.id === sessionId)
+                if (!current || current.title === title || current.last_sequence > page.next_cursor)
+                  return sessions
+                return sessions?.map((item) =>
+                  item === current ? { ...item, title, last_sequence: page.next_cursor } : item,
+                )
+              })
+            }
             if (!received) setConnection({ key, retry, error: '' })
             received = true
             failures = 0
@@ -98,7 +112,7 @@ export function useEventFeed(
       controller.abort()
       clearTimeout(timer)
     }
-  }, [client, key, queryClient, sessionId, retry, parentId])
+  }, [client, key, queryClient, sessionId, retry, parentId, source])
   const current = connection?.key === key && connection.retry === retry ? connection : null
   const syncing = Boolean(sessionId && !current?.error && (!current || !checkpoint))
   return {
@@ -116,6 +130,7 @@ export function useEventFeed(
         previous ? { ...previous, permissionMode } : previous,
       ),
     status: checkpoint?.status ?? 'idle',
+    title: checkpoint?.title,
     error: current?.error ?? '',
     loading: syncing && !checkpoint,
     syncing,

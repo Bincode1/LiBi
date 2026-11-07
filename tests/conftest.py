@@ -69,6 +69,7 @@ def offline_network(monkeypatch):
 @pytest.fixture
 def config(tmp_path) -> PaiCliConfig:
     config = PaiCliConfig()
+    config.session_title.enabled = False
     config.features.mcp = False
     config.memory.long_term_db_path = str(tmp_path / "memory.db")
     config.policy.audit_log_path = str(tmp_path / "audit.jsonl")

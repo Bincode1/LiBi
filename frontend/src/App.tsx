@@ -20,6 +20,7 @@ import {
   Moon,
   PanelLeftClose,
   PanelRight,
+  Pencil,
   Plus,
   Search,
   Settings2,
@@ -44,7 +45,8 @@ import type { Mode, PermissionMode, Session, Source, Subagent } from '@/lib/type
 
 const navigationDrawer = '(max-width: 950px)'
 const detailsDrawer = '(max-width: 1275px)'
-const sessionTitle = (session: Session) =>
+const maxTitleLength = 60
+const sessionTitle = (session: Pick<Session, 'id' | 'title'>) =>
   session.title || `会话 ${session.id.replace('session_', '').slice(0, 8)}`
 const statusLabel = (status: string) =>
   ({
@@ -70,6 +72,9 @@ export default function App() {
   const [searchTerm, setSearchTerm] = useState(''),
     [details, setDetails] = useState(() => !matchMedia(detailsDrawer).matches),
     [sidebar, setSidebar] = useState(false)
+  const [renameDraft, setRenameDraft] = useState<string | null>(null)
+  const [renaming, setRenaming] = useState(false)
+  const [renameError, setRenameError] = useState('')
   const [mobile, setMobile] = useState(() => matchMedia(navigationDrawer).matches)
   const [detailsTab, setDetailsTab] = useState<DetailsTab>('changes')
   const [agentSelection, setAgentSelection] = useState<{ key: string; path: Subagent[] }>()
@@ -167,8 +172,19 @@ export default function App() {
     source === 'live' && feed.status === 'running' && !runId && (!pending || pendingFinished)
   const busy = Boolean(runId || feed.status === 'running' || (pending && !pendingFinished))
   const stopping = activeRun?.status === 'canceling' || Boolean(runId && cancelRequested === runId)
-  const current = sessions.data?.find((s) => s.id === id)
-  const title = current ? sessionTitle(current) : '新会话'
+  const visibleSessions = useMemo(
+    () =>
+      (sessions.data ?? []).map((session) =>
+        session.id === id && feed.title && feed.cursor >= session.last_sequence
+          ? { ...session, title: feed.title }
+          : session,
+      ),
+    [sessions.data, id, feed.title, feed.cursor],
+  )
+  const current = visibleSessions.find((session) => session.id === id)
+  const title = id ? sessionTitle(current ?? { id, title: feed.title }) : '新会话'
+  const editedTitle = renameDraft?.trim().replace(/\s+/g, ' ') ?? ''
+  const titleTooLong = [...editedTitle].length > maxTitleLength
   const visibleTool = tool
     ? (turns.flatMap((t) => t.tools).find((t) => t.id === tool.id) ?? tool)
     : null
@@ -195,6 +211,7 @@ export default function App() {
   useEffect(() => {
     setTool(null)
     setAgentSelection(undefined)
+    setRenameDraft(null)
     setNearBottom(true)
     scrollRef.current?.scrollTo({ top: 0 })
   }, [id, source])
@@ -243,6 +260,20 @@ export default function App() {
     navigate(`/sessions/${encodeURIComponent(sessionId)}`)
     setSidebar(false)
     setSearch(false)
+  }
+  const renameSession = async () => {
+    if (!id || !editedTitle || titleTooLong || renaming) return
+    setRenaming(true)
+    setRenameError('')
+    try {
+      await client.renameSession(id, editedTitle)
+      await sessions.refetch()
+      setRenameDraft(null)
+    } catch (error) {
+      setRenameError(errorMessage(error))
+    } finally {
+      setRenaming(false)
+    }
   }
   const switchSource = (next: Source) => {
     if (submitting) return
@@ -359,7 +390,7 @@ export default function App() {
       setSubmitting(false)
     }
   }
-  const grouped = (sessions.data ?? []).reduce<Record<string, Session[]>>((groups, session) => {
+  const grouped = visibleSessions.reduce<Record<string, Session[]>>((groups, session) => {
     const today = new Date().toDateString(),
       yesterday = new Date(Date.now() - 86400000).toDateString(),
       date = new Date(session.updated_at).toDateString()
@@ -501,7 +532,24 @@ export default function App() {
             </Button>
             <span className="breadcrumb-project">{project}</span>
             <span className="breadcrumb-slash">/</span>
-            <span className="breadcrumb-title">{id ? title : '新会话'}</span>
+            <span className="breadcrumb-title" title={title}>
+              {title}
+            </span>
+            {id && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="rename-session"
+                aria-label="重命名会话"
+                title="重命名会话"
+                onClick={() => {
+                  setRenameError('')
+                  setRenameDraft(current?.title ?? feed.title ?? '')
+                }}
+              >
+                <Pencil size={13} aria-hidden="true" />
+              </Button>
+            )}
           </div>
           <div className="topbar-actions">
             <button
@@ -728,6 +776,48 @@ export default function App() {
         </div>
       )}
       <Dialog
+        open={renameDraft !== null}
+        onOpenChange={(open) => {
+          if (!open && !renaming) setRenameDraft(null)
+        }}
+        title="重命名会话"
+        description="顶部、侧栏和搜索结果会显示这个名称。"
+      >
+        <form
+          className="session-title-form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void renameSession()
+          }}
+        >
+          <input
+            value={renameDraft ?? ''}
+            onChange={(event) => {
+              setRenameError('')
+              setRenameDraft(event.target.value)
+            }}
+            disabled={renaming}
+            aria-label="会话名称"
+            aria-invalid={titleTooLong}
+            aria-describedby={titleTooLong ? 'session-title-limit' : undefined}
+            placeholder="输入会话名称"
+          />
+          <Button size="sm" disabled={renaming || !editedTitle || titleTooLong}>
+            {renaming ? '保存中…' : '保存'}
+          </Button>
+        </form>
+        {titleTooLong && (
+          <p className="inline-failure" id="session-title-limit">
+            会话名称最多 {maxTitleLength} 个字符。
+          </p>
+        )}
+        {renameError && (
+          <p className="inline-failure" role="alert">
+            {renameError}
+          </p>
+        )}
+      </Dialog>
+      <Dialog
         open={settings}
         onOpenChange={setSettings}
         title="让工作台连接你的 Agent"
@@ -823,7 +913,7 @@ export default function App() {
           <kbd>ESC</kbd>
         </div>
         <div className="search-results">
-          {(sessions.data ?? [])
+          {visibleSessions
             .filter((s) =>
               `${sessionTitle(s)} ${s.id}`.toLowerCase().includes(searchTerm.toLowerCase()),
             )
@@ -834,7 +924,7 @@ export default function App() {
                 <ArrowRight size={14} />
               </button>
             ))}
-          {!(sessions.data ?? []).some((s) =>
+          {!visibleSessions.some((s) =>
             `${sessionTitle(s)} ${s.id}`.toLowerCase().includes(searchTerm.toLowerCase()),
           ) && <p>没有找到匹配的会话。</p>}
         </div>

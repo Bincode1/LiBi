@@ -113,7 +113,7 @@ function append(
   const session = sessions.find((s) => s.id === id)
   if (session) {
     session.last_sequence = event.sequence
-    session.updated_at = now()
+    if (type !== 'session/title_updated') session.updated_at = now()
     if (type === 'turn/started') session.status = 'running'
     if (['turn/completed', 'turn/canceled', 'turn/failed'].includes(type))
       session.status = type.split('/')[1]
@@ -123,11 +123,12 @@ function append(
 
 function eventPage(id: string, cursor: number): EventPage {
   const events = logs.get(id) ?? []
+  const session = sessions.find((item) => item.id === id)
   return {
     session_id: id,
     events: events.slice(cursor),
     next_cursor: Math.max(events.length, cursor),
-    state: { status: sessions.find((session) => session.id === id)?.status ?? 'idle' },
+    state: { status: session?.status ?? 'idle', title: session?.title },
     permission_mode: permissionModes.get(id) ?? 'default',
   }
 }
@@ -223,6 +224,13 @@ export const demoClient: RuntimeClient = {
     }
     sessions.unshift(session)
     return { ...session }
+  },
+  renameSession: async (id, title) => {
+    const session = sessions.find((item) => item.id === id)
+    if (!session) throw new Error('演示会话不存在。')
+    session.title = title
+    append(id, 'session/title_updated', { title }, undefined, { turn_id: null, step_id: null })
+    return { title }
   },
   events: async (id, cursor) => eventPage(id, cursor),
   subscribe: (id, cursor, signal, receive) =>

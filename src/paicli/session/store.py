@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from paicli.policy.redaction import Redactor
-from paicli.session.models import CompactionLease, SessionEvent, SessionState, SessionSummary
+from paicli.session.models import (
+    MAX_SESSION_TITLE_LENGTH,
+    CompactionLease,
+    SessionEvent,
+    SessionState,
+    SessionSummary,
+)
 
 
 def default_runtime_db_path() -> Path:
@@ -32,6 +38,7 @@ _MODEL_VISIBLE_EVENTS = {
     "compaction/failed",
 }
 _STATE_EVENT_TYPES = (
+    "session/title_updated",
     "turn/started",
     "turn/completed",
     "turn/failed",
@@ -258,6 +265,62 @@ class SessionStore:
             ).fetchone()
         return row is not None
 
+    def claim_session_title(self, session_id: str, turn_id: str) -> bool:
+        """Reserve one automatic title attempt for the first real input."""
+        with closing(self._connect()) as conn, conn:
+            conn.execute("begin immediate")
+            self._session_row(conn, session_id)
+            cursor = conn.execute(
+                """
+                update sessions set title_generation_claimed = 1
+                where id = ? and kind = 'root' and title is null and title_generation_claimed = 0
+                  and ? = (
+                    select turn_id from events
+                    where session_id = ? and type = 'user/message'
+                      and coalesce(source, '') not in ('subagent-delivery', 'subagent-steer')
+                      and coalesce(source, '') not like 'child:%'
+                    order by sequence limit 1
+                  )
+                """,
+                (session_id, turn_id, session_id),
+            )
+            return cursor.rowcount == 1
+
+    def set_session_title(
+        self, session_id: str, title: str, *, generated: bool = False
+    ) -> str | None:
+        if not isinstance(title, str):
+            raise ValueError("title must be a string")
+        title = " ".join(title.split())
+        if not 1 <= len(title) <= MAX_SESSION_TITLE_LENGTH:
+            raise ValueError(f"title must be 1 to {MAX_SESSION_TITLE_LENGTH} characters")
+        title = self.sanitize_payload({"title": title})["title"][:MAX_SESSION_TITLE_LENGTH].rstrip()
+        with closing(self._connect()) as conn, conn:
+            conn.execute("begin immediate")
+            self._session_row(conn, session_id)
+            current = conn.execute(
+                "select title from sessions where id = ? and kind = 'root'", (session_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError("title requires a root session")
+            if generated and current[0] is not None:
+                return None
+            if current[0] == title:
+                return title
+            conn.execute("update sessions set title = ? where id = ?", (title, session_id))
+            self._insert_event_tx(
+                conn,
+                session_id,
+                "session/title_updated",
+                json.dumps({"title": title}, ensure_ascii=False),
+                _now(),
+                turn_id=None,
+                step_id=None,
+                source="title-generator" if generated else "runtime",
+            )
+        self._notify_append(session_id)
+        return title
+
     def last_sequence(self, session_id: str) -> int:
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -288,7 +351,8 @@ class SessionStore:
                 params.append(self.workspace)
             where = "where " + " and ".join(filters) if filters else ""
             rows = conn.execute(
-                "select id, created_at, updated_at, last_sequence, status, kind, parent_session_id "
+                "select id, created_at, updated_at, last_sequence, status, kind, "
+                "parent_session_id, title "
                 f"from sessions {where} order by updated_at desc, id desc limit ?",
                 (*params, limit if limit is not None else -1),
             ).fetchall()
@@ -302,6 +366,7 @@ class SessionStore:
                 last_sequence=int(last_sequence or 0),
                 kind=str(kind or "root"),
                 parent_session_id=str(parent_session_id) if parent_session_id else None,
+                title=self.redactor.clean(title) if title is not None else None,
             )
             for (
                 session_id,
@@ -311,6 +376,7 @@ class SessionStore:
                 status,
                 kind,
                 parent_session_id,
+                title,
             ) in rows
         ]
 
@@ -459,7 +525,14 @@ class SessionStore:
                     (session_id,),
                 ).fetchone()[0]
             )
-            if current_sequence != base_sequence:
+            if current_sequence < base_sequence or (
+                current_sequence > base_sequence
+                and conn.execute(
+                    "select 1 from events where session_id = ? and sequence > ? "
+                    "and type != 'session/title_updated' limit 1",
+                    (session_id, base_sequence),
+                ).fetchone()
+            ):
                 raise RuntimeError("session history changed before compaction lease acquisition")
             row = conn.execute(
                 "select owner_token, expires_at from session_leases where session_id = ?",
@@ -890,8 +963,11 @@ class SessionStore:
         step_id = state.active_step_id
         status = state.status
         compaction_id = state.latest_compaction_id
+        title = state.title
         for event in events:
-            if event.event_type == "turn/started":
+            if event.event_type == "session/title_updated":
+                title = event.payload["title"]
+            elif event.event_type == "turn/started":
                 turn_id, status = event.turn_id, "running"
             elif event.event_type in {"turn/completed", "turn/failed", "turn/canceled"}:
                 turn_id, step_id, status = None, None, event.event_type.split("/", 1)[1]
@@ -908,6 +984,7 @@ class SessionStore:
             active_turn_id=turn_id,
             active_step_id=step_id,
             latest_compaction_id=compaction_id,
+            title=title,
         )
 
     def sanitize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -979,14 +1056,15 @@ class SessionStore:
             ),
         )
         conn.execute(
-            "update sessions set updated_at = ?, last_sequence = ?, "
+            "update sessions set updated_at = case ? when 'session/title_updated' "
+            "then updated_at else ? end, last_sequence = ?, "
             "status = case ? "
             "when 'turn/started' then 'running' "
             "when 'turn/completed' then 'completed' "
             "when 'turn/failed' then 'failed' "
             "when 'turn/canceled' then 'canceled' "
             "else coalesce(status, 'created') end where id = ?",
-            (created_at, sequence, event_type, session_id),
+            (event_type, created_at, sequence, event_type, session_id),
         )
         return event_id, sequence
 
@@ -1012,6 +1090,8 @@ class SessionStore:
                 "kind": "text",
                 "parent_session_id": "text",
                 "workspace": "text",
+                "title": "text",
+                "title_generation_claimed": "integer not null default 0",
             }
             for column, column_type in session_additions.items():
                 if column not in session_columns:
@@ -1120,7 +1200,8 @@ class SessionStore:
                 conn.execute(
                     "with event_stats as ("
                     "  select session_id, max(sequence) as last_sequence, "
-                    "         max(created_at) as updated_at "
+                    "         max(case when type != 'session/title_updated' then created_at end) "
+                    "           as updated_at "
                     "  from events group by session_id"
                     "), last_events as ("
                     "  select e.session_id, e.type from events e join event_stats s "

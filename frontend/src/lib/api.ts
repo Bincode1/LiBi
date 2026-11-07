@@ -51,6 +51,7 @@ export const liveClient: RuntimeClient = {
       last_sequence: 0,
     }
   },
+  renameSession: (id, title) => post(`${sid(id)}/title`, { title }),
   events: (id, cursor, signal) =>
     request<EventPage>(`${sid(id)}/events.json?cursor=${cursor}`, { signal }),
   subscribe: (id, cursor, signal, receive, parentId) =>

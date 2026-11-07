@@ -28,6 +28,7 @@ _MODEL_CONTEXT_EVENTS = _MODEL_MESSAGE_EVENTS | {
 _MODEL_EVENT_PREFIXES = {"user", "assistant", "tool", "system", "developer"}
 _KNOWN_EVENTS = {
     "session/created",
+    "session/title_updated",
     "turn/started",
     "turn/completed",
     "turn/failed",

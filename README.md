@@ -424,6 +424,11 @@ curl -sS http://127.0.0.1:24158/v1/sessions/<session_id>/events \
 SSE 的 `page` 消息沿用 `events.json` 的数据结构，先重放历史，再推送新事件和文本预览。
 断开后使用最后收到的 `next_cursor` 重连。
 工作台使用 `view=conversation` 只接收会话界面所需的事件。游标覆盖已读取的历史，包括被筛除的诊断事件。
+会话列表和事件状态包含 `title`。使用 `POST /v1/sessions/<session_id>/title` 和
+`{"title":"新名称"}` 手动改名，事件流会同步 `session/title_updated`。
+Runtime 接收新会话的第一条用户消息后，在后台只尝试生成一次标题。生成失败时会话仍可手动命名。
+配置示例为 `{"session_title":{"model":"deepseek-flash"}}`。留空会沿用 `llm.model`，连接配置沿用
+主模型。DeepSeek 标题请求固定关闭思考。可用 `session_title.enabled=false` 关闭自动生成。
 该视图通过 `subagents` 同步委派任务的状态，通过 `agent/results_received` 标记内部结果投递。
 工作台在主对话显示委派入口，在右侧显示子 agent 的状态和独立执行记录。打开子会话时订阅
 `GET /v1/sessions/<parent_id>/subagents/<child_session_id>/events/stream?cursor=<sequence>`。

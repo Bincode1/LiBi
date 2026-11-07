@@ -1003,6 +1003,83 @@ def _is_stopped(page):
     )
 
 
+@pytest.mark.parametrize("outcome", ["auto", "manual", "error"])
+def test_session_title_runs_once_without_blocking_or_overwriting_manual_name(
+    runtime_http, monkeypatch, outcome
+):
+    runtime, client = runtime_http
+    runtime.config.session_title.enabled = True
+    runtime.config.session_title.model = "title-model" if outcome != "error" else ""
+    runtime.config.llm.thinking_enabled = True
+    title_started = threading.Event()
+    release_title = threading.Event()
+    title_requests = []
+
+    async def respond(_transport, request):
+        body = json.loads(request.content)
+        system = body["messages"][0]["content"]
+        if system.startswith("Write a short chat title"):
+            title_requests.append(body)
+            title_started.set()
+            assert await asyncio.to_thread(release_title.wait, 5)
+            if outcome == "error":
+                return httpx.Response(503)
+            text = "“检查目录结构”"
+        else:
+            assert body["thinking"] == {"type": "enabled"}
+            text = "Main reply"
+        chunk = {"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]}
+        return httpx.Response(200, content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", respond)
+    session_id = client.post("/v1/sessions").json()["id"]
+    base = f"/v1/sessions/{session_id}"
+    assert client.get("/v1/sessions").json()["sessions"][0]["title"] is None
+    for route in ("turns", "turns/async"):
+        assert client.post(f"{base}/{route}", json={"message": "  \t "}).status_code == 400
+    try:
+        first = client.post(f"{base}/turns/async", json={"message": "请检查这个目录"})
+        assert first.status_code == 202
+        assert title_started.wait(3)
+        _wait_for_session_page(
+            client,
+            base,
+            lambda page: page["state"]["status"] == "completed" and not page["active_run"],
+        )
+        second = client.post(f"{base}/turns", json={"message": "再检查一次"})
+        assert second.json()["text"] == "Main reply"
+        if outcome == "manual":
+            assert client.post(f"{base}/title", json={"title": " "}).status_code == 400
+            renamed = client.post(f"{base}/title", json={"title": "  我自己的名称  "})
+            assert renamed.json() == {"title": "我自己的名称"}
+    finally:
+        release_title.set()
+        runtime._title_executor.shutdown(wait=True)
+
+    assert len(title_requests) == 1
+    request = title_requests[0]
+    assert request["model"] == ("title-model" if outcome != "error" else runtime.config.llm.model)
+    assert request["thinking"] == {"type": "disabled"}
+    assert "tools" not in request
+    assert request["messages"][1:] == [{"role": "user", "content": "请检查这个目录"}]
+
+    title = {"auto": "检查目录结构", "manual": "我自己的名称", "error": None}[outcome]
+    page = client.get(f"{base}/events.json").json()
+    assert page["state"]["title"] == title
+    assert client.get("/v1/sessions").json()["sessions"][0]["title"] == title
+    with client.stream(
+        "GET",
+        f"{base}/events/stream",
+        params={"view": "conversation", "cursor": page["next_cursor"]},
+    ) as opened:
+        replay = next(_event_stream_pages(opened))
+    assert replay["events"] == []
+    assert replay["state"]["title"] == title
+
+    reopened = SessionStore(runtime.db_path, workspace=runtime.cwd)
+    assert not reopened.claim_session_title(session_id, first.json()["turn_id"])
+
+
 def test_http_session_permission_mode_is_scoped_and_validated(runtime_http):
     runtime, client = runtime_http
     sid = client.post("/v1/sessions").json()["id"]

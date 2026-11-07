@@ -7,7 +7,7 @@ export interface Session {
   updated_at: string
   status: string
   last_sequence: number
-  title?: string
+  title?: string | null
 }
 export interface RuntimeEvent {
   id: string
@@ -50,7 +50,7 @@ export interface EventPage {
   session_id: string
   events: RuntimeEvent[]
   next_cursor: number
-  state: { status: string; active_turn_id?: string | null }
+  state: { status: string; active_turn_id?: string | null; title?: string | null }
   active_run?: ActiveRun | null
   permission_mode?: PermissionMode
   assistant_preview?: AssistantPreview | null
@@ -84,6 +84,7 @@ export interface RuntimeClient {
   health(signal?: AbortSignal): Promise<{ status: string; cwd: string }>
   sessions(signal?: AbortSignal): Promise<Session[]>
   createSession(): Promise<Session>
+  renameSession(id: string, title: string): Promise<{ title: string }>
   events(id: string, cursor: number, signal?: AbortSignal): Promise<EventPage>
   subscribe(
     id: string,

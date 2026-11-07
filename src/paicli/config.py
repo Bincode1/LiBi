@@ -131,6 +131,17 @@ class RuntimeConfig:
 
 
 @dataclass(slots=True)
+class SessionTitleConfig:
+    model: str = ""
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model, str) or type(self.enabled) is not bool:
+            raise ValueError("session_title requires a string model and a boolean enabled value")
+        self.model = self.model.strip()
+
+
+@dataclass(slots=True)
 class PaiCliConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     render_mode: str = "inline"
@@ -143,6 +154,7 @@ class PaiCliConfig:
     prompt: PromptConfig = field(default_factory=PromptConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    session_title: SessionTitleConfig = field(default_factory=SessionTitleConfig)
 
 
 def load_config(
@@ -354,6 +366,7 @@ def _dict_to_config(data: dict[str, Any]) -> PaiCliConfig:
         prompt=PromptConfig(**data.get("prompt", {})),
         features=FeatureConfig(**data.get("features", {})),
         runtime=RuntimeConfig(**data.get("runtime", {})),
+        session_title=SessionTitleConfig(**data.get("session_title", {})),
     )
 
 

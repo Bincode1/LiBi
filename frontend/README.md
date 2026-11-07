@@ -33,6 +33,7 @@ pnpm dev
 | --- | --- |
 | 健康状态 | `GET /v1/health` |
 | 列出、创建会话 | `GET / POST /v1/sessions` |
+| 会话标题 | 首条消息触发一次后台生成，顶部的铅笔按钮可手动改名。标题通过 SSE 同步 |
 | 历史与运行事件 | `GET /v1/sessions/{id}/events/stream?cursor=N&view=conversation`，SSE 推送会话界面所需的历史和更新 |
 | 异步执行 | `POST /v1/sessions/{id}/turns/async`，提交 message 和 react/plan mode |
 | 后台任务 | `GET / POST /v1/tasks`，`POST /v1/tasks/{id}/cancel` |
@@ -44,7 +45,8 @@ pnpm dev
 | 文件 diff、结构化计划 | 待后端提供，真实模式明确显示待接入 |
 | 模型选择 | 使用 Runtime 默认模型，不显示虚假的可选模型 |
 
-真实模式的列表按 Runtime 的工作区过滤，前端使用缩短的会话 ID 作标题。同一会话有运行中的回合时，再次提交返回 409。
+真实模式的列表按 Runtime 的工作区过滤。尚无标题的会话使用缩短的会话 ID，手动命名优先于自动生成。
+同一会话有运行中的回合时，再次提交返回 409。
 
 ## 后端接口预留约定
 

@@ -257,3 +257,13 @@ def test_compaction_lease_rejects_stale_history(session_store):
         session_store.acquire_compaction_lease(
             sid, attempt_id="old", base_sequence=0, surface_hash="old-surface"
         )
+
+
+def test_renaming_does_not_invalidate_compaction_history(session_store):
+    sid = session_store.create_session()
+    message = session_store.append(sid, "user/message", {"content": "old"})
+    session_store.set_session_title(sid, "My title")
+    lease = session_store.acquire_compaction_lease(
+        sid, attempt_id="attempt", base_sequence=message.sequence, surface_hash="surface"
+    )
+    assert lease.base_sequence == message.sequence

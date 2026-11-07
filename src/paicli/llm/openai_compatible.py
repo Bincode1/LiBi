@@ -65,6 +65,7 @@ class OpenAICompatibleClient:
         tools: list[dict[str, Any]],
         *,
         system_prompt: str,
+        retry_transient_errors: bool = True,
     ) -> AsyncIterator[dict[str, Any]]:
         if not self.api_key:
             yield {
@@ -88,7 +89,7 @@ class OpenAICompatibleClient:
         yield {"type": "message_start", "model": self.model}
         async with httpx.AsyncClient(timeout=self.timeout, http2=False) as client:
             retry_deadline = monotonic() + min(self.timeout, _PROVIDER_RETRY_WINDOW)
-            for attempt in (1, 2):
+            for attempt in (1, 2) if retry_transient_errors else (1,):
                 started = monotonic()
                 stage = "response_headers"
                 upstream_id = None
@@ -115,7 +116,8 @@ class OpenAICompatibleClient:
                     if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
                         stage = "connect"
                     retryable = (
-                        attempt == 1
+                        retry_transient_errors
+                        and attempt == 1
                         and error.details.get("status_code") in _RETRYABLE_HTTP_STATUSES
                     )
                     failed_at = monotonic()

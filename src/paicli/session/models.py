@@ -5,6 +5,8 @@ from typing import Any
 
 from paicli.types import Message
 
+MAX_SESSION_TITLE_LENGTH = 60
+
 MessageSource = dict[str, list[object]]
 
 
@@ -32,6 +34,7 @@ class SessionState:
     active_turn_id: str | None = None
     active_step_id: str | None = None
     latest_compaction_id: str | None = None
+    title: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -44,6 +47,7 @@ class SessionSummary:
     kind: str = "root"
     parent_session_id: str | None = None
     latest_user_message: str | None = None
+    title: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

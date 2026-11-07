@@ -8,7 +8,7 @@ import re
 import socket
 import threading
 import uuid
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import aclosing
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
@@ -26,6 +26,7 @@ from paicli.llm import create_llm_client
 from paicli.policy.permission_mode import PermissionMode, PermissionModeController
 from paicli.runtime.conversation import SUBAGENT_STATE_EVENTS, SubagentCatalog, conversation_event
 from paicli.runtime.tasks import TASK_MODES, DurableTaskManager, TaskRecord
+from paicli.runtime.titles import generate_session_title
 from paicli.session import (
     SessionEvent,
     SessionState,
@@ -45,6 +46,7 @@ _STREAM_HISTORY_INTERVAL = 1.0
 _STREAM_HEARTBEAT_INTERVAL = 10.0
 _CONVERSATION_EVENT_TYPES = (
     "session/created",
+    "session/title_updated",
     "turn/started",
     "turn/completed",
     "turn/failed",
@@ -114,6 +116,7 @@ class RuntimeApiServer:
         )
         self.workers = workers
         self._stop = threading.Event()
+        self._title_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="paicli-title")
         self._background_turns: dict[str, dict[str, Any]] = {}
         self._background_turns_lock = threading.Condition(threading.Lock())
         self._active_turn_sessions: dict[str, str | None] = {}
@@ -177,6 +180,7 @@ class RuntimeApiServer:
                 self._cancel_background_turn(session_id, run_id)
         with self._background_turns_lock:
             self._background_turns_lock.wait_for(lambda: not self._active_turn_sessions)
+        self._title_executor.shutdown(wait=False, cancel_futures=True)
 
     def work_forever(self) -> None:
         self._start_workers()
@@ -222,6 +226,11 @@ class RuntimeApiServer:
                 _send_json(request, 200, {"sessions": self._list_sessions()})
             elif request.command == "GET" and path == "/v1/health":
                 _send_json(request, 200, {"status": "ok", "cwd": self.cwd})
+            elif request.command == "POST" and _matches_session_route(path, "/title"):
+                title = self.session_store.set_session_title(
+                    _session_id_from_path(path), body.get("title")
+                )
+                _send_json(request, 200, {"title": title})
             elif request.command in {"GET", "POST"} and _matches_session_route(
                 path, "/permissions"
             ):
@@ -237,7 +246,7 @@ class RuntimeApiServer:
             elif request.command == "POST" and _matches_session_route(path, "/turns"):
                 session_id = _session_id_from_path(path)
                 message = str(body.get("message") or body.get("prompt") or "")
-                if not message:
+                if not message.strip():
                     _send_json(request, 400, {"error": "message is required"})
                     return
                 mode = _mode_from_body(body)
@@ -253,7 +262,7 @@ class RuntimeApiServer:
             elif request.command == "POST" and _matches_session_route(path, "/turns/async"):
                 session_id = _session_id_from_path(path)
                 message = str(body.get("message") or body.get("prompt") or "")
-                if not message:
+                if not message.strip():
                     _send_json(request, 400, {"error": "message is required"})
                     return
                 mode = _mode_from_body(body)
@@ -362,6 +371,7 @@ class RuntimeApiServer:
         if turn_id is None:
             turn_id = f"turn_{uuid.uuid4().hex}"
             self.session_store.start_turn(session_id, turn_id, mode=mode, message=message)
+            self._schedule_session_title(session_id, turn_id, message, config)
         engine: QueryEngine | None = None
         text = ""
         total_tokens = 0
@@ -518,8 +528,35 @@ class RuntimeApiServer:
                     del self._background_turns[run_id]
                     self._release_turn_locked(session_id)
             raise
+        self._schedule_session_title(session_id, run_id, message, config)
         self._wake_event_streams(session_id)
         return run_id, after_sequence
+
+    def _schedule_session_title(
+        self, session_id: str, turn_id: str, message: str, config: PaiCliConfig
+    ) -> None:
+        if not config.session_title.enabled or not message.strip() or self._stop.is_set():
+            return
+        try:
+            if self.session_store.claim_session_title(session_id, turn_id):
+                prompt = self.session_store.sanitize_payload({"content": message})["content"]
+                self._title_executor.submit(
+                    self._generate_session_title, session_id, prompt, config
+                )
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Session title scheduling failed: %s", type(exc).__name__
+            )
+
+    def _generate_session_title(self, session_id: str, message: str, config: PaiCliConfig) -> None:
+        try:
+            title = asyncio.run(generate_session_title(config, message))
+            if title:
+                self.session_store.set_session_title(session_id, title, generated=True)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Session title generation failed: %s", type(exc).__name__
+            )
 
     def _reserve_turn(self, session_id: str, run_id: str | None = None) -> PaiCliConfig:
         with self._background_turns_lock:
@@ -653,6 +690,7 @@ class RuntimeApiServer:
                 "updated_at": item.updated_at,
                 "status": item.status,
                 "last_sequence": item.last_sequence,
+                "title": item.title,
             }
             for item in self.session_store.list_sessions(limit=100)
         ]

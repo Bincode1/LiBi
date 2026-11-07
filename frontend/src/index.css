@@ -482,6 +482,12 @@ kbd {
   white-space: nowrap;
   color: var(--secondary);
 }
+.topbar-leading .rename-session {
+  flex: none;
+  width: 27px;
+  height: 27px;
+  color: var(--muted);
+}
 .topbar-actions {
   flex-shrink: 0;
   gap: 13px;
@@ -1810,11 +1816,13 @@ kbd {
   text-align: center;
   padding: 20px;
 }
-.task-form {
+.task-form,
+.session-title-form {
   display: flex;
   gap: 8px;
 }
-.task-form input {
+.task-form input,
+.session-title-form input {
   flex: 1;
   min-width: 0;
   background: var(--surface);
