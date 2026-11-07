@@ -11,15 +11,23 @@ def test_compaction_retains_complete_tool_batch():
         Message(role="user", content="old request"),
         Message(role="assistant", content="old answer"),
         Message(role="user", content="read file"),
-        Message(role="assistant", content="", tool_calls=[{
-            "id": "call-1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}
-        }]),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        ),
         Message(role="tool", content="result", tool_call_id="call-1"),
         Message(role="assistant", content="answer"),
     ]
-    plan = CompactionPlanner(CompactionPolicy(
-        10_000, 100, min_recent_messages=3
-    )).plan(messages, force=True)
+    plan = CompactionPlanner(CompactionPolicy(10_000, 100, min_recent_messages=3)).plan(
+        messages, force=True
+    )
     assert plan.has_selection
     assert plan.retained_messages[0].role == "assistant"
     assert plan.retained_messages[0].tool_calls[0]["id"] == "call-1"

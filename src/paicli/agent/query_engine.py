@@ -22,6 +22,7 @@ class QueryEngine:
         config: PaiCliConfig,
         cwd: str,
         approval_callback=None,
+        child_preview_callback=None,
         session_store: SessionStore | None = None,
         session_id: str | None = None,
     ):
@@ -30,6 +31,7 @@ class QueryEngine:
         self.config = config
         self.cwd = cwd
         self.approval_callback = approval_callback
+        self.child_preview_callback = child_preview_callback
         self.session_store = session_store
         self.session_id = (
             session_store.create_session(session_id) if session_store is not None else session_id
@@ -46,7 +48,7 @@ class QueryEngine:
         self._react_loop: asyncio.AbstractEventLoop | None = None
         self._running = False
 
-    async def ask(self, message: str):
+    async def ask(self, message: str, *, turn_id: str | None = None):
         if self._running:
             raise RuntimeError("QueryEngine already has an active request.")
         loop = asyncio.get_running_loop()
@@ -67,12 +69,16 @@ class QueryEngine:
                 session_store=self.session_store,
                 session_id=self.session_id,
             )
+            if self._react_agent.subagent_manager is not None:
+                self._react_agent.subagent_manager.child_preview_callback = (
+                    self.child_preview_callback
+                )
             self._react_loop = loop
         agent = self._react_agent
         self._last_agent = agent
         self._running = True
         try:
-            async with aclosing(agent.run(message)) as events:
+            async with aclosing(agent.run(message, turn_id=turn_id)) as events:
                 async for event in events:
                     yield event
         finally:
@@ -102,7 +108,7 @@ class QueryEngine:
         finally:
             await self.aclose()
 
-    async def plan(self, message: str):
+    async def plan(self, message: str, *, turn_id: str | None = None):
         agent = Agent(
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
@@ -116,7 +122,7 @@ class QueryEngine:
         self._last_agent = agent
         self.session_store = agent.session_store
         self.session_id = agent.session_id
-        async with aclosing(agent.run(message)) as events:
+        async with aclosing(agent.run(message, turn_id=turn_id)) as events:
             async for event in events:
                 yield event
         self.session_store = agent.session_store

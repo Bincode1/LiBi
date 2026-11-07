@@ -11,7 +11,7 @@ from paicli.session.models import (
 )
 from paicli.session.projector import ContextProjector
 from paicli.session.request import RequestBuilder
-from paicli.session.store import SessionStore, default_runtime_db_path
+from paicli.session.store import SessionStore, TurnInProgressError, default_runtime_db_path
 
 __all__ = [
     "ContextProjector",
@@ -26,5 +26,6 @@ __all__ = [
     "SessionSummary",
     "SessionState",
     "SessionStore",
+    "TurnInProgressError",
     "default_runtime_db_path",
 ]

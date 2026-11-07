@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -267,7 +269,7 @@ def test_approval_broker_serializes_presenter_calls():
     asyncio.run(run())
 
 
-def test_send_message_rejects_cross_tree_child(tmp_path, monkeypatch):
+def test_send_message_rejects_cross_tree_child(tmp_path):
     from paicli.agent.subagents import make_subagent_control_tools
 
     manager = SubagentManager()
@@ -471,7 +473,7 @@ def test_provider_capabilities_default_to_one_shot_for_non_llm_adapter():
     assert not capabilities.continuable
 
 
-def test_one_shot_activation_does_not_enter_idle_waiting(tmp_path, monkeypatch):
+def test_one_shot_activation_does_not_enter_idle_waiting(tmp_path):
     class OneShotProvider:
         provider_name = "external"
         capabilities = ProviderCapabilities(
@@ -652,31 +654,24 @@ def test_requested_unregistered_provider_fails_closed(tmp_path):
     asyncio.run(run())
 
 
-def test_session_persistence_failure_rolls_back_activation(tmp_path, monkeypatch):
+def test_session_persistence_failure_rolls_back_activation(tmp_path):
     context = _context(tmp_path)
     manager = SubagentManager()
-
-    original = context.session_store.append
-    calls = 0
-    catalog_calls = 0
-
-    def fail_catalog(session_id, event_type, payload, **kwargs):
-        nonlocal calls, catalog_calls
-        calls += 1
-        if event_type == "agent/subagent_catalog":
-            catalog_calls += 1
-            raise OSError("store unavailable")
-        return original(session_id, event_type, payload, **kwargs)
-
-    monkeypatch.setattr(context.session_store, "append", fail_catalog)
+    store = context.session_store
+    with closing(sqlite3.connect(store.db_path)) as conn, conn:
+        conn.execute(
+            "create trigger reject_child_started before insert on events "
+            "when new.type = 'agent/child_started' "
+            "begin select raise(abort, 'could not record child start'); end"
+        )
 
     async def run():
         result = await manager.start({"description": "persist", "prompt": "work"}, context)
         assert result.is_error
         assert "SESSION_PERSISTENCE_UNAVAILABLE" in result.content
         assert manager.activations == {}
-        assert calls == 3
-        assert catalog_calls == 1
+        assert store.list_sessions(parent_session_id=context.session_id) == []
+        assert store.events(context.session_id) == []
 
     asyncio.run(run())
 
@@ -687,13 +682,28 @@ def test_recovery_marks_started_child_orphaned_without_replay(tmp_path):
         kind="child", parent_session_id=context.session_id
     )
     context.session_store.append(
+        child_session, "agent/subagent_descriptor", {"provider": "local"}, source="test"
+    )
+    context.session_store.append(
         context.session_id,
         "agent/child_started",
-        {"child_id": "agent_orphan", "child_session_id": child_session},
+        {
+            "child_id": "agent_orphan",
+            "child_session_id": child_session,
+            "description": "Historical child",
+        },
         source="test",
     )
     manager = SubagentManager()
     manager.session_store = context.session_store
+    assert manager.restore_catalog("root", context.session_id) == [
+        {
+            "child_id": "agent_orphan",
+            "child_session_id": child_session,
+            "provider": "local",
+            "label": "Historical child",
+        }
+    ]
     recovered = manager.recover_orphaned_children("root", context.session_id)
     assert recovered == ["agent_orphan"]
     assert manager.recovered_for("root")[0]["status"] == "orphaned"

@@ -9,8 +9,7 @@ from paicli.tools.executor import ToolExecutor
 from paicli.tools.registry import ToolRegistry
 
 
-def test_auto_mode_runs_approval_required_tool_without_callback(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_auto_mode_runs_approval_required_tool_without_callback(tmp_path):
     config = load_config(project_root=tmp_path)
     controller = PermissionModeController(config)
     executions: list[str] = []
@@ -43,3 +42,21 @@ def test_auto_mode_runs_approval_required_tool_without_callback(tmp_path, monkey
     approved = asyncio.run(executor.execute_all([call], context))[0]
     assert not approved.is_error
     assert executions == ["ok"]
+
+
+def test_default_mode_restores_the_original_policy(tmp_path):
+    config = load_config(project_root=tmp_path)
+    config.policy.hitl_mode = "always"
+    config.policy.path_guard_enabled = False
+    config.policy.command_guard_enabled = True
+    controller = PermissionModeController(config)
+
+    assert controller.toggle() == "auto"
+    assert config.policy.hitl_mode == "never"
+    assert not config.policy.path_guard_enabled
+    assert not config.policy.command_guard_enabled
+
+    assert controller.toggle() == "default"
+    assert config.policy.hitl_mode == "always"
+    assert not config.policy.path_guard_enabled
+    assert config.policy.command_guard_enabled

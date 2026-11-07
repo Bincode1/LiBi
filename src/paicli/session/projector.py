@@ -20,6 +20,12 @@ from paicli.types import Message
 
 _VARIABLE = re.compile(r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*")
 _MODEL_MESSAGE_EVENTS = {"user/message", "assistant/message", "tool/result"}
+_MODEL_CONTEXT_EVENTS = _MODEL_MESSAGE_EVENTS | {
+    "developer/message",
+    "memory/context",
+    "skill/context",
+}
+_MODEL_EVENT_PREFIXES = {"user", "assistant", "tool", "system", "developer"}
 _KNOWN_EVENTS = {
     "session/created",
     "turn/started",
@@ -41,6 +47,7 @@ _KNOWN_EVENTS = {
     "request/prepared",
     "context/summary",
     "request/completed",
+    "request/attempt_failed",
     "request/failed",
     "approval/started",
     "approval/approved",
@@ -58,6 +65,44 @@ class ContextProjector:
     """Build a deterministic model view from canonical Session events."""
 
     projection_version = "context-projector-v2"
+
+    @staticmethod
+    def working_events(
+        events: list[SessionEvent], *, turn_id: str, step_id: str
+    ) -> list[SessionEvent]:
+        """Keep the event subset needed by the active step and its successors."""
+        if not events:
+            return []
+        latest = events[-1].sequence
+        checkpoint = next(
+            (
+                event.sequence
+                for event in reversed(events)
+                if event.event_type == "compaction/checkpoint"
+            ),
+            0,
+        )
+
+        def relevant(event: SessionEvent) -> bool:
+            kind = event.event_type
+            if event.sequence in (latest, checkpoint) or event.schema_version != 1:
+                return True
+            if kind in _MODEL_CONTEXT_EVENTS:
+                return event.sequence > checkpoint
+            if kind == "system/section":
+                return event.turn_id in (None, turn_id)
+            if kind == "runtime/context":
+                return event.turn_id in (None, turn_id) and event.step_id in (None, "", step_id)
+            if kind == "tool/schema_snapshot":
+                return (event.step_id or str(event.payload.get("step_id") or "")) == step_id
+            if kind == "step/completed":
+                return event.step_id == step_id
+            # Tool-start envelopes remain part of the request's replay fingerprint.
+            if kind in {"turn/started", "tool/execution_started"}:
+                return True
+            return kind not in _KNOWN_EVENTS and kind.split("/", 1)[0] in _MODEL_EVENT_PREFIXES
+
+        return [event for event in events if relevant(event)]
 
     def project_session(
         self,
@@ -218,33 +263,43 @@ class ContextProjector:
         tool_history: list[dict[str, Any]] = []
         tool_snapshot: list[dict[str, Any]] = []
         developer_messages: list[str] = []
-        pending_skill_candidates: list[tuple[str, str]] = []
+        # Candidate discovery follows durable turn admission, so its event can follow the input.
+        candidate_contexts = []
+        for event in relevant:
+            payload = event.payload
+            if (
+                event.event_type == "skill/context"
+                and event.turn_id in {None, turn_id}
+                and payload.get("state") == "candidate"
+                and payload.get("visibility", "model") == "model"
+                and (checkpoint is None or event.sequence > checkpoint.sequence)
+            ):
+                source = payload.get("source") or payload.get("id") or "skill"
+                candidate_contexts.append(
+                    f"[relevant skill candidates: {source}; untrusted data]\n"
+                    f"{payload.get('content')}"
+                )
         supports_developer = bool((adapter_capabilities or {}).get("supports_developer_role"))
         for event in relevant:
             if event.event_type not in _KNOWN_EVENTS:
-                if event.event_type.split("/", 1)[0] in {
-                    "user",
-                    "assistant",
-                    "tool",
-                    "system",
-                    "developer",
-                }:
+                if event.event_type.split("/", 1)[0] in _MODEL_EVENT_PREFIXES:
                     raise ValueError(f"unknown model-related event type: {event.event_type}")
                 continue
             if event.event_type in _MODEL_MESSAGE_EVENTS:
                 if checkpoint is not None and event.sequence <= checkpoint.sequence:
                     continue
                 message = self._message_from_event(event)
-                if event.event_type == "user/message" and pending_skill_candidates:
+                if (
+                    event.event_type == "user/message"
+                    and event.turn_id == turn_id
+                    and candidate_contexts
+                ):
                     if not isinstance(message.content, str):
                         raise ValueError("skill candidates require a text user message")
-                    context = "\n\n".join(
-                        f"[relevant skill candidates: {source}; untrusted data]\n{text}"
-                        for source, text in pending_skill_candidates
-                    )
+                    context = "\n\n".join(candidate_contexts)
                     message = _copy_message(message)
                     message.content = f"{context}\n\n---\nUser request:\n{message.content}"
-                    pending_skill_candidates.clear()
+                    candidate_contexts.clear()
                 messages.append(message)
                 message_sources.append(_event_source(event.sequence))
                 source_sequences.append(event.sequence)
@@ -303,7 +358,6 @@ class ContextProjector:
                     event.event_type == "skill/context"
                     and event.payload.get("state") == "candidate"
                 ):
-                    pending_skill_candidates.append((source, text))
                     source_sequences.append(event.sequence)
                     continue
                 projected = f"[{label}-context: {source}; untrusted data]\n{text}"
@@ -343,6 +397,11 @@ class ContextProjector:
                 ]
             ).strip()
         self._validate_tool_pairs(messages)
+        historical_limit = (budget or {}).get("historical_tool_result_chars", 0)
+        if historical_limit > 0:
+            _shorten_earlier_tool_results(
+                messages, message_sources, turn_events[0].sequence, historical_limit
+            )
         if message_transform:
             messages = [message_transform(_copy_message(message)) for message in messages]
         capabilities = _stable_json(adapter_capabilities or {})
@@ -670,6 +729,25 @@ def _checkpoint_sources(checkpoint: SessionEvent, message_count: int) -> list[Me
     checkpoint_id = str(checkpoint.payload.get("compaction_id") or checkpoint.event_id)
     legacy = {"event_sequences": [], "checkpoint_ids": [checkpoint_id]}
     return [dict(legacy) for _ in range(message_count)]
+
+
+def _shorten_earlier_tool_results(
+    messages: list[Message], sources: list[MessageSource], turn_start: int, limit: int
+) -> None:
+    note = "\n[Earlier tool result shortened. Inspect the source if more detail is needed.]\n"
+    kept = max(0, limit - len(note))
+    head, tail = kept // 2, kept - kept // 2
+    for message, source in zip(messages, sources, strict=True):
+        body = message.content
+        sequences = source["event_sequences"]
+        if (
+            message.role == "tool"
+            and isinstance(body, str)
+            and len(body) > limit
+            and sequences
+            and max(int(sequence) for sequence in sequences) < turn_start
+        ):
+            message.content = body[:head] + note[:limit] + (body[-tail:] if tail else "")
 
 
 def _copy_message(message: Message) -> Message:

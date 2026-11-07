@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
+import socket
 import threading
 import uuid
+from concurrent.futures import Future
 from contextlib import aclosing
-from dataclasses import asdict
-from datetime import UTC, datetime
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -17,11 +23,72 @@ from paicli.agent import QueryEngine
 from paicli.bootstrap import build_tool_registry
 from paicli.config import PaiCliConfig
 from paicli.llm import create_llm_client
+from paicli.policy.permission_mode import PermissionMode, PermissionModeController
+from paicli.runtime.conversation import SUBAGENT_STATE_EVENTS, SubagentCatalog, conversation_event
 from paicli.runtime.tasks import TASK_MODES, DurableTaskManager, TaskRecord
-from paicli.session import SessionStore, default_runtime_db_path
+from paicli.session import (
+    SessionEvent,
+    SessionState,
+    SessionStore,
+    TurnInProgressError,
+    default_runtime_db_path,
+)
+from paicli.tools.base import ToolDecision
+
+_APPROVAL_TIMEOUT = 300.0
+_APPROVAL_ROUTE = re.compile(r"/v1/sessions/([^/]+)/approvals/([^/]+)/decision")
+_CANCEL_RUN_ROUTE = re.compile(r"/v1/sessions/([^/]+)/runs/([^/]+)/cancel")
+_CHILD_STREAM_ROUTE = re.compile(r"/v1/sessions/([^/]+)/subagents/([^/]+)/events/stream")
+_CHILD_PREVIEW_LIMIT = 65536
+_STREAM_FRAME_INTERVAL = 0.03
+_STREAM_HISTORY_INTERVAL = 1.0
+_STREAM_HEARTBEAT_INTERVAL = 10.0
+_CONVERSATION_EVENT_TYPES = (
+    "session/created",
+    "turn/started",
+    "turn/completed",
+    "turn/failed",
+    "turn/canceled",
+    "step/started",
+    "user/message",
+    "assistant/message",
+    "assistant/text_delta",
+    "tool/execution_started",
+    "tool/result",
+    "approval/started",
+    "approval/approved",
+    "approval/rejected",
+    "approval/canceled",
+    "request/completed",
+)
+_PRIVATE_KEY_PREVIEW = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL
+)
+
+
+@dataclass(eq=False)
+class _StreamWake:
+    ready: threading.Event = field(default_factory=threading.Event)
+    history_changed: bool = True
+
+
+@dataclass
+class _PendingApproval:
+    session_id: str
+    deadline: float
+    agent_id: str
+    decision: Future[ToolDecision] = field(default_factory=Future)
 
 
 class TaskCanceledError(RuntimeError):
+    pass
+
+
+class RuntimeStoppingError(RuntimeError):
+    pass
+
+
+class RuntimeBindError(OSError):
     pass
 
 
@@ -34,13 +101,13 @@ class RuntimeApiServer:
         cwd: str,
         config: PaiCliConfig,
         api_key: str,
-        port: int = 8080,
+        port: int | None = None,
         workers: int = 2,
     ):
         self.cwd = str(Path(cwd).resolve())
         self.config = config
         self.api_key = api_key
-        self.port = port
+        self.port = config.runtime.port if port is None else port
         self.db_path = default_runtime_db_path()
         self.task_manager = DurableTaskManager(
             Path.home() / ".paicli" / "tasks" / "tasks.db", scope=self.cwd
@@ -48,13 +115,23 @@ class RuntimeApiServer:
         self.workers = workers
         self._stop = threading.Event()
         self._background_turns: dict[str, dict[str, Any]] = {}
-        self._background_turns_lock = threading.Lock()
+        self._background_turns_lock = threading.Condition(threading.Lock())
+        self._active_turn_sessions: dict[str, str | None] = {}
+        self._session_permissions: dict[str, PermissionMode] = {}
+        self._pending_approvals: dict[str, _PendingApproval] = {}
+        self._approval_lock = threading.Lock()
+        self._assistant_previews: dict[tuple[str, str], tuple[str, str]] = {}
+        self._assistant_previews_lock = threading.Lock()
+        self._event_streams: dict[str, set[_StreamWake]] = {}
+        self._event_streams_lock = threading.Lock()
         self.session_store = SessionStore(
-            self.db_path, sensitive_values=(api_key, config.llm.api_key)
+            self.db_path,
+            workspace=self.cwd,
+            sensitive_values=(api_key, config.llm.api_key),
+            on_append=lambda session_id: self._wake_event_streams(session_id, history_changed=True),
         )
 
     def serve_forever(self) -> None:
-        self._start_workers()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -67,12 +144,39 @@ class RuntimeApiServer:
             def log_message(self, _format: str, *args: Any) -> None:
                 return
 
-        server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
-        print(f"PaiCLI Runtime API listening on http://127.0.0.1:{self.port}", flush=True)
-        try:
-            server.serve_forever()
-        finally:
+        with ThreadingHTTPServer(
+            ("127.0.0.1", self.port), Handler, bind_and_activate=False
+        ) as server:
+            if os.name == "nt":
+                server.allow_reuse_address = False
+                server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            try:
+                server.server_bind()
+                server.server_activate()
+            except OSError as exc:
+                raise RuntimeBindError(
+                    f"Cannot listen on 127.0.0.1:{self.port}: {exc.strerror or exc}."
+                ) from exc
+            self.session_store.recover_interrupted_runtime_turns(server.server_port)
+            self.session_store.runtime_port = server.server_port
+            self._start_workers()
+            print(
+                f"PaiCLI Runtime API listening on http://127.0.0.1:{server.server_port}", flush=True
+            )
+            try:
+                server.serve_forever()
+            finally:
+                self._stop_and_drain_turns()
+
+    def _stop_and_drain_turns(self) -> None:
+        with self._background_turns_lock:
             self._stop.set()
+            active = tuple(self._active_turn_sessions.items())
+        for session_id, run_id in active:
+            if run_id is not None:
+                self._cancel_background_turn(session_id, run_id)
+        with self._background_turns_lock:
+            self._background_turns_lock.wait_for(lambda: not self._active_turn_sessions)
 
     def work_forever(self) -> None:
         self._start_workers()
@@ -106,6 +210,11 @@ class RuntimeApiServer:
             _send_json(request, 400, {"error": str(exc)})
             return
         try:
+            if path.startswith("/v1/sessions/") and not self.session_store.session_exists(
+                _session_id_from_path(path)
+            ):
+                _send_json(request, 404, {"error": "session not found"})
+                return
             if request.command == "POST" and path == "/v1/sessions":
                 session_id = self._create_session()
                 _send_json(request, 200, {"id": session_id})
@@ -113,15 +222,33 @@ class RuntimeApiServer:
                 _send_json(request, 200, {"sessions": self._list_sessions()})
             elif request.command == "GET" and path == "/v1/health":
                 _send_json(request, 200, {"status": "ok", "cwd": self.cwd})
+            elif request.command in {"GET", "POST"} and _matches_session_route(
+                path, "/permissions"
+            ):
+                session_id = _session_id_from_path(path)
+                if request.command == "POST":
+                    permission_mode = body.get("mode")
+                    if permission_mode not in ("default", "auto"):
+                        raise ValueError("permission mode must be default or auto")
+                    self._set_permission_mode(session_id, permission_mode)
+                else:
+                    permission_mode = self._permission_mode(session_id)
+                _send_json(request, 200, {"mode": permission_mode})
             elif request.command == "POST" and _matches_session_route(path, "/turns"):
                 session_id = _session_id_from_path(path)
                 message = str(body.get("message") or body.get("prompt") or "")
                 if not message:
                     _send_json(request, 400, {"error": "message is required"})
                     return
-                result = asyncio.run(
-                    self._run_turn(session_id, message, mode=_mode_from_body(body))
-                )
+                mode = _mode_from_body(body)
+                config = self._reserve_turn(session_id)
+                try:
+                    result = asyncio.run(
+                        self._run_turn(session_id, message, mode=mode, config=config)
+                    )
+                finally:
+                    with self._background_turns_lock:
+                        self._release_turn_locked(session_id)
                 _send_json(request, 200, result)
             elif request.command == "POST" and _matches_session_route(path, "/turns/async"):
                 session_id = _session_id_from_path(path)
@@ -130,16 +257,58 @@ class RuntimeApiServer:
                     _send_json(request, 400, {"error": "message is required"})
                     return
                 mode = _mode_from_body(body)
-                run_id = self._start_background_turn(session_id, message, mode=mode)
+                interactive_approval = body.get("interactive_approval", False)
+                if not isinstance(interactive_approval, bool):
+                    raise ValueError("interactive_approval must be a boolean")
+                self._ensure_llm_key()
+                run_id, after_sequence = self._start_background_turn(
+                    session_id, message, mode=mode, interactive_approval=interactive_approval
+                )
                 _send_json(
                     request,
                     202,
-                    {"run_id": run_id, "session_id": session_id, "mode": mode},
+                    {
+                        "run_id": run_id,
+                        "turn_id": run_id,
+                        "session_id": session_id,
+                        "mode": mode,
+                        "after_sequence": after_sequence,
+                    },
                 )
+            elif request.command == "POST" and (match := _CANCEL_RUN_ROUTE.fullmatch(path)):
+                status = self._cancel_background_turn(*match.groups())
+                _send_json(request, status, {"cancel_requested": status == 202})
+            elif request.command == "POST" and (match := _APPROVAL_ROUTE.fullmatch(path)):
+                decision = body.get("decision")
+                if decision not in ("approve", "deny"):
+                    raise ValueError("decision must be approve or deny")
+                status = self._decide_approval(*match.groups(), decision)
+                _send_json(request, status, {"accepted": status == 200})
             elif request.command == "GET" and _matches_session_route(path, "/events.json"):
                 session_id = _session_id_from_path(path)
                 query_cursor = parse_qs(request.path.partition("?")[2]).get("cursor", ["0"])[0]
                 _send_json(request, 200, self._events_json(session_id, _parse_cursor(query_cursor)))
+            elif request.command == "GET" and (child_route := _CHILD_STREAM_ROUTE.fullmatch(path)):
+                parent_id, child_id = child_route.groups()
+                if not self.session_store.is_child_session(parent_id, child_id):
+                    _send_json(request, 404, {"error": "child session not found"})
+                    return
+                self._send_event_stream(
+                    request,
+                    child_id,
+                    after_sequence=_stream_cursor(request),
+                    conversation=True,
+                    root_session_id=parent_id,
+                )
+            elif request.command == "GET" and _matches_session_route(path, "/events/stream"):
+                session_id = _session_id_from_path(path)
+                query = parse_qs(request.path.partition("?")[2])
+                self._send_event_stream(
+                    request,
+                    session_id,
+                    after_sequence=_stream_cursor(request),
+                    conversation=query.get("view", [""])[0] == "conversation",
+                )
             elif request.command == "GET" and _matches_session_route(path, "/events"):
                 session_id = _session_id_from_path(path)
                 query_cursor = parse_qs(request.path.partition("?")[2]).get("cursor", [None])[0]
@@ -159,69 +328,117 @@ class RuntimeApiServer:
                 task = self.task_manager.get(path.split("/")[3])
                 payload = asdict(task) if task else {"error": "not found"}
                 _send_json(request, 200 if task else 404, payload)
-            elif request.command == "POST" and path.startswith("/v1/tasks/") and path.endswith(
-                "/cancel"
+            elif (
+                request.command == "POST"
+                and path.startswith("/v1/tasks/")
+                and path.endswith("/cancel")
             ):
                 _send_json(request, 200, {"canceled": self.task_manager.cancel(path.split("/")[3])})
             else:
                 _send_json(request, 404, {"error": "not found"})
+        except TurnInProgressError:
+            _send_json(request, 409, {"error": "session already has an active turn"})
+        except RuntimeStoppingError:
+            _send_json(request, 503, {"error": "Runtime is stopping"})
         except ValueError as exc:
             _send_json(request, 400, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": str(exc)})
 
     async def _run_turn(
-        self, session_id: str, message: str, *, mode: str = "react"
+        self,
+        session_id: str,
+        message: str,
+        *,
+        mode: str = "react",
+        interactive_approval: bool = False,
+        config: PaiCliConfig | None = None,
+        turn_id: str | None = None,
     ) -> dict[str, Any]:
         self._ensure_llm_key()
         mode = _validate_mode(mode)
-        if not self.session_store.session_exists(session_id):
-            raise ValueError(f"session not found: {session_id}")
-        turn_boundary = self.session_store.state(session_id).last_sequence
+        if config is None:
+            config = deepcopy(self.config)
+        if turn_id is None:
+            turn_id = f"turn_{uuid.uuid4().hex}"
+            self.session_store.start_turn(session_id, turn_id, mode=mode, message=message)
         engine: QueryEngine | None = None
         text = ""
         total_tokens = 0
+        preview_turns: dict[str, str] = {}
+        canceled = False
+
+        async def approve_tool(payload: dict[str, Any]) -> ToolDecision:
+            return await self._request_approval(session_id, turn_id, payload)
+
+        def update_preview(event: dict[str, Any], *, child: bool = False) -> None:
+            event_session_id = event.get("session_id") if child else session_id
+            event_turn_id, step_id = event.get("turn_id"), event.get("step_id")
+            delta = str(event.get("text") or "")
+            if not (event_session_id and event_turn_id and step_id and delta):
+                return
+            if not child and event_turn_id != turn_id:
+                return
+            key = (event_session_id, event_turn_id)
+            with self._assistant_previews_lock:
+                previous_turn = preview_turns.get(event_session_id)
+                if previous_turn and previous_turn != event_turn_id:
+                    self._assistant_previews.pop((event_session_id, previous_turn), None)
+                preview_turns[event_session_id] = event_turn_id
+                previous_step, previous_text = self._assistant_previews.get(key, (None, ""))
+                preview = previous_text + delta if previous_step == step_id else delta
+                self._assistant_previews[key] = (
+                    step_id,
+                    preview[:_CHILD_PREVIEW_LIMIT] if child else preview,
+                )
+            self._wake_event_streams(event_session_id)
+
         try:
-            registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
+            registry, _manager = await build_tool_registry(config=config, cwd=self.cwd)
             engine = QueryEngine(
-                llm_client=create_llm_client(self.config.llm),
+                llm_client=create_llm_client(config.llm),
                 tool_registry=registry,
-                config=self.config,
+                config=config,
                 cwd=self.cwd,
                 session_store=self.session_store,
                 session_id=session_id,
+                approval_callback=approve_tool if interactive_approval else None,
+                child_preview_callback=lambda event: update_preview(event, child=True),
             )
-            events = _engine_events(engine, mode, message)
+            events = _engine_events(engine, mode, message, turn_id=turn_id)
             async with aclosing(events):
                 async for event in events:
                     event_type = str(event.get("type"))
                     if event_type == "text_delta":
                         text += str(event.get("text") or "")
+                        update_preview(event)
                     elif event_type == "done":
                         total_tokens = int(event.get("total_tokens") or 0)
                     elif event_type == "error":
                         raise event["error"]
         except asyncio.CancelledError:
-            self._close_unowned_turn(
-                session_id,
-                mode=mode,
-                status="turn/canceled",
-                detail={"mode": mode},
-                after_sequence=turn_boundary,
-            )
+            canceled = True
+            self._close_turn(session_id, turn_id, "turn/canceled", {"mode": mode})
             raise
         except Exception as exc:
-            self._close_unowned_turn(
-                session_id,
-                mode=mode,
-                status="turn/failed",
-                detail={"error_type": type(exc).__name__},
-                after_sequence=turn_boundary,
-            )
+            self._close_turn(session_id, turn_id, "turn/failed", {"error_type": type(exc).__name__})
             raise
         finally:
-            if engine is not None:
-                await engine.aclose()
+            try:
+                if engine is not None:
+                    await engine.aclose()
+            except Exception as exc:
+                if not canceled:
+                    raise
+                logging.getLogger(__name__).warning(
+                    "Canceled turn cleanup failed: %s", type(exc).__name__
+                )
+            finally:
+                with self._assistant_previews_lock:
+                    for identity, preview_turn in preview_turns.items():
+                        self._assistant_previews.pop((identity, preview_turn), None)
+                for identity in preview_turns:
+                    self._wake_event_streams(identity)
         return {
             "session_id": session_id,
             "text": text,
@@ -229,10 +446,21 @@ class RuntimeApiServer:
             "total_tokens": total_tokens,
         }
 
-    def _start_background_turn(self, session_id: str, message: str, *, mode: str) -> str:
-        run_id = f"run_{uuid.uuid4().hex}"
+    def _start_background_turn(
+        self, session_id: str, message: str, *, mode: str, interactive_approval: bool = False
+    ) -> tuple[str, int]:
+        run_id = f"turn_{uuid.uuid4().hex}"
+        config = self._reserve_turn(session_id, run_id)
+        try:
+            after_sequence = self.session_store.start_turn(
+                session_id, run_id, mode=mode, message=message
+            )
+        except Exception:
+            with self._background_turns_lock:
+                self._release_turn_locked(session_id)
+            raise
         with self._background_turns_lock:
-            self._background_turns[run_id] = {
+            record = self._background_turns[run_id] = {
                 "run_id": run_id,
                 "session_id": session_id,
                 "mode": mode,
@@ -240,19 +468,175 @@ class RuntimeApiServer:
                 "started_at": datetime.now(UTC).isoformat(),
             }
 
+        async def run() -> dict[str, Any]:
+            with self._background_turns_lock:
+                record["task"] = asyncio.current_task()
+                canceled = self._stop.is_set() or record["status"] == "canceling"
+                if canceled:
+                    record["status"] = "canceling"
+            if canceled:
+                self._close_turn(session_id, run_id, "turn/canceled", {"mode": mode})
+                raise asyncio.CancelledError
+            return await self._run_turn(
+                session_id,
+                message,
+                mode=mode,
+                interactive_approval=interactive_approval,
+                config=config,
+                turn_id=run_id,
+            )
+
         def runner() -> None:
+            outcome: dict[str, Any] = {"status": "failed", "error": "interrupted"}
             try:
-                result = asyncio.run(self._run_turn(session_id, message, mode=mode))
+                result = asyncio.run(run())
                 outcome = {"status": "completed", "result": result}
+            except asyncio.CancelledError:
+                outcome = {"status": "canceled"}
+                self._close_turn(session_id, run_id, "turn/canceled", {"mode": mode})
             except Exception as exc:  # noqa: BLE001 - background task boundary
                 outcome = {"status": "failed", "error": type(exc).__name__}
-            with self._background_turns_lock:
-                record = self._background_turns.get(run_id)
-                if record is not None:
+                self._close_turn(
+                    session_id, run_id, "turn/failed", {"error_type": type(exc).__name__}
+                )
+            finally:
+                with self._background_turns_lock:
+                    record.pop("task", None)
                     record.update(outcome, finished_at=datetime.now(UTC).isoformat())
+                    self._release_turn_locked(session_id)
+                self._wake_event_streams(session_id)
 
-        threading.Thread(target=runner, name=f"paicli-turn-{run_id}", daemon=True).start()
-        return run_id
+        try:
+            threading.Thread(target=runner, name=f"paicli-turn-{run_id}", daemon=True).start()
+        except RuntimeError as exc:
+            try:
+                self._close_turn(
+                    session_id, run_id, "turn/failed", {"error_type": type(exc).__name__}
+                )
+            finally:
+                with self._background_turns_lock:
+                    del self._background_turns[run_id]
+                    self._release_turn_locked(session_id)
+            raise
+        self._wake_event_streams(session_id)
+        return run_id, after_sequence
+
+    def _reserve_turn(self, session_id: str, run_id: str | None = None) -> PaiCliConfig:
+        with self._background_turns_lock:
+            if self._stop.is_set():
+                raise RuntimeStoppingError
+            if session_id in self._active_turn_sessions:
+                raise TurnInProgressError
+            config = deepcopy(self.config)
+            PermissionModeController(config, self._session_permissions.get(session_id, "default"))
+            self._active_turn_sessions[session_id] = run_id
+            return config
+
+    def _release_turn_locked(self, session_id: str) -> None:
+        del self._active_turn_sessions[session_id]
+        self._background_turns_lock.notify_all()
+
+    def _cancel_background_turn(self, session_id: str, run_id: str) -> int:
+        with self._background_turns_lock:
+            record = self._background_turns.get(run_id)
+            if record is None or record["session_id"] != session_id:
+                return 404
+            if record["status"] == "canceling":
+                return 202
+            if record["status"] != "running":
+                return 409
+            task = record.get("task")
+            if task is not None:
+                try:
+                    task.get_loop().call_soon_threadsafe(task.cancel)
+                except RuntimeError:  # The event loop closed while the run was finishing.
+                    return 409
+            record["status"] = "canceling"
+        self._wake_event_streams(session_id)
+        return 202
+
+    def _active_background_run(self, session_id: str) -> dict[str, str] | None:
+        with self._background_turns_lock:
+            run_id = self._active_turn_sessions.get(session_id)
+            if run_id is None:
+                return None
+            record = self._background_turns.get(run_id)
+            return {"run_id": run_id, "status": record["status"]} if record else None
+
+    async def _request_approval(
+        self, session_id: str, turn_id: str, request: dict[str, Any]
+    ) -> ToolDecision:
+        approval_id = f"approval_{uuid.uuid4().hex}"
+        expires_at = datetime.now(UTC) + timedelta(seconds=_APPROVAL_TIMEOUT)
+        pending = _PendingApproval(session_id, monotonic() + _APPROVAL_TIMEOUT, request["agent_id"])
+        agent_session_id = request.get("session_id")
+        agent_label = None
+        if agent_session_id and agent_session_id != session_id:
+            descriptors = self.session_store.events(
+                agent_session_id, event_types=("agent/subagent_descriptor",)
+            )
+            if descriptors:
+                agent_label = str(descriptors[-1].payload.get("description") or "")[:160]
+        event_fields = {
+            "turn_id": turn_id,
+            "tool_call_id": request.get("tool_call_id"),
+            "approval_id": approval_id,
+            "source": "runtime-approval",
+        }
+        started = False
+        decision = None
+        with self._approval_lock:
+            self._pending_approvals[approval_id] = pending
+        try:
+            self.session_store.append(
+                session_id,
+                "approval/started",
+                {
+                    "tool_name": request["tool_name"],
+                    "input": request["input"],
+                    "danger_level": request["danger_level"],
+                    "agent_id": request["agent_id"],
+                    "agent_session_id": agent_session_id,
+                    "agent_label": agent_label,
+                    "expires_at": expires_at.isoformat(),
+                },
+                **event_fields,
+            )
+            started = True
+            await asyncio.wait(
+                {asyncio.wrap_future(pending.decision)},
+                timeout=max(0, pending.deadline - monotonic()),
+            )
+            with self._approval_lock:
+                decision = pending.decision.result() if pending.decision.done() else None
+        finally:
+            with self._approval_lock:
+                del self._pending_approvals[approval_id]
+            if started:
+                event_type = {"approve": "approval/approved", "deny": "approval/rejected"}
+                self.session_store.append(
+                    session_id, event_type.get(decision, "approval/canceled"), {}, **event_fields
+                )
+        return decision or "deny"
+
+    def _decide_approval(self, session_id: str, approval_id: str, decision: ToolDecision) -> int:
+        with self._approval_lock:
+            pending = self._pending_approvals.get(approval_id)
+            if pending is None or pending.session_id != session_id:
+                return 404
+            if pending.decision.done() or monotonic() >= pending.deadline:
+                return 409
+            pending.decision.set_result(decision)
+            return 200
+
+    def _permission_mode(self, session_id: str) -> PermissionMode:
+        with self._background_turns_lock:
+            return self._session_permissions.get(session_id, "default")
+
+    def _set_permission_mode(self, session_id: str, mode: PermissionMode) -> None:
+        with self._background_turns_lock:
+            self._session_permissions[session_id] = mode
+        self._wake_event_streams(session_id)
 
     def _create_session(self) -> str:
         session_id = self.session_store.create_session()
@@ -279,9 +663,37 @@ class RuntimeApiServer:
         return {
             "session_id": session_id,
             "events": [self._serialize_event(event) for event in events],
-            "next_cursor": state.last_sequence,
+            "next_cursor": events[-1].sequence if events else after_sequence,
             "state": asdict(state),
+            "active_run": self._active_background_run(session_id),
+            "permission_mode": self._permission_mode(session_id),
+            "assistant_preview": self._assistant_preview(state),
         }
+
+    def _assistant_preview(self, state: SessionState) -> dict[str, Any] | None:
+        if state.active_turn_id and state.active_step_id:
+            with self._assistant_previews_lock:
+                preview = self._assistant_previews.get((state.session_id, state.active_turn_id))
+            if preview and preview[0] == state.active_step_id:
+                payload = self.session_store.sanitize_payload(
+                    {
+                        "turn_id": state.active_turn_id,
+                        "step_id": preview[0],
+                        "text": _PRIVATE_KEY_PREVIEW.sub("[redacted]", preview[1]),
+                    }
+                )
+                text = payload["text"]
+                # A chunk can end midway through a credential that the next chunk completes.
+                hidden = 0
+                for secret in self.session_store.redactor.sensitive_values:
+                    for length in range(min(len(secret) - 1, len(text)), hidden, -1):
+                        if text.endswith(secret[:length]):
+                            hidden = length
+                            break
+                if hidden:
+                    payload["text"] = text[:-hidden]
+                return payload if payload["text"] else None
+        return None
 
     @staticmethod
     def _serialize_event(event: Any) -> dict[str, Any]:
@@ -294,6 +706,8 @@ class RuntimeApiServer:
             "turn_id": event.turn_id,
             "step_id": event.step_id,
             "tool_call_id": event.tool_call_id,
+            "approval_id": event.approval_id,
+            "schema_version": event.schema_version,
             "source": event.source,
         }
 
@@ -316,40 +730,176 @@ class RuntimeApiServer:
         request.end_headers()
         request.wfile.write(body)
 
-    def _close_unowned_turn(
+    def _wake_event_streams(self, session_id: str, *, history_changed: bool = False) -> None:
+        with self._event_streams_lock:
+            for wake in self._event_streams.get(session_id, ()):
+                wake.history_changed |= history_changed
+                wake.ready.set()
+
+    def _replay_conversation(
         self,
+        state: SessionState,
+        catalog: SubagentCatalog,
+        cursor: int,
+        *,
+        include_messages: bool = True,
+    ) -> tuple[list[SessionEvent], SessionState]:
+        history, watermark = self.session_store.replay_events(
+            state.session_id,
+            after_sequence=state.last_sequence,
+            visible_after_sequence=cursor,
+            visible_types=_CONVERSATION_EVENT_TYPES if include_messages else (),
+            state_event_types=SUBAGENT_STATE_EVENTS,
+        )
+        catalog.advance(state, history)
+        return history, replace(
+            self.session_store.advance_state(state, history), last_sequence=watermark
+        )
+
+    def _send_event_stream(
+        self,
+        request: BaseHTTPRequestHandler,
         session_id: str,
         *,
-        mode: str,
+        after_sequence: int,
+        conversation: bool = False,
+        root_session_id: str | None = None,
+    ) -> None:
+        parent_id = self.session_store.child_parent(session_id) if root_session_id else None
+        parent_state = SessionState(parent_id, "created", 0) if parent_id else None
+        parent_catalog = SubagentCatalog()
+        child_summary = None
+        wake = _StreamWake()
+        with self._event_streams_lock:
+            self._event_streams.setdefault(session_id, set()).add(wake)
+
+        state = SessionState(session_id, "created", 0)
+        catalog = SubagentCatalog()
+        subagents: list[dict[str, Any]] = []
+        owner = root_session_id or session_id
+        last_view = None
+        cursor = after_sequence
+        history_deadline = 0.0
+        last_write = 0.0
+        started = False
+        try:
+            while not self._stop.is_set():
+                with self._event_streams_lock:
+                    history_changed = wake.history_changed
+                    wake.history_changed = False
+                    wake.ready.clear()
+                events = []
+                if history_changed or monotonic() >= history_deadline:
+                    # Local commits wake the stream. This also catches writes from other processes.
+                    if conversation:
+                        history, state = self._replay_conversation(state, catalog, cursor)
+                        with self._background_turns_lock:
+                            owner_active = owner in self._active_turn_sessions
+                        with self._approval_lock:
+                            waiting_agents = {
+                                approval.agent_id
+                                for approval in self._pending_approvals.values()
+                                if approval.session_id == owner
+                            }
+                        subagents = catalog.snapshot(
+                            self.session_store,
+                            session_id,
+                            active_parent_turn=state.active_turn_id if owner_active else None,
+                            waiting_agents=waiting_agents,
+                        )
+                        if parent_state is not None:
+                            _, parent_state = self._replay_conversation(
+                                parent_state, parent_catalog, 0, include_messages=False
+                            )
+                            summaries = parent_catalog.snapshot(
+                                self.session_store,
+                                parent_state.session_id,
+                                active_parent_turn=parent_state.active_turn_id
+                                if owner_active
+                                else None,
+                                waiting_agents=waiting_agents,
+                                only_session_id=session_id,
+                            )
+                            child_summary = summaries[0] if summaries else None
+                    else:
+                        history = self.session_store.events(
+                            session_id, after_sequence=state.last_sequence
+                        )
+                        state = self.session_store.advance_state(state, history)
+                    events = [
+                        conversation_event(event, self._serialize_event(event))
+                        if conversation
+                        else self._serialize_event(event)
+                        for event in history
+                        if event.sequence > cursor
+                        and (not conversation or event.event_type in _CONVERSATION_EVENT_TYPES)
+                    ]
+                    history_deadline = monotonic() + _STREAM_HISTORY_INTERVAL
+                preview = self._assistant_preview(state)
+                active_run = self._active_background_run(session_id)
+                permission_mode = self._permission_mode(session_id)
+                view = (state, preview, active_run, permission_mode, subagents, child_summary)
+                if not started:
+                    request.close_connection = True
+                    request.connection.settimeout(5)
+                    request.send_response(200)
+                    request.send_header("content-type", "text/event-stream")
+                    request.send_header("cache-control", "no-cache, no-transform")
+                    request.send_header("x-accel-buffering", "no")
+                    request.send_header("connection", "close")
+                    request.end_headers()
+                    started = True
+                if events or view != last_view:
+                    if conversation:
+                        cursor = max(cursor, state.last_sequence)
+                    elif events:
+                        cursor = events[-1]["sequence"]
+                    data = json.dumps(
+                        {
+                            "session_id": session_id,
+                            "events": events,
+                            "next_cursor": cursor,
+                            "state": asdict(state),
+                            "active_run": active_run,
+                            "permission_mode": permission_mode,
+                            "assistant_preview": preview,
+                            **({"subagents": subagents} if conversation else {}),
+                            **({"subagent": child_summary} if parent_state is not None else {}),
+                        },
+                        ensure_ascii=False,
+                    )
+                    request.wfile.write(f"id: {cursor}\nevent: page\ndata: {data}\n\n".encode())
+                    last_view = view
+                    last_write = monotonic()
+                elif monotonic() - last_write >= _STREAM_HEARTBEAT_INTERVAL:
+                    request.wfile.write(b": heartbeat\n\n")
+                    last_write = monotonic()
+                deadline = min(history_deadline, last_write + _STREAM_HEARTBEAT_INTERVAL)
+                wake.ready.wait(max(0, deadline - monotonic()))
+                self._stop.wait(max(0, last_write + _STREAM_FRAME_INTERVAL - monotonic()))
+        except (ConnectionError, TimeoutError):
+            pass
+        except Exception as exc:  # noqa: BLE001 - headers may already have been sent
+            if not started:
+                raise
+            logging.getLogger(__name__).warning(
+                "Runtime event stream ended: %s", type(exc).__name__
+            )
+        finally:
+            with self._event_streams_lock:
+                self._event_streams[session_id].remove(wake)
+                if not self._event_streams[session_id]:
+                    del self._event_streams[session_id]
+
+    def _close_turn(
+        self,
+        session_id: str,
+        turn_id: str,
         status: str,
         detail: dict[str, Any],
-        after_sequence: int,
     ) -> None:
-        events = self.session_store.events(session_id)
-        if any(
-            event.sequence > after_sequence and event.event_type == "turn/started"
-            for event in events
-        ):
-            return
-        state = self.session_store.state(session_id)
-        turn_id = f"turn_{uuid.uuid4().hex}"
-        if state.active_turn_id is not None:
-            self.session_store.append(
-                session_id,
-                status,
-                detail,
-                turn_id=state.active_turn_id,
-                source="runtime",
-            )
-            return
-        self.session_store.append(
-            session_id,
-            "turn/started",
-            {"mode": mode, "synthetic": True},
-            turn_id=turn_id,
-            source="runtime",
-        )
-        self.session_store.append(session_id, status, detail, turn_id=turn_id, source="runtime")
+        if self.session_store.active_turn_step(session_id)[0] == turn_id:
+            self.session_store.append(session_id, status, detail, turn_id=turn_id, source="runtime")
 
     def _worker_loop(self, worker_id: str) -> None:
         while not self._stop.is_set():
@@ -424,7 +974,12 @@ class RuntimeApiServer:
 
 
 def _matches_session_route(path: str, suffix: str) -> bool:
-    return path.startswith("/v1/sessions/") and path.endswith(suffix)
+    return re.fullmatch(r"/v1/sessions/[^/]+" + re.escape(suffix), path) is not None
+
+
+def _stream_cursor(request: BaseHTTPRequestHandler) -> int:
+    cursor = parse_qs(request.path.partition("?")[2]).get("cursor", ["0"])[0]
+    return _parse_cursor(request.headers.get("last-event-id") or cursor)
 
 
 def _session_id_from_path(path: str) -> str:
@@ -481,9 +1036,9 @@ def _validate_mode(mode: str) -> str:
     return value
 
 
-def _engine_events(engine: QueryEngine, mode: str, message: str):
+def _engine_events(engine: QueryEngine, mode: str, message: str, *, turn_id: str | None = None):
     if mode == "react":
-        return engine.ask(message)
+        return engine.ask(message, turn_id=turn_id) if turn_id else engine.ask(message)
     if mode == "plan":
-        return engine.plan(message)
+        return engine.plan(message, turn_id=turn_id) if turn_id else engine.plan(message)
     raise ValueError(f"mode must be one of: {', '.join(sorted(TASK_MODES))}")

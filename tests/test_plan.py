@@ -7,6 +7,7 @@ import pytest
 
 from paicli.agent import PlanExecuteAgent
 from paicli.config import load_config
+from paicli.llm.base import ProviderRequestError
 from paicli.plan import ExecutionPlan, Planner, Task, TaskType
 from paicli.session import ContextProjector, SessionStore
 from paicli.tools import ToolRegistry, get_builtin_tools
@@ -65,8 +66,40 @@ def test_planner_parses_tasks_and_dependencies():
     assert plan.get_task("task_2").type == TaskType.VERIFICATION
 
 
-def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+@pytest.mark.parametrize("plan_json", ["not JSON", "{}", '{"tasks":[]}', '{"tasks":"bad"}'])
+def test_planner_rejects_missing_or_invalid_task_lists(plan_json):
+    with pytest.raises(ValueError):
+        Planner(FakeClient()).parse_plan("goal", plan_json)
+
+
+@pytest.mark.parametrize("dependencies", [["a"], ["b"]])
+def test_planner_rejects_self_or_mutual_dependency_cycles(dependencies):
+    import json
+
+    raw = {
+        "tasks": [
+            {"id": "a", "dependencies": dependencies},
+            {"id": "b", "dependencies": ["a"]},
+        ]
+    }
+    with pytest.raises(ValueError, match="cyclic"):
+        Planner(FakeClient()).parse_plan("goal", json.dumps(raw))
+
+
+def test_failed_dependency_never_becomes_executable():
+    plan = ExecutionPlan(id="failure", goal="goal")
+    dependency = Task("a", "first")
+    dependent = Task("b", "second", dependencies=["a"])
+    plan.add_task(dependent)
+    plan.add_task(dependency)
+    assert dependency.dependents == ["b"]
+    dependency.mark_failed("failed")
+    assert plan.executable_tasks() == []
+    assert plan.has_failed() and not plan.is_all_completed()
+    assert plan.progress() == 0
+
+
+def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path):
     client = ParallelPlanClient()
     registry = ToolRegistry()
     registry.register_all(get_builtin_tools())
@@ -138,6 +171,56 @@ def test_plan_execute_runs_independent_tasks_in_parallel(tmp_path, monkeypatch):
     assert sum(event.event_type == "agent/child_completed" for event in parent_events) == 2
     assert not any(event.event_type == "request/prepared" for event in parent_events)
     assert registry.get("subagent") is None
+
+
+def test_plan_persists_provider_attempts_under_one_request(session_store, config, tmp_path):
+    class PlannerClient:
+        model_name = "plan-model"
+        provider_name = "plan-provider"
+
+        async def chat(self, messages, tools, *, system_prompt):
+            for attempt, code in enumerate((503, 500), start=1):
+                yield {
+                    "type": "provider_attempt_failed",
+                    "diagnostic": {
+                        "attempt": attempt,
+                        "stage": "response_headers",
+                        "elapsed_ms": 35,
+                        "error_type": "HTTPStatusError",
+                        "retrying": attempt == 1,
+                        "provider_error": {"kind": "http", "status_code": code},
+                    },
+                }
+            yield {
+                "type": "error",
+                "error": ProviderRequestError("failed", kind="http", status_code=500),
+            }
+
+    agent = PlanExecuteAgent(
+        llm_client=PlannerClient(),
+        tool_registry=ToolRegistry(),
+        config=config,
+        cwd=str(tmp_path),
+        session_store=session_store,
+    )
+
+    async def run():
+        return [event async for event in agent.run("先检查 A，然后分析 B")]
+
+    with pytest.raises(ProviderRequestError):
+        asyncio.run(run())
+
+    events = session_store.events(agent.session_id)
+    attempts = [event for event in events if event.event_type == "request/attempt_failed"]
+    assert [event.payload["attempt"] for event in attempts] == [1, 2]
+    assert [event.payload["retrying"] for event in attempts] == [True, False]
+    assert [event.payload["provider_error"]["status_code"] for event in attempts] == [503, 500]
+    assert attempts[0].payload["request_id"] == attempts[1].payload["request_id"]
+    assert attempts[0].payload["purpose"] == "planning"
+    assert attempts[0].payload["provider"] == "plan-provider"
+    assert attempts[0].payload["model"] == "plan-model"
+    assert events[-1].event_type == "turn/failed"
+    assert events[-1].payload["provider_error"] == {"kind": "http", "status_code": 500}
 
 
 @pytest.mark.parametrize("fails", [False, True])

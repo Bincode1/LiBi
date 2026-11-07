@@ -31,6 +31,21 @@ def test_session_store_can_check_resume_target(tmp_path):
     assert not store.session_exists(" ")
 
 
+def test_session_state_reports_latest_cursor_without_loading_full_history(tmp_path, monkeypatch):
+    store = SessionStore(tmp_path / "runtime.db")
+    session_id = store.create_session("active-session")
+    store.append(session_id, "turn/started", {}, turn_id="turn-a")
+    latest = store.append(session_id, "user/message", {"content": "request"}, turn_id="turn-a")
+
+    def fail_if_history_is_loaded(*_args, **_kwargs):
+        raise AssertionError("state must not load full event history")
+
+    monkeypatch.setattr(store, "events", fail_if_history_is_loaded)
+    state = store.state(session_id)
+    assert state.active_turn_id == "turn-a"
+    assert state.last_sequence == latest.sequence
+
+
 def test_session_store_lists_sessions_by_recent_activity(tmp_path):
     store = SessionStore(tmp_path / "runtime.db")
     older = store.create_session("older")
@@ -195,6 +210,44 @@ def test_context_projector_requires_tool_calls_to_match_results(tmp_path):
         )
 
 
+def test_model_projection_bounds_older_tool_output_without_changing_history(tmp_path):
+    store = SessionStore(tmp_path / "runtime.db")
+    sid = store.create_session()
+    output = "start\n" + ("file content\n" * 300) + "end"
+    for turn in ("older", "current"):
+        store.append(sid, "turn/started", {}, turn_id=turn)
+        store.append(sid, "user/message", {"content": "read"}, turn_id=turn)
+        store.append(sid, "step/started", {}, turn_id=turn, step_id=turn)
+        store.append(
+            sid,
+            "assistant/message",
+            {"tool_calls": [{"id": turn, "function": {"name": "read_file", "arguments": "{}"}}]},
+            turn_id=turn,
+            step_id=turn,
+        )
+        store.append(
+            sid, "tool/result", {"content": output}, turn_id=turn, step_id=turn, tool_call_id=turn
+        )
+        if turn == "older":
+            store.append(sid, "turn/completed", {}, turn_id=turn)
+
+    projector = ContextProjector()
+    events = store.events(sid)
+    scope = {"session_id": sid, "turn_id": "current", "step_id": "current"}
+    raw = projector.project(events, **scope)
+    limited = projector.project(events, **scope, budget={"historical_tool_result_chars": 2_000})
+    tools = [message for message in limited.messages if message.role == "tool"]
+    assert [tool.tool_call_id for tool in tools] == ["older", "current"]
+    assert len(tools[0].content) <= 2_000 and "shortened" in tools[0].content
+    assert tools[0].content.startswith("start") and tools[0].content.endswith("end")
+    assert tools[1].content == output
+    assert [message.content for message in raw.messages if message.role == "tool"] == [
+        output,
+        output,
+    ]
+    assert store.events(sid) == events
+
+
 def test_context_projector_does_not_duplicate_skill_context_in_checkpoint(tmp_path):
     store = SessionStore(tmp_path / "runtime.db")
     sid = store.create_session("session-a")
@@ -260,11 +313,19 @@ class TwoStepClient:
 
 
 def test_react_session_event_log_is_source_for_next_model_step(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     config = load_config(project_root=tmp_path)
     config.llm.api_key = "test-only"
     client = TwoStepClient()
     store = SessionStore(tmp_path / "runtime.db", sensitive_values=(config.llm.api_key,))
+    read_cursors = []
+    read_events = store.events
+
+    def record_read(session_id, *, after_sequence=0, event_types=None):
+        if event_types is None:
+            read_cursors.append(after_sequence)
+        return read_events(session_id, after_sequence=after_sequence, event_types=event_types)
+
+    monkeypatch.setattr(store, "events", record_read)
     engine = QueryEngine(
         llm_client=client,
         tool_registry=ToolRegistry(),
@@ -274,6 +335,9 @@ def test_react_session_event_log_is_source_for_next_model_step(tmp_path, monkeyp
     )
 
     result = asyncio.run(engine.ask_complete_async("run"))
+    assert read_cursors.count(0) == 1
+    assert len(read_cursors) == 3
+    assert read_cursors == sorted(set(read_cursors))
     events = store.events(engine.session_id)
     event_types = [event.event_type for event in events]
 
@@ -284,6 +348,16 @@ def test_react_session_event_log_is_source_for_next_model_step(tmp_path, monkeyp
     assert event_types.count("tool/result") == 1
     prepared = [event for event in events if event.event_type == "request/prepared"]
     assert all("context_summary" in event.payload for event in prepared)
+    for event in prepared:
+        replayed = ContextProjector().project(
+            events,
+            session_id=engine.session_id,
+            turn_id=event.turn_id,
+            step_id=event.step_id,
+            through_sequence=event.payload["through_sequence"],
+            **event.payload["projection"],
+        )
+        assert replayed.context_hash == event.payload["context_hash"]
     assert event_types[-1] == "turn/completed"
     assert store.state(engine.session_id).status == "completed"
     assert all(
@@ -292,7 +366,8 @@ def test_react_session_event_log_is_source_for_next_model_step(tmp_path, monkeyp
     )
 
 
-def test_agent_continues_past_twenty_tool_calls_until_model_finishes(tmp_path, monkeypatch):
+@pytest.mark.slow
+def test_agent_continues_past_twenty_tool_calls_until_model_finishes(tmp_path):
     class ToolCallingClient:
         model_name = "fake-model"
         provider_name = "fake-provider"
@@ -317,7 +392,6 @@ def test_agent_continues_past_twenty_tool_calls_until_model_finishes(tmp_path, m
                 yield {"type": "text_delta", "text": "finished"}
                 yield {"type": "message_end", "stop_reason": "end_turn"}
 
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     config = load_config(project_root=tmp_path)
     config.llm.api_key = "test-only"
     store = SessionStore(tmp_path / "runtime.db")
@@ -347,8 +421,7 @@ def test_agent_continues_past_twenty_tool_calls_until_model_finishes(tmp_path, m
     assert session_events[-1].event_type == "turn/completed"
 
 
-def test_agent_reuses_session_until_clear_then_starts_new_session(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_agent_reuses_session_until_clear_then_starts_new_session(tmp_path):
     config = load_config(project_root=tmp_path)
     config.llm.api_key = "test-only"
 

@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from paicli.llm.base import LlmClient
+from paicli.llm.base import LlmClient, ProviderRequestError
 from paicli.plan.models import ExecutionPlan, Task, TaskType
 from paicli.types import Message, Usage
 
@@ -24,6 +24,9 @@ PLANNER_PROMPT = """你是 PaiCLI 的任务规划器。
   ]
 }
 可以并行的独立任务应放在同一执行批次中。
+未指定范围的 Bug 检查或代码审查，先从改动、入口和测试证据界定调查范围。
+把任务组织成定位线索、验证假设和报告覆盖范围，不按文件数量拆分。
+遇到需要跟进的具体线索，或用户要求深入检查时，可以扩大范围。
 summary 和 description 必须使用与用户目标相同的语言；用户目标包含中文时，必须使用中文。
 JSON 字段名、任务 id 和 type 枚举值保持上述英文格式。
 """
@@ -68,8 +71,21 @@ class Planner:
                 usage = Usage.from_mapping(event.get("usage") or {})
                 self.last_usage = self.last_usage + usage
                 yield {"type": "usage", "usage": usage.to_dict(), "phase": "planning"}
+            elif event_type == "provider_attempt_failed":
+                yield {
+                    "type": event_type,
+                    "diagnostic": event["diagnostic"],
+                    "provider": self.llm_client.provider_name,
+                    "model": self.llm_client.model_name,
+                }
             elif event_type == "error":
                 raise event["error"]
+            elif event_type == "message_end" and event.get("stop_reason") == "max_tokens":
+                raise ProviderRequestError(
+                    "Model output reached its token limit while planning.",
+                    kind="protocol",
+                    code="max_output_tokens",
+                )
 
         yield {"type": "plan_created", "plan": self.parse_plan(goal, text)}
 

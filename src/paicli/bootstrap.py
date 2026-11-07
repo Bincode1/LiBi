@@ -16,7 +16,7 @@ async def build_tool_registry(
     registry = ToolRegistry()
     registry.register_all(get_builtin_tools())
     manager: McpClientManager | None = None
-    if config.features.mcp:
+    if config.features.mcp and config.mcp.auto_start:
         manager = McpClientManager(cwd)
         registry.register_all(await manager.load_tools())
     return registry, manager
@@ -37,6 +37,7 @@ async def build_runtime(
     client = create_llm_client(config.llm)
     session_store = SessionStore(
         default_runtime_db_path(),
+        workspace=cwd,
         sensitive_values=(config.llm.api_key,),
     )
     return client, registry, manager, session_store

@@ -34,5 +34,3 @@ def _message_text(message: Message) -> str:
     if isinstance(message.content, str):
         return message.content
     return json.dumps(message.content, ensure_ascii=False, separators=(",", ":"))
-
-

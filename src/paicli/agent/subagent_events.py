@@ -8,6 +8,22 @@ from typing import Any
 
 from paicli.policy.redaction import Redactor
 
+SUBAGENT_ROLES = (
+    "explorer",
+    "researcher",
+    "builder",
+    "reviewer",
+    "tester",
+    "writer",
+    "planner",
+    "general",
+)
+
+
+def subagent_role(value: object) -> str | None:
+    return value if isinstance(value, str) and value in SUBAGENT_ROLES else None
+
+
 _FIELDS = {
     "started": {"description"},
     "continued": set(),

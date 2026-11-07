@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
@@ -32,10 +31,12 @@ from paicli.llm.model_profiles import (
 )
 from paicli.memory import MemoryManager
 from paicli.policy import AuditLog
+from paicli.policy.permission_mode import PermissionMode, PermissionModeController
 from paicli.prompt import PromptAssembler
 from paicli.rag import CodeIndex
 from paicli.render import RichRenderer
 from paicli.runtime import DurableTaskManager
+from paicli.session import SessionStore
 from paicli.skill import SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools import ToolRegistry
@@ -66,38 +67,6 @@ SLASH_COMMANDS = [
     "/snapshot",
     "/restore",
 ]
-
-
-PermissionMode = Literal["default", "auto"]
-
-
-@dataclass
-class PermissionModeController:
-    """Apply one of the two interactive permission modes to the live config."""
-
-    config: PaiCliConfig
-    mode: PermissionMode = "default"
-
-    def __post_init__(self) -> None:
-        self._default_hitl_mode = self.config.policy.hitl_mode
-        self._default_path_guard_enabled = self.config.policy.path_guard_enabled
-        self._default_command_guard_enabled = self.config.policy.command_guard_enabled
-        self.set(self.mode)
-
-    def set(self, mode: PermissionMode) -> PermissionMode:
-        self.mode = mode
-        if mode == "auto":
-            self.config.policy.hitl_mode = "never"
-            self.config.policy.path_guard_enabled = False
-            self.config.policy.command_guard_enabled = False
-        else:
-            self.config.policy.hitl_mode = self._default_hitl_mode
-            self.config.policy.path_guard_enabled = self._default_path_guard_enabled
-            self.config.policy.command_guard_enabled = self._default_command_guard_enabled
-        return self.mode
-
-    def toggle(self) -> PermissionMode:
-        return self.set("auto" if self.mode == "default" else "default")
 
 
 async def start_repl(
@@ -349,7 +318,12 @@ async def _handle_slash(
     elif command == "/audit":
         limit = int(arg or "20") if (arg or "20").isdigit() else 20
         console.print_json(
-            json.dumps(AuditLog(config.policy.audit_log_path).tail(limit), ensure_ascii=False)
+            json.dumps(
+                AuditLog(config.policy.audit_log_path, sensitive_values=(config.llm.api_key,)).tail(
+                    limit
+                ),
+                ensure_ascii=False,
+            )
         )
     elif command == "/index":
         count = CodeIndex(cwd).rebuild(arg or ".")

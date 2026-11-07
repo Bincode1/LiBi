@@ -501,18 +501,20 @@ def test_interrupted_partial_stream_is_hidden_and_plain_renderer_shows_status(
     async def run():
         manager = SubagentManager()
         manager.event_callback = captured.append
-        await manager.start({"description": "test", "prompt": "test"}, ctx)
-        child = next(iter(manager.activations.values()))
-        async with asyncio.timeout(2):
-            while not child.settled:
-                await asyncio.sleep(0)
-        await manager.flush_observations()
-        assert "unit-private-prefix" not in json.dumps(captured)
-        renderer = PlainRenderer()
-        for event in captured:
-            renderer.handle(event)
-        assert "ended" in capsys.readouterr().out
-        await manager.drain()
+        try:
+            await manager.start({"description": "test", "prompt": "test"}, ctx)
+            child = next(iter(manager.activations.values()))
+            async with asyncio.timeout(2):
+                while not child.settled:
+                    await asyncio.sleep(0)
+            await manager.flush_observations()
+            assert "unit-private-prefix" not in json.dumps(captured)
+            renderer = PlainRenderer()
+            for event in captured:
+                renderer.handle(event)
+            assert "ended" in capsys.readouterr().out
+        finally:
+            await manager.drain()
 
     asyncio.run(run())
 
@@ -532,7 +534,6 @@ def test_runtime_turn_closes_idle_children(tmp_path, monkeypatch):
     async def registry(**kwargs):
         return ToolRegistry(), None
 
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
     monkeypatch.setattr("paicli.runtime.api.QueryEngine", engine_factory)
     monkeypatch.setattr("paicli.runtime.api.build_tool_registry", registry)

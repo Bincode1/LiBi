@@ -6,7 +6,7 @@ from typing import Any
 from paicli.agent import QueryEngine
 from paicli.config import load_config
 from paicli.context import CompactionResponse
-from paicli.session import SessionStore
+from paicli.session import ContextProjector, SessionStore
 from paicli.skill import SkillRegistry
 from paicli.tools import ToolRegistry, get_builtin_tools
 
@@ -112,8 +112,7 @@ class UsageAndCompressionClient:
         }
 
 
-def test_query_engine_executes_tool_and_replays_result(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_query_engine_executes_tool_and_replays_result(tmp_path):
     (tmp_path / "note.txt").write_text("hello\n", encoding="utf-8")
     config = load_config(project_root=tmp_path)
     registry = ToolRegistry()
@@ -131,10 +130,15 @@ def test_query_engine_executes_tool_and_replays_result(tmp_path, monkeypatch):
     result = asyncio.run(run())
     assert result.text == "done"
     assert result.turns == 2
+    tool_events = [
+        event
+        for event in engine.session_store.events(engine.session_id)
+        if event.event_type in {"tool/execution_started", "tool/result"}
+    ]
+    assert [event.tool_call_id for event in tool_events] == ["call_1", "call_1"]
 
 
-def test_load_skill_is_injected_in_the_same_query_next_model_turn(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_load_skill_is_injected_in_the_same_query_next_model_turn(tmp_path):
     SkillRegistry(tmp_path).create(
         "demo-skill",
         description="Use for the demo workflow",
@@ -159,8 +163,7 @@ def test_load_skill_is_injected_in_the_same_query_next_model_turn(tmp_path, monk
     assert client.calls == 2
 
 
-def test_query_integrates_context_compression_and_detailed_usage(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_query_integrates_context_compression_and_detailed_usage(tmp_path):
     config = load_config(project_root=tmp_path)
     config.llm.max_tokens = 100
     config.memory.compression_reserve_tokens = 20
@@ -189,3 +192,16 @@ def test_query_integrates_context_compression_and_detailed_usage(tmp_path, monke
     assert result.total_tokens == 128
     assert result.usage.cache_hit_tokens == 20
     assert result.usage.cache_miss_tokens == 100
+    events = store.events(session_id)
+    checkpoint = next(event for event in events if event.event_type == "compaction/checkpoint")
+    prepared = next(event for event in events if event.event_type == "request/prepared")
+    replayed = ContextProjector().project(
+        events,
+        session_id=session_id,
+        turn_id=prepared.turn_id,
+        step_id=prepared.step_id,
+        through_sequence=prepared.payload["through_sequence"],
+        **prepared.payload["projection"],
+    )
+    assert prepared.payload["compaction_id"] == checkpoint.payload["compaction_id"]
+    assert replayed.context_hash == prepared.payload["context_hash"]

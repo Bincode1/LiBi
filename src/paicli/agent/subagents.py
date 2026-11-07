@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from paicli.agent.subagent_events import ObservationBuffer, public_event
+from paicli.agent.subagent_events import (
+    SUBAGENT_ROLES,
+    ObservationBuffer,
+    public_event,
+    subagent_role,
+)
 from paicli.policy.redaction import Redactor
-from paicli.tools.base import ToolContext, ToolResult, object_schema
+from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
 
 
 class ActivationState(StrEnum):
@@ -258,6 +265,7 @@ class SubagentManager:
         self.event_queue_size = max(32, event_queue_size)
         self.drain_timeout = max(0.1, drain_timeout)
         self.event_callback: Any | None = None
+        self.child_preview_callback: Callable[[dict[str, Any]], None] | None = None
         self.observation_error: Exception | None = None
         self.settlement_error: Exception | None = None
 
@@ -333,22 +341,56 @@ class SubagentManager:
                 "RESIDENT_ACTIVATION_LIMIT_REACHED: parked child capacity reached.",
                 is_error=True,
             )
-        agent_id = f"agent_{uuid.uuid4().hex[:12]}"
-        session_id = None
-        if context.session_store and context.session_id:
-            session_id = context.session_store.create_session(
-                kind="child",
-                parent_session_id=context.session_id,
-            )
-        if session_id is None:
+        store, parent_session_id = context.session_store, context.session_id
+        if store is None or not parent_session_id:
             return ToolResult(
                 "SESSION_PERSISTENCE_UNAVAILABLE: subagents require a session store.",
                 is_error=True,
             )
-        self.session_store = context.session_store
-        self.redactor = context.session_store.redactor
-        self.redactor.add_sensitive_values((context.config.llm.api_key,))
-        self.depths[agent_id] = self.depths.get(parent_id, 0) + 1
+
+        store.redactor.add_sensitive_values((context.config.llm.api_key,))
+        agent_id = f"agent_{uuid.uuid4().hex[:12]}"
+        description = store.redactor.clean(str(payload["description"]))
+        depth = self.depths.get(parent_id, 0) + 1
+        config_snapshot = deepcopy(context.config)
+        policy_snapshot = {
+            "hitl_mode": config_snapshot.policy.hitl_mode,
+            "path_guard_enabled": config_snapshot.policy.path_guard_enabled,
+            "command_guard_enabled": config_snapshot.policy.command_guard_enabled,
+            "subagent_tool_allowlist": config_snapshot.policy.subagent_tool_allowlist,
+            "cwd": str(requested_cwd),
+        }
+        role = subagent_role(payload.get("role"))
+        descriptor = {
+            "child_id": agent_id,
+            "parent_id": parent_id,
+            "description": description,
+            "cwd": str(requested_cwd),
+            "provider": provider_name,
+            "depth": depth,
+            "deadline_seconds": deadline_seconds,
+            "capabilities": asdict(provider.capabilities),
+            "policy_snapshot": policy_snapshot,
+        }
+        if role:
+            descriptor["role"] = role
+        try:
+            session_id = store.start_child_session(
+                parent_session_id,
+                descriptor,
+                turn_id=context.turn_id,
+                step_id=context.step_id,
+                tool_call_id=context.tool_call_id,
+            )
+        except (OSError, sqlite3.Error) as exc:
+            return ToolResult(
+                f"SESSION_PERSISTENCE_UNAVAILABLE: {type(exc).__name__}",
+                is_error=True,
+            )
+
+        self.session_store = store
+        self.redactor = store.redactor
+        self.depths[agent_id] = depth
         activation: Activation
 
         async def execute_provider() -> str | SubagentResult:
@@ -360,121 +402,18 @@ class SubagentManager:
             agent_id,
             parent_id,
             session_id,
-            self.redactor.clean(str(payload["description"])),
+            description,
             task,
-            context.session_id or "",
+            parent_session_id,
+            deadline_seconds=deadline_seconds,
+            provider=provider_name,
+            provider_adapter=provider,
+            capabilities=provider.capabilities,
+            policy_snapshot=policy_snapshot,
+            config_snapshot=config_snapshot,
         )
         self.activations[agent_id] = activation
         self.transition(activation, ActivationState.RUNNING)
-        activation.deadline_seconds = deadline_seconds
-        activation.provider = provider_name
-        activation.provider_adapter = provider
-        activation.capabilities = provider.capabilities
-        activation.policy_snapshot = deepcopy(
-            {
-                "hitl_mode": context.config.policy.hitl_mode,
-                "path_guard_enabled": context.config.policy.path_guard_enabled,
-                "command_guard_enabled": context.config.policy.command_guard_enabled,
-                "subagent_tool_allowlist": context.config.policy.subagent_tool_allowlist,
-                "cwd": str(requested_cwd),
-            }
-        )
-        activation.config_snapshot = deepcopy(context.config)
-        activation.config_snapshot.policy.hitl_mode = activation.policy_snapshot["hitl_mode"]
-        activation.config_snapshot.policy.path_guard_enabled = activation.policy_snapshot[
-            "path_guard_enabled"
-        ]
-        activation.config_snapshot.policy.command_guard_enabled = activation.policy_snapshot[
-            "command_guard_enabled"
-        ]
-        activation.config_snapshot.policy.subagent_tool_allowlist = activation.policy_snapshot[
-            "subagent_tool_allowlist"
-        ]
-        try:
-            if context.session_store:
-                context.session_store.append(
-                    session_id,
-                    "agent/subagent_descriptor",
-                    {
-                        "child_id": agent_id,
-                        "parent_id": parent_id,
-                        "parent_session_id": context.session_id,
-                        "description": activation.description,
-                        "cwd": str(requested_cwd),
-                        "provider": activation.provider,
-                        "depth": self.depths[agent_id],
-                        "deadline_seconds": deadline_seconds,
-                        "capabilities": {
-                            "continuable": activation.capabilities.continuable,
-                            "queue_idle": activation.capabilities.queue_idle,
-                            "steer_running": activation.capabilities.steer_running,
-                            "supports_cancel": activation.capabilities.supports_cancel,
-                            "supports_child_options": (
-                                activation.capabilities.supports_child_options
-                            ),
-                            "supports_structured_output": (
-                                activation.capabilities.supports_structured_output
-                            ),
-                            "supports_live_events": activation.capabilities.supports_live_events,
-                            "external_process": activation.capabilities.external_process,
-                            "agent_options": activation.capabilities.agent_options,
-                            "agent_preset": activation.capabilities.agent_preset,
-                            "output_schema": activation.capabilities.output_schema,
-                            "depth_limit": activation.capabilities.depth_limit,
-                        },
-                        "policy_snapshot": activation.policy_snapshot,
-                    },
-                    source="subagent-manager",
-                )
-                context.session_store.append(
-                    context.session_id or "",
-                    "agent/child_started",
-                    {
-                        "child_id": agent_id,
-                        "child_session_id": session_id,
-                        "description": activation.description,
-                    },
-                    source="subagent-manager",
-                )
-                context.session_store.append(
-                    context.session_id or "",
-                    "agent/subagent_catalog",
-                    {
-                        "version": 1,
-                        "child_id": agent_id,
-                        "child_session_id": session_id,
-                        "parent_id": parent_id,
-                        "parent_session_id": context.session_id,
-                        "provider": activation.provider,
-                        "mode": (
-                            "continuable" if activation.capabilities.continuable else "one-shot"
-                        ),
-                        "label": activation.description,
-                        "capabilities": {
-                            "continuable": activation.capabilities.continuable,
-                            "supports_cancel": activation.capabilities.supports_cancel,
-                            "supports_live_events": activation.capabilities.supports_live_events,
-                        },
-                    },
-                    source="subagent-manager",
-                )
-        except Exception as exc:
-            activation.error_code = "SESSION_PERSISTENCE_UNAVAILABLE"
-            if activation.provider_adapter is None:
-                raise RuntimeError(f"activation {activation.id} has no provider adapter") from exc
-            await activation.provider_adapter.interrupt(activation)
-            await asyncio.gather(activation.task, return_exceptions=True)
-            try:
-                await activation.provider_adapter.dispose(activation)
-            except Exception as cleanup_exc:
-                self._cleanup_failure(activation, cleanup_exc, "Provider cleanup failed")
-            activation.provider_disposed = True
-            self.activations.pop(agent_id, None)
-            self.depths.pop(agent_id, None)
-            return ToolResult(
-                f"SESSION_PERSISTENCE_UNAVAILABLE: {type(exc).__name__}",
-                is_error=True,
-            )
         self._publish_event(
             {
                 "type": "subagent_event",
@@ -595,7 +534,9 @@ class SubagentManager:
     async def _observe_callbacks(self) -> None:
         while not self._observer_stopping or not self._callback_buffer.empty():
             try:
-                event = await asyncio.wait_for(self._callback_buffer.get(), timeout=1.0)
+                # Stay in this task so queue removal and the busy flag cannot be interleaved.
+                async with asyncio.timeout(1.0):
+                    event = await self._callback_buffer.get()
             except TimeoutError:
                 for activation in self.activations.values():
                     if activation.status in _RESIDENT_STATES:
@@ -771,7 +712,6 @@ class SubagentManager:
     ) -> str:
         from paicli.agent.agent import Agent
 
-        requested_cwd = Path(str(payload.get("cwd") or context.cwd)).expanduser().resolve()
         activation = self.activations[agent_id]
 
         async def forward(event: dict[str, Any]) -> None:
@@ -780,6 +720,8 @@ class SubagentManager:
             if event_type in {"text_delta", "thinking_delta", "context_summary"}:
                 self._phase(activation, "model")
             if event_type in {"text_delta", "thinking_delta"}:
+                if event_type == "text_delta" and self.child_preview_callback is not None:
+                    self.child_preview_callback(event)
                 key = "text" if event_type == "text_delta" else "thinking"
                 if event_type not in activation.hidden_channels:
                     text = activation.stream_buffers.get(event_type, "") + str(event.get(key) or "")
@@ -821,7 +763,7 @@ class SubagentManager:
                 )
             ),
             config=activation.config_snapshot,
-            cwd=str(requested_cwd),
+            cwd=activation.policy_snapshot["cwd"],
             approval_callback=context.approval_callback,
             session_store=context.session_store,
             session_id=session_id,
@@ -1102,7 +1044,16 @@ class SubagentManager:
         """Rebuild unacknowledged child results from the append-only parent event log."""
         if self.session_store is None:
             raise RuntimeError("session store is unavailable for delivery recovery")
-        events = self.session_store.events(parent_session_id)
+        events = self.session_store.events(
+            parent_session_id,
+            event_types=(
+                "agent/child_completed",
+                "agent/child_failed",
+                "agent/child_delivery_created",
+                "agent/child_delivery_acknowledged",
+                "user/message",
+            ),
+        )
         created: dict[str, PersistedDelivery] = {}
         acknowledged: set[str] = set()
         for event in events:
@@ -1167,36 +1118,33 @@ class SubagentManager:
         ]
 
     def restore_catalog(self, parent_id: str, parent_session_id: str) -> list[dict[str, Any]]:
-        if self.session_store is None:
+        store = self.session_store
+        if store is None:
             raise RuntimeError("session store is unavailable for catalog recovery")
         entries: dict[str, dict[str, Any]] = {}
-        for event in self.session_store.events(parent_session_id):
-            if event.event_type == "agent/child_started":
-                child_id = str(event.payload.get("child_id") or "")
-                if child_id:
-                    entries.setdefault(
-                        child_id,
-                        {
-                            "version": 0,
-                            "child_id": child_id,
-                            "child_session_id": event.payload.get("child_session_id"),
-                            "parent_id": parent_id,
-                            "parent_session_id": parent_session_id,
-                            "provider": "unknown",
-                            "mode": "unknown",
-                            "label": str(event.payload.get("description") or ""),
-                        },
-                    )
-                continue
-            if event.event_type != "agent/subagent_catalog":
-                continue
-            payload = dict(event.payload)
+        for event in store.events(parent_session_id, event_types=("agent/child_started",)):
+            payload = event.payload
             child_id = str(payload.get("child_id") or "")
-            if not child_id:
-                raise ValueError("subagent catalog event is missing child_id")
-            if int(payload.get("version") or 0) != 1:
-                raise ValueError(f"unsupported subagent catalog version for {child_id}")
-            entries[child_id] = payload
+            if not child_id or child_id in entries:
+                continue
+            provider = payload.get("provider")
+            child_session_id = payload.get("child_session_id")
+            if (
+                not provider
+                and isinstance(child_session_id, str)
+                and store.child_parent(child_session_id) == parent_session_id
+            ):
+                descriptors = store.events(
+                    child_session_id, event_types=("agent/subagent_descriptor",)
+                )
+                if descriptors:
+                    provider = descriptors[0].payload.get("provider")
+            entries[child_id] = {
+                "child_id": child_id,
+                "child_session_id": child_session_id,
+                "provider": provider or "unknown",
+                "label": str(payload.get("description") or ""),
+            }
         self.catalogs[parent_id] = list(entries.values())
         return [dict(item) for item in self.catalogs[parent_id]]
 
@@ -1207,7 +1155,15 @@ class SubagentManager:
         """Mark interrupted activations after restart without replaying their side effects."""
         if self.session_store is None:
             raise RuntimeError("session store is unavailable for child recovery")
-        events = self.session_store.events(parent_session_id)
+        events = self.session_store.events(
+            parent_session_id,
+            event_types=(
+                "agent/child_started",
+                "agent/child_completed",
+                "agent/child_failed",
+                "agent/child_orphaned",
+            ),
+        )
         started: dict[str, dict[str, Any]] = {}
         terminal: set[str] = set()
         orphaned: set[str] = set()
@@ -1234,7 +1190,9 @@ class SubagentManager:
             child_session_id = str(payload.get("child_session_id") or "")
             if not child_session_id:
                 raise ValueError(f"child {child_id} has no persisted session identity")
-            descriptor_events = self.session_store.events(child_session_id)
+            descriptor_events = self.session_store.events(
+                child_session_id, event_types=("agent/subagent_descriptor",)
+            )
             external = any(
                 item.event_type == "agent/subagent_descriptor"
                 and bool(item.payload.get("capabilities", {}).get("external_process"))
@@ -1656,8 +1614,6 @@ class SubagentManager:
 
 
 def make_subagent_tool():
-    from paicli.tools.base import Tool
-
     async def handler(payload: dict[str, Any], context: ToolContext) -> ToolResult:
         if context.subagent_manager is None:
             return ToolResult("Subagent runtime is unavailable.", is_error=True)
@@ -1671,6 +1627,11 @@ def make_subagent_tool():
         parameters=object_schema(
             {
                 "description": {"type": "string", "description": "Short task label"},
+                "role": {
+                    "type": "string",
+                    "enum": list(SUBAGENT_ROLES),
+                    "description": "Optional display role for this task. Choose the closest role.",
+                },
                 "prompt": {
                     "type": "string",
                     "description": "Complete, self-contained task instructions",
@@ -1692,8 +1653,6 @@ def make_subagent_tool():
 
 
 def make_subagent_control_tools():
-    from paicli.tools.base import Tool
-
     async def list_handler(_payload: dict[str, Any], context: ToolContext) -> ToolResult:
         if context.subagent_manager is None:
             return ToolResult("Subagent runtime is unavailable.", is_error=True)
@@ -1773,6 +1732,7 @@ def make_subagent_control_tools():
             handler=interrupt_handler,
             is_read_only=False,
             required_keys=["agent_id"],
+            needs_workspace_checkpoint=False,
         ),
         Tool(
             name="send_message",

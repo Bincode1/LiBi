@@ -18,12 +18,15 @@ import hashlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable
-from contextlib import suppress
+from contextlib import aclosing, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
 from paicli.agent.events import collect_query_result
 from paicli.agent.plan_execute import PlanExecuteAgent
+from paicli.agent.run_controller import RunController
+from paicli.agent.subagents import SubagentManager, make_subagent_control_tools, make_subagent_tool
 from paicli.config import PaiCliConfig
 from paicli.context import (
     CompactionClient,
@@ -36,18 +39,20 @@ from paicli.context import (
     estimate_text_tokens,
 )
 from paicli.image import parse_image_references
-from paicli.llm.base import LlmClient
+from paicli.image.processor import IMAGE_PATTERN
+from paicli.llm.base import LlmClient, ProviderRequestError
 from paicli.llm.pricing import calculate_costs
 from paicli.prompt import PromptAssembler
 from paicli.session import (
     ContextProjector,
     RequestBuilder,
+    SessionEvent,
     SessionStore,
     default_runtime_db_path,
 )
 from paicli.skill import SkillContextBuffer, SkillRegistry
 from paicli.snapshot import SnapshotService
-from paicli.tools.base import ToolContext
+from paicli.tools.base import ToolContext, ToolResult
 from paicli.tools.call_parsing import (
     finalize_tool_calls,
     merge_tool_delta,
@@ -100,6 +105,7 @@ class Agent:
         event_sink: Callable[[dict[str, Any]], Any] | None = None,
         steer_inbox: asyncio.Queue[str] | None = None,
         compaction_client: CompactionClient | None = None,
+        turn_snapshot: SnapshotService | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -113,8 +119,6 @@ class Agent:
         self.session_store = session_store
         self.session_id = session_id
         if mode == "react" and subagent_manager is None:
-            from paicli.agent.subagents import SubagentManager
-
             subagent_manager = SubagentManager(
                 max_active=config.subagents.max_active,
                 max_resident=config.subagents.max_resident,
@@ -128,6 +132,7 @@ class Agent:
         self.event_sink = event_sink
         self.steer_inbox = steer_inbox
         self.compaction_client = compaction_client
+        self._turn_snapshot = turn_snapshot
         self.last_compaction: dict[str, Any] | None = None
         self._context_projector = ContextProjector()
         self._request_builder = RequestBuilder()
@@ -157,7 +162,9 @@ class Agent:
     # Public API — run the agent
     # ------------------------------------------------------------------
 
-    async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
+    async def run(
+        self, message: str, *, turn_id: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
         """Execute *message* and yield streaming events.
 
         Events follow this protocol (``type`` field determines the shape):
@@ -183,58 +190,87 @@ class Agent:
             {"type": "done", "total_turns": int, "total_tokens": int,
              "usage": {...}, "cost": {...}, "messages": [Message, ...]}
         """
-        snapshot = SnapshotService(self.cwd)
-        with suppress(Exception):
-            snapshot.create("pre-turn")
-
+        session_id = self._ensure_session()
+        assert self.session_store is not None
+        if turn_id is None:
+            turn_id = f"turn_{uuid.uuid4().hex}"
+            self.session_store.start_turn(session_id, turn_id, mode=self.mode, message=message)
+        elif self.session_store.active_turn_step(session_id)[0] != turn_id:
+            raise RuntimeError("The accepted turn is no longer active.")
+        snapshot = None
         try:
-            if self.mode == "plan":
-                events = self._run_plan(message)
+            if self.mode == "react":
+                snapshot = self._turn_snapshot or SnapshotService(self.cwd)
+            stream = (
+                self._run_react(message, snapshot, turn_id)
+                if snapshot is not None
+                else self._run_plan(message, turn_id)
+            )
+            async with aclosing(stream) as events:
                 async for event in events:
                     if self.event_sink is not None:
                         await self.event_sink(event)
                     yield event
-            else:
-                async for event in self._run_react(message):
-                    if self.event_sink is not None:
-                        await self.event_sink(event)
-                    yield event
-        except asyncio.CancelledError:
-            if self.subagent_manager is not None:
-                await self.subagent_manager.cancel_for_parent(self.agent_id)
-            if self.session_store is not None and self.session_id is not None:
-                state = self.session_store.state(self.session_id)
-                if state.active_turn_id:
-                    self._log(
-                        "turn/canceled",
-                        {"reason": "cancelled"},
-                        turn_id=state.active_turn_id,
-                    )
-            raise
-        except TimeoutError:
-            if self.session_store is not None and self.session_id is not None:
-                self._log("turn/failed", {"reason": "deadline_exceeded"})
+        except (asyncio.CancelledError, GeneratorExit):
+            cleanup_error = None
+            try:
+                if self.subagent_manager is not None:
+                    async with asyncio.timeout(self.config.subagents.drain_timeout):
+                        await self.subagent_manager.cancel_for_parent(self.agent_id)
+            except Exception as exc:
+                cleanup_error = type(exc).__name__
+            finally:
+                self._close_canceled_turn(turn_id, cleanup_error)
             raise
         except Exception as exc:
-            if self.session_store is not None and self.session_id is not None:
-                state = self.session_store.state(self.session_id)
-                if state.active_turn_id:
-                    if state.active_step_id:
-                        self._log(
-                            "step/failed",
-                            {"reason": type(exc).__name__},
-                            turn_id=state.active_turn_id,
-                            step_id=state.active_step_id,
-                        )
-                    self._log(
-                        "turn/failed",
-                        {"reason": type(exc).__name__},
-                        turn_id=state.active_turn_id,
+            active_turn_id, step_id = self.session_store.active_turn_step(session_id)
+            if active_turn_id == turn_id:
+                failure: dict[str, Any] = {"reason": type(exc).__name__}
+                if isinstance(exc, TimeoutError):
+                    failure = {"reason": "deadline_exceeded"}
+                elif isinstance(exc, CompactionError) and exc.provider_error is not None:
+                    failure = {
+                        "reason": "provider_error",
+                        "provider_error": exc.provider_error,
+                        "purpose": "compaction",
+                    }
+                if step_id:
+                    self._close_pending_tools(
+                        turn_id, step_id, "Tool result unknown after failure."
                     )
+                    self._log("step/failed", failure, turn_id=turn_id, step_id=step_id)
+                self._log("turn/failed", failure, turn_id=turn_id)
             raise
         finally:
-            with suppress(Exception):
-                snapshot.create("post-turn")
+            if snapshot is not None and self._turn_snapshot is None:
+                with suppress(Exception):
+                    snapshot.finish_turn()
+
+    def _close_canceled_turn(self, turn_id: str, cleanup_error: str | None) -> None:
+        assert self.session_store is not None and self.session_id is not None
+        active_turn_id, step_id = self.session_store.active_turn_step(self.session_id)
+        if active_turn_id != turn_id:
+            return
+        if step_id:
+            self._close_pending_tools(turn_id, step_id, "Tool call canceled.")
+        detail = {"reason": "cancelled"}
+        if cleanup_error is not None:
+            detail["cleanup_error"] = cleanup_error
+        self._log("turn/canceled", detail, turn_id=turn_id)
+
+    def _close_pending_tools(self, turn_id: str, step_id: str, content: str) -> None:
+        assert self.session_store is not None and self.session_id is not None
+        for call_id, name in self.session_store.pending_tool_calls(
+            self.session_id, turn_id, step_id
+        ).items():
+            self._log(
+                "tool/result",
+                {"name": name, "content": content, "is_error": True},
+                turn_id=turn_id,
+                step_id=step_id,
+                tool_call_id=call_id,
+                source="tool-executor",
+            )
 
     async def run_complete(self, message: str) -> QueryResult:
         """Run the agent and collect all events into a single result."""
@@ -304,6 +340,15 @@ class Agent:
         )
 
         def write_event(event_type: str, payload: dict[str, Any]) -> Any:
+            if event_type == "request/attempt_failed":
+                return self.session_store.append(
+                    session_id,
+                    event_type,
+                    payload,
+                    turn_id=state.active_turn_id,
+                    step_id=state.active_step_id,
+                    source="compaction-coordinator",
+                )
             if event_type == "compaction/started":
                 return self.session_store.append(
                     session_id,
@@ -401,17 +446,13 @@ class Agent:
     # Mode runners
     # ------------------------------------------------------------------
 
-    async def _run_react(self, message: str) -> AsyncIterator[dict[str, Any]]:
+    async def _run_react(
+        self, message: str, snapshot: SnapshotService, turn_id: str
+    ) -> AsyncIterator[dict[str, Any]]:
         """Standard ReAct loop (the default and most common mode)."""
-        turn_id = f"turn_{uuid.uuid4().hex}"
-        session_id = self._ensure_session()
+        session_id = self.session_id
         store = self.session_store
-        assert store is not None
-        self._log(
-            "turn/started",
-            {"mode": "react"},
-            turn_id=turn_id,
-        )
+        assert store is not None and session_id is not None
         original = message
         candidate_message = _prepend_skill_candidates(message, self.cwd, self.config)
         candidate_prefix, separator, request_message = candidate_message.partition(
@@ -452,18 +493,8 @@ class Agent:
             )
         else:
             message = with_skill_context
-        self._log(
-            "user/message",
-            {"content": original},
-            turn_id=turn_id,
-            source="cli-or-runtime",
-        )
-        # Prepend skill candidates that match the user message.
-
         tool_defs = self.tool_registry.definitions()
         if self.mode == "react":
-            from paicli.agent.subagents import make_subagent_control_tools, make_subagent_tool
-
             subagent_tools = [make_subagent_tool(), *make_subagent_control_tools()]
             allowlist = self.config.policy.subagent_tool_allowlist
             if allowlist is None or self.agent_id == "root":
@@ -492,8 +523,10 @@ class Agent:
             ),
             session_store=store,
             session_id=session_id,
+            turn_id=turn_id,
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
+            before_workspace_mutation=snapshot.checkpoint_turn,
             status_callback=(lambda event: self.subagent_manager.tool_status(self.agent_id, event))
             if self.subagent_manager is not None
             else None,
@@ -528,14 +561,30 @@ class Agent:
         total_usage = Usage()
         turn = 0
         finished = False
-        from paicli.agent.run_controller import RunController
-
         run_controller = RunController(
             manager=self.subagent_manager,
             parent_id=self.agent_id,
             parent_session_id=session_id,
             session_store=store,
         )
+        context_events: list[SessionEvent] = []
+        context_cursor = 0
+        context_secrets = store.redactor.sensitive_values
+
+        def refresh_context(step_id: str) -> list[SessionEvent]:
+            nonlocal context_events, context_cursor, context_secrets
+            if context_secrets != store.redactor.sensitive_values:
+                # A newly configured secret also applies to older cached events.
+                context_secrets = store.redactor.sensitive_values
+                context_events = []
+                context_cursor = 0
+            incoming = store.events(session_id, after_sequence=context_cursor)
+            if incoming:
+                context_cursor = incoming[-1].sequence
+                context_events = self._context_projector.working_events(
+                    context_events + incoming, turn_id=turn_id, step_id=step_id
+                )
+            return context_events
 
         async def consume_steer(step_id: str) -> bool:
             if self.steer_inbox is None:
@@ -597,19 +646,22 @@ class Agent:
                 source="runtime-context",
             )
 
-            current_events = store.events(session_id)
+            current_events = refresh_context(step_id)
+            projection = {
+                "scope": "session",
+                "route": self.llm_client.provider_name,
+                "adapter_capabilities": {
+                    "provider": self.llm_client.provider_name,
+                    "supports_images": bool(getattr(self.llm_client, "supports_images", False)),
+                },
+                "budget": self._budget_metadata(),
+            }
             current_view = self._context_projector.project(
                 current_events,
                 session_id=session_id,
                 turn_id=turn_id,
                 step_id=step_id,
-                scope="session",
-                route=self.llm_client.provider_name,
-                adapter_capabilities={
-                    "provider": self.llm_client.provider_name,
-                    "supports_images": bool(getattr(self.llm_client, "supports_images", False)),
-                },
-                budget=self._budget_metadata(),
+                **projection,
             )
 
             if self.config.memory.compression_mode == "llm" and callable(
@@ -658,36 +710,30 @@ class Agent:
                             turn_id,
                             step_id,
                         )
+                    current_events = refresh_context(step_id)
                     current_view = self._context_projector.project(
-                        store.events(session_id),
+                        current_events,
                         session_id=session_id,
                         turn_id=turn_id,
                         step_id=step_id,
-                        scope="session",
-                        route=self.llm_client.provider_name,
-                        adapter_capabilities={
-                            "provider": self.llm_client.provider_name,
-                            "supports_images": bool(
-                                getattr(self.llm_client, "supports_images", False)
-                            ),
-                        },
-                        budget=self._budget_metadata(),
+                        **projection,
                     )
 
-            current_view = self._context_projector.project(
-                store.events(session_id),
-                session_id=session_id,
-                turn_id=turn_id,
-                step_id=step_id,
-                scope="session",
-                route=self.llm_client.provider_name,
-                adapter_capabilities={
-                    "provider": self.llm_client.provider_name,
-                    "supports_images": bool(getattr(self.llm_client, "supports_images", False)),
-                },
-                message_transform=lambda item: _transform_message_images(item, self.cwd),
-                budget=self._budget_metadata(),
-            )
+            # Budget pressure uses raw messages. Resolve image references only after compaction.
+            if any(
+                item.role == "user"
+                and isinstance(item.content, str)
+                and IMAGE_PATTERN.search(item.content)
+                for item in current_view.messages
+            ):
+                current_view = self._context_projector.project(
+                    current_events,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                    message_transform=lambda item: _transform_message_images(item, self.cwd),
+                    **projection,
+                )
             request = self._request_builder.build(
                 current_view,
                 model=self.llm_client.model_name,
@@ -712,15 +758,7 @@ class Agent:
                 "context_window": int(self.llm_client.max_context_window),
                 "compaction_id": request.metadata["compaction_id"],
                 "through_sequence": request.metadata["through_sequence"],
-                "projection": {
-                    "scope": "session",
-                    "route": self.llm_client.provider_name,
-                    "adapter_capabilities": {
-                        "provider": self.llm_client.provider_name,
-                        "supports_images": bool(getattr(self.llm_client, "supports_images", False)),
-                    },
-                    "budget": self._budget_metadata(),
-                },
+                "projection": projection,
             }
             yield _annotate_event(
                 {"type": "context_summary", **context_summary},
@@ -793,29 +831,53 @@ class Agent:
                             turn_id,
                             step_id,
                         )
+                    elif event_type == "provider_attempt_failed":
+                        self._log(
+                            "request/attempt_failed",
+                            {
+                                **event["diagnostic"],
+                                "request_id": request.request_id,
+                                "provider": request.provider,
+                                "model": request.model,
+                            },
+                            turn_id=turn_id,
+                            step_id=step_id,
+                            source="provider",
+                        )
                     elif event_type == "error":
                         error = event["error"]
+                        failure: dict[str, Any] = {"reason": "provider_error"}
+                        if isinstance(error, ProviderRequestError):
+                            failure["provider_error"] = error.details
                         self._log(
                             "request/failed",
-                            {"request_id": request.request_id, "error_type": type(error).__name__},
+                            {
+                                "request_id": request.request_id,
+                                "error_type": type(error).__name__,
+                                **failure,
+                            },
                             turn_id=turn_id,
                             step_id=step_id,
                         )
                         self._log(
                             "step/failed",
-                            {"reason": "provider_error"},
+                            failure,
                             turn_id=turn_id,
                             step_id=step_id,
                         )
                         self._log(
                             "turn/failed",
-                            {"reason": "provider_error"},
+                            failure,
                             turn_id=turn_id,
                         )
                         yield _annotate_event(
                             {"type": "error", "error": error}, session_id, turn_id, step_id
                         )
                         return
+            except (asyncio.CancelledError, GeneratorExit):
+                if close := getattr(response_events, "aclose", None):
+                    await close()
+                raise
             except Exception as exc:
                 self._log(
                     "request/failed",
@@ -837,7 +899,12 @@ class Agent:
                 raise
 
             total_usage = total_usage + turn_usage
-            tool_calls = finalize_tool_calls(tool_states)
+            truncated = stop_reason == "max_tokens"
+            tool_calls = [] if truncated else finalize_tool_calls(tool_states)
+            for call in tool_calls:
+                if store.redactor.clean(call["id"]) != call["id"]:
+                    # Use one opaque ID for the call and its result before either is persisted.
+                    call["id"] = f"call_{uuid.uuid4().hex}"
             assistant_msg = Message(
                 role="assistant",
                 content=text or "",
@@ -859,6 +926,21 @@ class Agent:
                 step_id=step_id,
                 source="provider",
             )
+            if truncated:
+                failure = {"reason": "max_output_tokens"}
+                self._log("step/failed", failure, turn_id=turn_id, step_id=step_id)
+                self._log("turn/failed", failure, turn_id=turn_id)
+                self.last_usage = total_usage
+                yield _annotate_event(
+                    {
+                        "type": "error",
+                        "error": RuntimeError("Model output reached its token limit."),
+                    },
+                    session_id,
+                    turn_id,
+                    step_id,
+                )
+                return
             yield _annotate_event(
                 {"type": "turn_complete", "turn": turn, "stop_reason": stop_reason},
                 session_id,
@@ -903,6 +985,7 @@ class Agent:
                                 "delivery_ids": [item.delivery_id for item in deliveries],
                             },
                             turn_id=turn_id,
+                            step_id=step_id,
                             source="subagent-delivery",
                         )
                         run_controller.acknowledge_deliveries(deliveries)
@@ -936,7 +1019,28 @@ class Agent:
                     step_id,
                 )
 
-            tool_results = await executor.execute_all(tool_calls, context)
+            completed_results: list[ToolResult] = []
+            try:
+                tool_results = await executor.execute_all(
+                    tool_calls,
+                    replace(context, step_id=step_id),
+                    on_result=completed_results.append,
+                )
+            except (Exception, asyncio.CancelledError):
+                for result in completed_results:
+                    self._log(
+                        "tool/result",
+                        {
+                            "name": tool_name_by_id(tool_calls, result.tool_use_id or ""),
+                            "content": result.content,
+                            "is_error": result.is_error,
+                        },
+                        turn_id=turn_id,
+                        step_id=step_id,
+                        tool_call_id=result.tool_use_id,
+                        source="tool-executor",
+                    )
+                raise
             loaded_skill_context = _drain_skill_context(self.skill_context_buffer)
             load_skill_ids = [
                 str(call.get("id") or "")
@@ -948,18 +1052,6 @@ class Agent:
 
             for result in tool_results:
                 tool_name = tool_name_by_id(tool_calls, result.tool_use_id or "")
-                yield _annotate_event(
-                    {
-                        "type": "tool_result",
-                        "name": tool_name,
-                        "result": result.content,
-                        "is_error": result.is_error,
-                        "tool_call_id": result.tool_use_id,
-                    },
-                    session_id,
-                    turn_id,
-                    step_id,
-                )
                 model_content = result.content
                 if loaded_skill_context and result.tool_use_id == injection_target:
                     model_content = f"{model_content}\n\n{loaded_skill_context}"
@@ -971,6 +1063,20 @@ class Agent:
                     step_id=step_id,
                     tool_call_id=result.tool_use_id,
                     source="tool-executor",
+                )
+
+            for result in tool_results:
+                yield _annotate_event(
+                    {
+                        "type": "tool_result",
+                        "name": tool_name_by_id(tool_calls, result.tool_use_id or ""),
+                        "result": result.content,
+                        "is_error": result.is_error,
+                        "tool_call_id": result.tool_use_id,
+                    },
+                    session_id,
+                    turn_id,
+                    step_id,
                 )
 
             if loaded_skill_context:
@@ -1018,12 +1124,7 @@ class Agent:
             )
             return
 
-        self._log(
-            "turn/completed",
-            {"total_tokens": total_usage.total_tokens, "steps": turn},
-            turn_id=turn_id,
-        )
-        final_events = store.events(session_id)
+        final_events = refresh_context(step_id)
         completed_step = next(
             (
                 event.step_id
@@ -1033,14 +1134,17 @@ class Agent:
             None,
         )
         if completed_step is None:
-            raise RuntimeError(
-                "internal error: no completed step found for the finished turn"
-            )
+            raise RuntimeError("internal error: no completed step found for the finished turn")
         final_view = self._context_projector.project(
             final_events,
             session_id=session_id,
             turn_id=turn_id,
             step_id=completed_step,
+        )
+        self._log(
+            "turn/completed",
+            {"total_tokens": total_usage.total_tokens, "steps": turn},
+            turn_id=turn_id,
         )
         self.last_usage = total_usage
 
@@ -1063,6 +1167,7 @@ class Agent:
         if self.session_store is None:
             self.session_store = SessionStore(
                 default_runtime_db_path(),
+                workspace=self.cwd,
                 sensitive_values=(self.config.llm.api_key,),
             )
         self.session_store.redactor.add_sensitive_values((self.config.llm.api_key,))
@@ -1078,6 +1183,7 @@ class Agent:
         session_id: str | None = None,
         turn_id: str | None = None,
         step_id: str | None = None,
+        tool_call_id: str | None = None,
         source: str | None = None,
     ) -> None:
         """Append an event to the session store.
@@ -1091,11 +1197,18 @@ class Agent:
         if sid is None:
             return
         self.session_store.append(
-            sid, event_type, payload, turn_id=turn_id, step_id=step_id, source=source
+            sid,
+            event_type,
+            payload,
+            turn_id=turn_id,
+            step_id=step_id,
+            tool_call_id=tool_call_id,
+            source=source or "agent",
         )
 
     def _budget_metadata(self) -> dict[str, int]:
         return {
+            "historical_tool_result_chars": 2_000,
             "context_window": int(self.llm_client.max_context_window),
             "max_output_tokens": int(self.config.llm.max_tokens),
             "reserve_tokens": int(self.config.memory.compression_reserve_tokens),
@@ -1108,11 +1221,12 @@ class Agent:
         if self.session_store is None:
             self.session_store = SessionStore(
                 default_runtime_db_path(),
+                workspace=self.cwd,
                 sensitive_values=(self.config.llm.api_key,),
             )
         return self.session_store.create_session()
 
-    async def _run_plan(self, message: str) -> AsyncIterator[dict[str, Any]]:
+    async def _run_plan(self, message: str, turn_id: str) -> AsyncIterator[dict[str, Any]]:
         """Plan-then-execute mode: the planner creates a DAG, then workers run it."""
         session_id = self._ensure_session()
         agent = PlanExecuteAgent(
@@ -1125,11 +1239,12 @@ class Agent:
             session_store=self.session_store,
             session_id=session_id,
         )
-        async for event in agent.run(message):
-            if event.get("type") == "done":
-                self.last_usage = Usage.from_mapping(event.get("usage") or {})
-                self.last_cost = dict(event.get("cost") or {})
-            yield event
+        async with aclosing(agent.run(message, turn_id=turn_id)) as events:
+            async for event in events:
+                if event.get("type") == "done":
+                    self.last_usage = Usage.from_mapping(event.get("usage") or {})
+                    self.last_cost = dict(event.get("cost") or {})
+                yield event
 
     # ------------------------------------------------------------------
     # Configuration helpers

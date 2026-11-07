@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import aclosing, suppress
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from paicli.config import PaiCliConfig
-from paicli.llm.base import LlmClient
+from paicli.llm.base import LlmClient, ProviderRequestError
 from paicli.llm.pricing import calculate_costs
 from paicli.plan import ExecutionPlan, Planner, Task, TaskStatus
 from paicli.prompt import PromptAssembler
@@ -57,10 +58,13 @@ class PlanExecuteAgent:
         self.session_store = session_store
         self.session_id = session_id
 
-    async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
+    async def run(
+        self, message: str, *, turn_id: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
         if self.session_store is None:
             self.session_store = SessionStore(
                 default_runtime_db_path(),
+                workspace=self.cwd,
                 sensitive_values=(self.config.llm.api_key,),
             )
         store = self.session_store
@@ -68,10 +72,13 @@ class PlanExecuteAgent:
         if self.session_id is None:
             self.session_id = store.create_session()
         session_id = self.session_id
-        turn_id = f"turn_{uuid.uuid4().hex}"
+        if turn_id is None:
+            turn_id = f"turn_{uuid.uuid4().hex}"
+            store.start_turn(session_id, turn_id, mode="plan", message=message)
+        elif store.active_turn_step(session_id)[0] != turn_id:
+            raise RuntimeError("The accepted turn is no longer active.")
         step_id = f"step_{uuid.uuid4().hex}"
-        store.append(session_id, "turn/started", {"mode": "plan"}, turn_id=turn_id)
-        store.append(session_id, "user/message", {"content": message}, turn_id=turn_id)
+        plan_request_id = f"req_{uuid.uuid4().hex}"
         store.append(session_id, "step/started", {"mode": "plan"}, turn_id=turn_id, step_id=step_id)
         answer: list[str] = []
         try:
@@ -80,6 +87,22 @@ class PlanExecuteAgent:
                     kind = event.get("type")
                     if kind == "text_delta":
                         answer.append(str(event.get("text") or ""))
+                    elif kind == "provider_attempt_failed":
+                        store.append(
+                            session_id,
+                            "request/attempt_failed",
+                            {
+                                **event["diagnostic"],
+                                "request_id": plan_request_id,
+                                "purpose": "planning",
+                                "provider": event["provider"],
+                                "model": event["model"],
+                            },
+                            turn_id=turn_id,
+                            step_id=step_id,
+                            source="planner",
+                        )
+                        continue
                     elif kind in {"plan_task_started", "plan_task_done", "plan_task_failed"}:
                         event_type = {
                             "plan_task_started": "agent/child_started",
@@ -132,25 +155,28 @@ class PlanExecuteAgent:
                         "step_id": step_id,
                     }
         except BaseException as exc:
+            if store.active_turn_step(session_id)[0] != turn_id:
+                raise
             status = (
                 "turn/canceled"
-                if isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+                if isinstance(exc, asyncio.CancelledError | GeneratorExit)
                 else "turn/failed"
             )
+            failure: dict[str, Any] = {"reason": type(exc).__name__}
+            if isinstance(exc, ProviderRequestError):
+                failure = {"reason": "provider_error", "provider_error": exc.details}
             store.append(
                 session_id,
                 "step/failed",
-                {"reason": type(exc).__name__},
+                failure,
                 turn_id=turn_id,
                 step_id=step_id,
             )
-            store.append(session_id, status, {"reason": type(exc).__name__}, turn_id=turn_id)
+            store.append(session_id, status, failure, turn_id=turn_id)
             raise
 
     async def _run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)
-        with suppress(Exception):
-            snapshot.create("pre-turn")
         total_usage = Usage()
         total_turns = 0
         final_text = ""
@@ -168,20 +194,21 @@ class PlanExecuteAgent:
             if plan is None:
                 raise ValueError("planner did not produce an execution plan")
             yield {"type": "text_delta", "text": plan.summarize() + "\n\n"}
-            async for event in self._execute_plan(plan):
-                if event.get("type") == "usage":
-                    total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
-                elif event.get("type") == "plan_task_done":
-                    total_turns += int(event.get("turns") or 0)
-                elif event.get("type") == "text_delta":
-                    final_text += str(event.get("text") or "")
-                yield event
+            async with aclosing(self._execute_plan(plan, snapshot)) as events:
+                async for event in events:
+                    if event.get("type") == "usage":
+                        total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
+                    elif event.get("type") == "plan_task_done":
+                        total_turns += int(event.get("turns") or 0)
+                    elif event.get("type") == "text_delta":
+                        final_text += str(event.get("text") or "")
+                    yield event
         except Exception as exc:  # noqa: BLE001
             yield {"type": "error", "error": exc}
             return
         finally:
             with suppress(Exception):
-                snapshot.create("post-turn")
+                snapshot.finish_turn()
         done: dict[str, Any] = {
             "type": "done",
             "total_turns": total_turns,
@@ -197,7 +224,9 @@ class PlanExecuteAgent:
             done["cost"] = costs
         yield done
 
-    async def _execute_plan(self, plan: ExecutionPlan) -> AsyncIterator[dict[str, Any]]:
+    async def _execute_plan(
+        self, plan: ExecutionPlan, snapshot: SnapshotService
+    ) -> AsyncIterator[dict[str, Any]]:
         yield {"type": "text_delta", "text": "开始执行计划……\n\n"}
         yield {"type": "plan_status", "phase": "execution"}
         plan.mark_started()
@@ -207,11 +236,14 @@ class PlanExecuteAgent:
                 break
             if len(executable) == 1:
                 result: TaskRunResult | None = None
-                async for event in self._execute_task_stream(plan, executable[0]):
-                    if event.get("type") == "plan_task_result":
-                        result = event["result"]
-                    else:
-                        yield event
+                async with aclosing(
+                    self._execute_task_stream(plan, executable[0], snapshot)
+                ) as events:
+                    async for event in events:
+                        if event.get("type") == "plan_task_result":
+                            result = event["result"]
+                        else:
+                            yield event
                 if result is None:
                     raise RuntimeError(f"task {executable[0].id} did not produce a result")
                 async for event in self._apply_task_result(result):
@@ -223,7 +255,7 @@ class PlanExecuteAgent:
             }
             queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
             runners = [
-                asyncio.create_task(self._pump_task_events(plan, task, queue))
+                asyncio.create_task(self._pump_task_events(plan, task, queue, snapshot))
                 for task in executable
             ]
             results: dict[str, TaskRunResult] = {}
@@ -298,9 +330,10 @@ class PlanExecuteAgent:
         plan: ExecutionPlan,
         task: Task,
         queue: asyncio.Queue[dict[str, Any]],
+        snapshot: SnapshotService,
     ) -> None:
         try:
-            async for event in self._execute_task_stream(plan, task):
+            async for event in self._execute_task_stream(plan, task, snapshot):
                 await queue.put(event)
         finally:
             await queue.put({"type": "plan_task_stream_done", "task_id": task.id})
@@ -309,6 +342,7 @@ class PlanExecuteAgent:
         self,
         plan: ExecutionPlan,
         task: Task,
+        snapshot: SnapshotService,
     ) -> AsyncIterator[dict[str, Any]]:
         from paicli.agent.agent import Agent
 
@@ -326,6 +360,7 @@ class PlanExecuteAgent:
             max_turns=self.max_task_turns,
             session_store=self.session_store,
             session_id=child_session_id,
+            turn_snapshot=snapshot,
         )
         task.mark_started()
         yield {
@@ -338,6 +373,7 @@ class PlanExecuteAgent:
         tool_results: list[str] = []
         usage = Usage()
         turns = 0
+        canceled = False
         try:
             async with aclosing(worker.run(_task_context(plan, task))) as events:
                 async for event in events:
@@ -366,6 +402,9 @@ class PlanExecuteAgent:
                     session_id=child_session_id,
                 ),
             }
+        except (asyncio.CancelledError, GeneratorExit):
+            canceled = True
+            raise
         except Exception as exc:  # noqa: BLE001
             yield {
                 "type": "plan_task_result",
@@ -380,7 +419,14 @@ class PlanExecuteAgent:
             }
         finally:
             if worker.subagent_manager is not None:
-                await worker.subagent_manager.drain()
+                try:
+                    await worker.subagent_manager.drain()
+                except Exception as exc:
+                    if not canceled:
+                        raise
+                    logging.getLogger(__name__).warning(
+                        "Canceled plan task cleanup failed: %s", type(exc).__name__
+                    )
 
     def _task_system_prompt(self, plan: ExecutionPlan, task: Task) -> str:
         base = PromptAssembler(

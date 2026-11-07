@@ -114,6 +114,40 @@ def test_lifecycle_priority_coalescing_and_snapshot_after_overload():
     asyncio.run(run())
 
 
+def test_flush_observations_waits_for_callback_after_queue_item_is_removed():
+    async def run():
+        manager = SubagentManager()
+        callbacks = []
+        manager.event_callback = callbacks.append
+        original_get = manager._callback_buffer.get
+        removed = asyncio.Event()
+
+        async def get_then_notify():
+            item = await original_get()
+            removed.set()
+            return item
+
+        manager._callback_buffer.get = get_then_notify
+        manager._observer_task = asyncio.create_task(manager._observe_callbacks())
+        try:
+            # Let the observer park on an empty queue before offering the event.
+            await asyncio.sleep(0)
+            manager._publish_event(
+                {
+                    "agent": "child",
+                    "parent_id": "root",
+                    "event": {"type": "ended", "status": "completed"},
+                }
+            )
+            await asyncio.wait_for(removed.wait(), timeout=1)
+            await asyncio.wait_for(manager.flush_observations(), timeout=1)
+            assert [event["event"]["type"] for event in callbacks] == ["ended"]
+        finally:
+            await manager.drain()
+
+    asyncio.run(run())
+
+
 def test_slow_callback_does_not_block_child_and_gap_recovers_state(tmp_path, monkeypatch):
     ctx = make_context(tmp_path)
     entered = threading.Event()

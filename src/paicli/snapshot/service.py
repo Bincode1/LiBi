@@ -25,6 +25,17 @@ class SnapshotService:
         self.root = Path.home() / ".paicli" / "snapshots" / digest
         self.root.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root / "index.jsonl"
+        self._turn_checkpointed = False
+
+    def checkpoint_turn(self) -> None:
+        if not self._turn_checkpointed:
+            self.create("pre-turn")
+            self._turn_checkpointed = True
+
+    def finish_turn(self) -> None:
+        if self._turn_checkpointed:
+            self.create("post-turn")
+            self._turn_checkpointed = False
 
     def create(self, phase: str) -> SnapshotRecord:
         snapshot_id = f"{phase}_{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"

@@ -71,6 +71,10 @@ def main(
             help="Resume an existing persisted session by ID",
         ),
     ] = None,
+    adopt_session: Annotated[
+        bool,
+        typer.Option("--adopt-session", help="Bind the selected legacy session to this workspace"),
+    ] = False,
     resume: Annotated[
         bool,
         typer.Option(
@@ -154,12 +158,14 @@ def main(
             "use either --resume or --session-id, not both",
             param_hint="--resume",
         )
+    if adopt_session and session_id is None:
+        raise typer.BadParameter("requires --session-id", param_hint="--adopt-session")
 
     session_store = None
     if resume:
         from paicli.session import SessionStore, default_runtime_db_path
 
-        session_store = SessionStore(default_runtime_db_path())
+        session_store = SessionStore(default_runtime_db_path(), workspace=root)
         session_id = _select_session(session_store)
 
     from paicli.config import load_config
@@ -170,12 +176,18 @@ def main(
 
     if session_id is not None:
         if session_store is None:
-            from paicli.session import SessionStore, default_runtime_db_path
+            from paicli.session import SessionStore, TurnInProgressError, default_runtime_db_path
 
             session_store = SessionStore(
                 default_runtime_db_path(),
+                workspace=root,
                 sensitive_values=(config.llm.api_key,),
             )
+            if adopt_session:
+                try:
+                    session_store.adopt_session(session_id)
+                except (ValueError, TurnInProgressError) as exc:
+                    raise typer.BadParameter(str(exc), param_hint="--adopt-session") from exc
         if not session_store.session_exists(session_id):
             raise typer.BadParameter(
                 f"session not found: {session_id}",
@@ -239,7 +251,9 @@ def doctor(
 @app.command("serve")
 def runtime_serve(
     http: Annotated[bool, typer.Option("--http", help="Serve Runtime API over HTTP")] = True,
-    port: Annotated[int, typer.Option("--port", help="HTTP port")] = 8080,
+    port: Annotated[
+        int | None, typer.Option("--port", min=1, max=65535, help="Override the configured port")
+    ] = None,
     api_key: Annotated[
         str | None,
         typer.Option("--api-key", help="Runtime API key. Defaults to PAICLI_RUNTIME_API_KEY."),
@@ -249,17 +263,17 @@ def runtime_serve(
     """Start the durable task runtime server (HTTP API)."""
     from paicli.config import load_config
     from paicli.runtime import RuntimeApiServer
-    from paicli.runtime.api import runtime_api_key
+    from paicli.runtime.api import RuntimeBindError, runtime_api_key
 
     _ = http
     root = (cwd or Path.cwd()).resolve()
-    config = load_config(project_root=root)
     try:
+        config = load_config(project_root=root)
         key = runtime_api_key(api_key)
-    except ValueError as exc:
+        RuntimeApiServer(cwd=str(root), config=config, api_key=key, port=port).serve_forever()
+    except (ValueError, RuntimeBindError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
-    RuntimeApiServer(cwd=str(root), config=config, api_key=key, port=port).serve_forever()
 
 
 @app.command("worker")

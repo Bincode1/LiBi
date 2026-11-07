@@ -122,6 +122,15 @@ class FeatureConfig:
 
 
 @dataclass(slots=True)
+class RuntimeConfig:
+    port: int = 24158
+
+    def __post_init__(self) -> None:
+        if type(self.port) is not int or not 1 <= self.port <= 65535:
+            raise ValueError("runtime.port must be an integer from 1 to 65535")
+
+
+@dataclass(slots=True)
 class PaiCliConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     render_mode: str = "inline"
@@ -133,6 +142,7 @@ class PaiCliConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
 
 def load_config(
@@ -162,12 +172,16 @@ def load_config(
     data = _apply_env(data, env_map)
     memory = data.get("memory", {})
     if memory.get("compression_mode") not in {"llm", "disabled"}:
-        raise ValueError("memory.compression_mode must be llm or disabled; extractive compression was removed")
+        raise ValueError(
+            "memory.compression_mode must be llm or disabled; extractive compression was removed"
+        )
     removed = {"max_conversation_history", "summary_max_chars", "mode_source"} & memory.keys()
     if removed:
         raise ValueError(f"removed memory settings: {', '.join(sorted(removed))}")
     if "context_compression" in data.get("features", {}):
-        raise ValueError("features.context_compression was removed; use memory.compression_mode=llm or disabled")
+        raise ValueError(
+            "features.context_compression was removed; use memory.compression_mode=llm or disabled"
+        )
     config = _dict_to_config(data)
     if config.prompt.agent_mode not in {"react", "plan"}:
         raise ValueError("prompt.agent_mode must be react or plan; Team mode has been removed")
@@ -195,22 +209,26 @@ def config_to_public_dict(config: PaiCliConfig) -> dict[str, Any]:
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return raw if isinstance(raw, dict) else None
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON configuration in {path} at line {exc.lineno}, column {exc.colno}"
+        ) from None
+    if not isinstance(raw, dict):
+        raise ValueError(f"Configuration must be a JSON object: {path}")
+    return raw
 
 
 def _read_env(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
-    if not path.exists():
-        return result
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except FileNotFoundError:
         return result
     for raw_line in lines:
         line = raw_line.strip()
@@ -328,12 +346,14 @@ def _dict_to_config(data: dict[str, Any]) -> PaiCliConfig:
         llm=LlmConfig(**data.get("llm", {})),
         render_mode=data.get("render_mode", "inline"),
         tools=ToolsConfig(**data.get("tools", {})),
+        subagents=SubagentConfig(**data.get("subagents", {})),
         mcp=McpConfig(**data.get("mcp", {})),
         memory=MemoryConfig(**data.get("memory", {})),
         compaction=CompactionConfig(**data.get("compaction", {})),
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),
         features=FeatureConfig(**data.get("features", {})),
+        runtime=RuntimeConfig(**data.get("runtime", {})),
     )
 
 
