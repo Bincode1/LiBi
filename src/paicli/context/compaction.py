@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from paicli.context.tokens import estimate_message_tokens, estimate_text_tokens
+from paicli.llm.base import ProviderRequestError
 from paicli.types import Message, Usage
 
 COMPACTION_PROMPT_VERSION = "compaction-v1"
@@ -183,6 +184,7 @@ class CompactionRequest:
     max_tokens: int
     temperature: float
     metadata: dict[str, Any] = field(default_factory=dict)
+    on_provider_attempt_failed: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         if self.purpose != "compaction":
@@ -219,11 +221,13 @@ class CompactionError(RuntimeError):
         code: str = "compaction_failed",
         retryable_by_user: bool = True,
         cost_may_be_charged: bool = False,
+        provider_error: dict[str, str | int] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable_by_user = retryable_by_user
         self.cost_may_be_charged = cost_may_be_charged
+        self.provider_error = provider_error
 
 
 class CompactionPlanner:
@@ -527,6 +531,19 @@ class CompactionCoordinator:
             serialized = self.serializer.serialize(
                 plan.selected_messages, sources=plan.selected_sources, focus=focus
             )
+
+            async def record_provider_attempt(diagnostic: dict[str, Any]) -> None:
+                await self._write_event(
+                    "request/attempt_failed",
+                    {
+                        **diagnostic,
+                        "request_id": attempt_id,
+                        "purpose": "compaction",
+                        "provider": self.provider,
+                        "model": self.model,
+                    },
+                )
+
             request = CompactionRequest(
                 purpose="compaction",
                 provider=self.provider,
@@ -546,6 +563,7 @@ class CompactionCoordinator:
                     "input_context_hash": input_context_hash,
                     "summarizer_input_hash": serialized.input_hash,
                 },
+                on_provider_attempt_failed=record_provider_attempt,
             )
             await self._write_event(
                 "compaction/started",
@@ -641,7 +659,6 @@ class CompactionCoordinator:
             )
         except CompactionError as exc:
             await self._write_failure_event(
-                "compaction/failed",
                 {
                     "attempt_id": attempt_id,
                     "trigger": trigger,
@@ -654,19 +671,23 @@ class CompactionCoordinator:
             )
             raise
         except Exception as exc:
-            await self._write_failure_event(
-                "compaction/failed",
-                {
-                    "attempt_id": attempt_id,
-                    "trigger": trigger,
-                    "failure_code": "provider_error",
-                    "retryable_by_user": True,
-                    "cost_may_be_charged": True,
-                    "input_context_hash": input_context_hash,
-                },
-            )
+            provider_error = exc.details if isinstance(exc, ProviderRequestError) else None
+            failure: dict[str, Any] = {
+                "attempt_id": attempt_id,
+                "trigger": trigger,
+                "failure_code": "provider_error",
+                "retryable_by_user": True,
+                "cost_may_be_charged": True,
+                "input_context_hash": input_context_hash,
+            }
+            if provider_error is not None:
+                failure["provider_error"] = provider_error
+            await self._write_failure_event(failure)
             raise CompactionError(
-                str(exc), code="provider_error", cost_may_be_charged=True
+                str(exc),
+                code="provider_error",
+                cost_may_be_charged=True,
+                provider_error=provider_error,
             ) from exc
         finally:
             self._busy = False

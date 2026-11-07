@@ -17,6 +17,20 @@ from paicli.llm.model_profiles import (
 )
 
 
+def test_curated_model_list_is_offline_and_returned_as_an_independent_list():
+    from paicli.llm.models import get_available_models, get_models_by_provider
+
+    models = get_available_models()
+    assert models
+    assert all(model.context_window > 0 for model in models)
+    assert get_models_by_provider("DEEPSEEK") == [
+        model for model in models if model.provider == "deepseek"
+    ]
+    assert get_models_by_provider("missing") == []
+    models.clear()
+    assert get_available_models()
+
+
 def test_selector_tabs_between_default_and_custom_models():
     custom = ModelProfile.custom_profile(
         name="My GLM",
@@ -114,7 +128,6 @@ def test_custom_profile_validates_endpoint_and_context_window():
 
 
 def test_activate_model_rebuilds_live_client_without_restart(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("ZAI_API_KEY", "glm-secret")
     config = load_config(project_root=tmp_path)
     old_client = create_llm_client(config.llm)
@@ -135,8 +148,7 @@ def test_activate_model_rebuilds_live_client_without_restart(tmp_path, monkeypat
     assert "You are PaiCLI" in agent.system_prompt
 
 
-def test_glm_startup_uses_official_zai_api_key_and_context(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_glm_startup_uses_official_zai_api_key_and_context(tmp_path):
     config = load_config(
         project_root=tmp_path,
         env={

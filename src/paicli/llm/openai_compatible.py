@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
+from time import monotonic
 from typing import Any
 
 import httpx
 
+from paicli.llm.base import ProviderRequestError
 from paicli.llm.pricing import CostBreakdown, ModelPriceProfile, calculate_cost
 from paicli.types import Message, Usage
+
+_RETRYABLE_HTTP_STATUSES = {500, 502, 503, 504}
+_PROVIDER_RETRY_DELAY = 0.5
+_PROVIDER_RETRY_WINDOW = 5.0
 
 
 @dataclass(slots=True)
@@ -77,45 +86,138 @@ class OpenAICompatibleClient:
         url = self.base_url.rstrip("/") + "/chat/completions"
 
         yield {"type": "message_start", "model": self.model}
-        try:
-            async with (
-                httpx.AsyncClient(timeout=self.timeout, http2=False) as client,
-                client.stream("POST", url, headers=headers, json=payload) as response,
-            ):
-                response.raise_for_status()
-                async for event in _iter_sse(response):
-                    if event == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(event)
-                    except json.JSONDecodeError:
-                        continue
-                    async for parsed in self._parse_chunk(chunk):
-                        yield parsed
-        except httpx.TimeoutException:
-            yield {
-                "type": "error",
-                "error": RuntimeError(
-                    f"{self.provider_name} request timed out after {self.timeout:g}s. "
-                    "Check the network and retry."
-                ),
-            }
-        except httpx.HTTPStatusError as exc:
-            yield {
-                "type": "error",
-                "error": RuntimeError(
-                    f"{self.provider_name} API returned HTTP {exc.response.status_code}. "
-                    "Check the API key, model access, account balance, and provider status."
-                ),
-            }
-        except httpx.RequestError:
-            yield {
-                "type": "error",
-                "error": RuntimeError(
-                    f"Could not connect to {self.provider_name} at {self.base_url}. "
-                    "Check the network, VPN/proxy, and provider status, then retry."
-                ),
-            }
+        async with httpx.AsyncClient(timeout=self.timeout, http2=False) as client:
+            retry_deadline = monotonic() + min(self.timeout, _PROVIDER_RETRY_WINDOW)
+            for attempt in (1, 2):
+                started = monotonic()
+                stage = "response_headers"
+                upstream_id = None
+                try:
+                    async with AsyncExitStack() as stack:
+                        # Bound the automatic retry through headers, then stream normally.
+                        remaining = max(0.0, retry_deadline - started) if attempt == 2 else None
+                        if remaining == 0:
+                            raise TimeoutError
+                        async with asyncio.timeout(remaining):
+                            response = await stack.enter_async_context(
+                                client.stream("POST", url, headers=headers, json=payload)
+                            )
+                        upstream_id = response.headers.get("x-request-id") or response.headers.get(
+                            "request-id"
+                        )
+                        response.raise_for_status()
+                        stage = "response_stream"
+                        async for parsed in self._stream_completion(response):
+                            yield parsed
+                    return
+                except (httpx.HTTPError, ProviderRequestError, TimeoutError) as exc:
+                    error = self._classify_failure(exc)
+                    if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
+                        stage = "connect"
+                    retryable = (
+                        attempt == 1
+                        and error.details.get("status_code") in _RETRYABLE_HTTP_STATUSES
+                    )
+                    failed_at = monotonic()
+                    retrying = retryable and failed_at + _PROVIDER_RETRY_DELAY < retry_deadline
+                    diagnostic: dict[str, Any] = {
+                        "attempt": attempt,
+                        "stage": stage,
+                        "elapsed_ms": round((failed_at - started) * 1000),
+                        "error_type": type(exc).__name__,
+                        "retrying": retrying,
+                        "provider_error": error.details,
+                    }
+                    if retryable and not retrying:
+                        diagnostic["retry_skipped"] = "budget_exhausted"
+                    if (
+                        upstream_id
+                        and self.api_key not in upstream_id
+                        and re.fullmatch(r"[a-zA-Z0-9._:-]{1,128}", upstream_id)
+                    ):
+                        diagnostic["upstream_request_id"] = upstream_id
+                yield {"type": "provider_attempt_failed", "diagnostic": diagnostic}
+                if not retrying:
+                    yield {"type": "error", "error": error}
+                    return
+                await asyncio.sleep(_PROVIDER_RETRY_DELAY)
+
+    def _classify_failure(
+        self, exc: httpx.HTTPError | ProviderRequestError | TimeoutError
+    ) -> ProviderRequestError:
+        if isinstance(exc, ProviderRequestError):
+            return exc
+        if isinstance(exc, TimeoutError):
+            return ProviderRequestError(
+                "Automatic retry timed out waiting for the provider response headers.",
+                kind="timeout",
+                code="retry_budget_exhausted",
+            )
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            return ProviderRequestError(
+                f"{self.provider_name} API returned HTTP {status}. "
+                "Check the API key, model access, account balance, and provider status.",
+                kind="http",
+                status_code=status,
+            )
+        if isinstance(exc, httpx.TimeoutException):
+            return ProviderRequestError(
+                f"{self.provider_name} request timed out after {self.timeout:g}s. "
+                "Check the network and retry.",
+                kind="timeout",
+            )
+        return ProviderRequestError(
+            f"Could not connect to {self.provider_name}. "
+            "Check the network, VPN/proxy, and provider status, then retry.",
+            kind="connection",
+        )
+
+    async def _stream_completion(self, response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
+        finished = False
+        has_output = False
+        async for data in _iter_sse(response):
+            if data.strip() == "[DONE]":
+                finished = True
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                raise ProviderRequestError(
+                    "Provider returned invalid JSON in an SSE event",
+                    kind="protocol",
+                    code="invalid_sse_json",
+                ) from None
+            if not isinstance(chunk, dict):
+                raise ProviderRequestError(
+                    "Provider returned an invalid SSE event",
+                    kind="protocol",
+                    code="invalid_sse_event",
+                )
+            if chunk.get("error") is not None:
+                raise ProviderRequestError(
+                    "Provider reported an error in the response stream",
+                    kind="protocol",
+                    code="provider_error_frame",
+                )
+            try:
+                async for event in self._parse_chunk(chunk):
+                    kind = event["type"]
+                    finished |= kind == "message_end"
+                    has_output |= kind in {"text_delta", "thinking_delta", "tool_call_delta"}
+                    yield event
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                raise ProviderRequestError(
+                    "Provider returned an invalid SSE event",
+                    kind="protocol",
+                    code="invalid_sse_event",
+                ) from None
+        if not finished or not has_output:
+            raise ProviderRequestError(
+                "Provider returned an empty or incomplete response stream",
+                kind="protocol",
+                code="incomplete_stream",
+            )
 
     async def complete(self, request: Any) -> Any:
         """Execute an isolated compaction request with explicit route parameters."""
@@ -145,8 +247,10 @@ class OpenAICompatibleClient:
                 finish_reason = str(event.get("stop_reason") or "end_turn")
             elif kind == "tool_call_delta":
                 finish_reason = "tool_use"
+            elif kind == "provider_attempt_failed" and request.on_provider_attempt_failed:
+                await request.on_provider_attempt_failed(event["diagnostic"])
             elif kind == "error":
-                raise RuntimeError(str(event.get("error") or "provider error"))
+                raise event["error"]
         return CompactionResponse(
             text="".join(text),
             finish_reason=finish_reason,
@@ -277,26 +381,19 @@ class OpenAICompatibleClient:
 
 
 async def _iter_sse(response: httpx.Response) -> AsyncIterator[str]:
-    buffer = ""
-    async for text in response.aiter_text():
-        buffer += text
-        while "\n\n" in buffer:
-            event, buffer = buffer.split("\n\n", 1)
-            data_lines = []
-            for line in event.splitlines():
-                line = line.strip()
-                if line.startswith("data:"):
-                    data_lines.append(line[5:].strip())
+    data_lines: list[str] = []
+    async for line in response.aiter_lines():
+        if line == "":
             if data_lines:
                 yield "\n".join(data_lines)
-    if buffer.strip():
-        data_lines = []
-        for line in buffer.splitlines():
-            line = line.strip()
-            if line.startswith("data:"):
-                data_lines.append(line[5:].strip())
-        if data_lines:
-            yield "\n".join(data_lines)
+                data_lines.clear()
+        elif line == "data":
+            data_lines.append("")
+        elif line.startswith("data:"):
+            value = line[5:]
+            data_lines.append(value[1:] if value.startswith(" ") else value)
+    if data_lines:
+        yield "\n".join(data_lines)
 
 
 def _map_finish_reason(reason: str) -> str:

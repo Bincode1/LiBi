@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import io
-import mimetypes
 import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -71,5 +70,4 @@ def _encode_image(path: Path, max_side: int = 1568) -> tuple[str, int, int]:
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=85, optimize=True)
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-        return f"data:{mime};base64,{encoded}", image.width, image.height
+        return f"data:image/jpeg;base64,{encoded}", image.width, image.height

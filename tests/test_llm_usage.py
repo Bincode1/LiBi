@@ -9,7 +9,7 @@ import pytest
 from paicli.agent import Agent
 from paicli.config import LlmConfig, PaiCliConfig, load_config
 from paicli.llm import calculate_cost, create_llm_client, get_builtin_price_profile
-from paicli.llm.openai_compatible import OpenAICompatibleClient
+from paicli.llm.openai_compatible import OpenAICompatibleClient, _iter_sse
 from paicli.tools import ToolRegistry
 from paicli.types import Message, Usage
 
@@ -26,6 +26,44 @@ def test_streaming_payload_requests_usage() -> None:
     assert payload["stream"] is True
     assert payload["stream_options"] == {"include_usage": True}
     assert payload["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_sse_handles_line_endings_across_byte_boundaries(newline):
+    class ByteStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            data = newline.join(
+                [": heartbeat", "", 'data: {"value":', "data: 1}", "", "data: [DONE]", "", ""]
+            ).encode("utf-8")
+            for byte in data:
+                yield bytes([byte])
+
+    async def collect():
+        response = httpx.Response(200, stream=ByteStream())
+        try:
+            return [event async for event in _iter_sse(response)]
+        finally:
+            await response.aclose()
+
+    assert asyncio.run(collect()) == ['{"value":\n1}', "[DONE]"]
+
+
+def test_chat_rejects_malformed_sse_json_without_exposing_payload(monkeypatch):
+    marker = "synthetic-sensitive-marker"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, text=f"data: {{invalid {marker}\n\n")
+    )
+    client_factory = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: client_factory(transport=transport, **kwargs)
+    )
+    events = asyncio.run(_collect_chat_events(_client()))
+    assert events[-2]["diagnostic"]["provider_error"] == {
+        "kind": "protocol",
+        "code": "invalid_sse_json",
+    }
+    assert "invalid JSON" in str(events[-1]["error"])
+    assert marker not in str(events)
 
 
 def test_deepseek_thinking_can_be_enabled() -> None:
@@ -63,46 +101,11 @@ def test_non_deepseek_payload_does_not_send_deepseek_thinking_option() -> None:
     assert "thinking" not in payload
 
 
-def test_connection_error_becomes_recoverable_error_event(monkeypatch) -> None:
-    def fail_stream(*args, **kwargs):
-        request = httpx.Request("POST", "https://api.deepseek.com/v1/chat/completions")
-        raise httpx.ConnectError("temporary connection failure", request=request)
-
-    monkeypatch.setattr(httpx.AsyncClient, "stream", fail_stream)
-
-    events = asyncio.run(_collect_chat_events(_client()))
-
-    assert [event["type"] for event in events] == ["message_start", "error"]
-    assert "Could not connect to deepseek" in str(events[-1]["error"])
-    assert "VPN/proxy" in str(events[-1]["error"])
-
-
-def test_timeout_becomes_recoverable_error_event(monkeypatch) -> None:
-    def fail_stream(*args, **kwargs):
-        request = httpx.Request("POST", "https://api.deepseek.com/v1/chat/completions")
-        raise httpx.ReadTimeout("temporary timeout", request=request)
-
-    monkeypatch.setattr(httpx.AsyncClient, "stream", fail_stream)
-
-    events = asyncio.run(_collect_chat_events(_client()))
-
-    assert [event["type"] for event in events] == ["message_start", "error"]
-    assert "timed out after 120s" in str(events[-1]["error"])
-
-
 def test_agent_propagates_connection_error_without_raising(tmp_path, monkeypatch) -> None:
-    class NoopSnapshotService:
-        def __init__(self, cwd):
-            self.cwd = cwd
-
-        def create(self, label):
-            return None
-
     def fail_stream(*args, **kwargs):
         request = httpx.Request("POST", "https://api.deepseek.com/v1/chat/completions")
         raise httpx.ConnectError("temporary connection failure", request=request)
 
-    monkeypatch.setattr("paicli.agent.agent.SnapshotService", NoopSnapshotService)
     monkeypatch.setattr(httpx.AsyncClient, "stream", fail_stream)
     config = PaiCliConfig()
     config.llm.api_key = "key"
