@@ -23,8 +23,7 @@ class CapturingClient:
         yield {"type": "message_end", "stop_reason": "end_turn"}
 
 
-def test_static_prompt_is_stable_and_custom_project_instructions_are_loaded(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_static_prompt_is_stable_and_custom_project_instructions_are_loaded(tmp_path):
     custom = tmp_path / "rules.md"
     custom.write_text("Always run the focused test first.", encoding="utf-8")
     config = load_config(project_root=tmp_path)
@@ -39,8 +38,7 @@ def test_static_prompt_is_stable_and_custom_project_instructions_are_loaded(tmp_
     assert "Current time" not in first
 
 
-def test_dynamic_prompt_recall_is_rebuilt_for_each_request(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_dynamic_prompt_recall_is_rebuilt_for_each_request(tmp_path):
     config = load_config(project_root=tmp_path)
     client = CapturingClient()
     engine = QueryEngine(
@@ -64,8 +62,7 @@ def test_dynamic_prompt_recall_is_rebuilt_for_each_request(tmp_path, monkeypatch
     assert "uv run python -m pytest" in client.system_prompts[1]
 
 
-def test_dynamic_memory_is_bounded_and_marked_untrusted(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+def test_dynamic_memory_is_bounded_and_marked_untrusted(tmp_path):
     config = load_config(project_root=tmp_path)
     manager = MemoryManager(config.memory.long_term_db_path, scope=str(tmp_path))
     manager.save("项目测试统一使用 pytest", kind="constraint")

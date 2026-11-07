@@ -41,6 +41,20 @@ class PromptAssembler:
             "Chinese, use Chinese for progress updates, explanations, and the final answer.",
             "- Use tools to inspect files, search code, and verify behavior when needed.",
             "- Prefer deterministic local tools before guessing.",
+            "- For broad bug checks or code reviews, choose a first-pass scope from the changes, "
+            "entry points, project instructions, and test evidence. Run a quick relevant check "
+            "early if one is available. Use glob, grep, or search_code to find leads, and read "
+            "enough to understand the complete relevant function or behavior in one pass. Batch "
+            "independent reads in the same response and skip unrelated or repeated reads.",
+            "- Check concrete hypotheses with focused tests or a traced execution path. "
+            "If further searching adds no useful evidence within the chosen scope, report what "
+            "you checked, confirmed findings with file and line references, and remaining gaps. "
+            "Expand the scope for a concrete lead or when the user asks for a deeper review.",
+            "- After the first useful evidence in a multi-step investigation, if you still need "
+            "tools, put one short visible sentence in the same response as the next tool calls. "
+            "Name the observation and the next check, even if you already gave an opening plan. "
+            "Update again when the evidence changes your conclusion or you hit a blocker. "
+            "Avoid narrating routine tool calls.",
             "- When writing files, keep changes scoped and preserve unrelated user work.",
             "- Preserve URLs and user-provided identifiers exactly unless evidence proves "
             "otherwise.",
