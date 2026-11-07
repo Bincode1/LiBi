@@ -416,10 +416,12 @@ def test_settlement_creates_and_acknowledges_durable_delivery(tmp_path, monkeypa
             parent_session_id=context.session_id,
             session_store=context.session_store,
         )
-        deliveries = controller.collect_deliveries()
+        deliveries = controller.ready_deliveries()
         assert len(deliveries) == 1
         assert deliveries[0].delivery_id == activation.delivery_id
-        assert controller.collect_deliveries() == []
+        assert controller.ready_deliveries() == deliveries
+        controller.acknowledge_deliveries(deliveries)
+        assert controller.ready_deliveries() == []
         acked = [
             event
             for event in context.session_store.events(context.session_id)
@@ -456,12 +458,12 @@ def test_pending_delivery_recovers_after_manager_restart(tmp_path):
         parent_session_id=parent_session_id,
         session_store=context.session_store,
     )
-    recovered = controller.collect_deliveries(defer_ack=True)
+    recovered = controller.ready_deliveries()
     assert len(recovered) == 1
     assert recovered[0].result == "recovered result"
     assert recovered[0].delivery_id == delivery_id
     controller.acknowledge_deliveries(recovered)
-    assert controller.collect_deliveries() == []
+    assert controller.ready_deliveries() == []
     assert any(
         event.event_type == "agent/child_delivery_acknowledged"
         and event.payload["delivery_id"] == delivery_id
@@ -849,7 +851,7 @@ def test_deferred_ack_marks_activation_and_persists_ack(tmp_path, monkeypatch):
             parent_session_id=context.session_id,
             session_store=context.session_store,
         )
-        deliveries = controller.collect_deliveries(defer_ack=True)
+        deliveries = controller.ready_deliveries()
         assert deliveries
         controller.acknowledge_deliveries(deliveries)
         assert activation.delivered

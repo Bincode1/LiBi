@@ -626,23 +626,6 @@ class Agent:
                 consumed = True
             return consumed
 
-        def consume_child_deliveries(step_id: str) -> bool:
-            deliveries = run_controller.collect_deliveries(defer_ack=True)
-            if not deliveries:
-                return False
-            self._log(
-                "user/message",
-                {
-                    "content": run_controller.format_deliveries(deliveries),
-                    "delivery_ids": [item.delivery_id for item in deliveries],
-                },
-                turn_id=turn_id,
-                step_id=step_id,
-                source="subagent-delivery",
-            )
-            run_controller.acknowledge_deliveries(deliveries)
-            return True
-
         while self.max_turns is None or turn < self.max_turns:
             turn += 1
             text = ""
@@ -684,7 +667,19 @@ class Agent:
                 source="runtime-context",
             )
 
-            consume_child_deliveries(step_id)
+            deliveries = run_controller.ready_deliveries()
+            if deliveries:
+                self._log(
+                    "user/message",
+                    {
+                        "content": run_controller.format_deliveries(deliveries),
+                        "delivery_ids": [item.delivery_id for item in deliveries],
+                    },
+                    turn_id=turn_id,
+                    step_id=step_id,
+                    source="subagent-delivery",
+                )
+                run_controller.acknowledge_deliveries(deliveries)
             current_events = refresh_context(step_id)
             projection = {
                 "scope": "session",
@@ -1005,20 +1000,14 @@ class Agent:
                     turn_id=turn_id,
                     step_id=step_id,
                 )
-                if (
-                    self.subagent_manager is not None
-                    and self.subagent_manager.event_callback is not None
-                ):
-                    run_controller.discard_observations()
-                if run_controller.has_pending_children():
-                    async for event in run_controller.observe_until_settled():
-                        if self.subagent_manager.event_callback is None:
-                            yield _annotate_event(event, session_id, turn_id, step_id)
-                    if consume_child_deliveries(step_id):
-                        self.subagent_manager.raise_background_errors()
-                        continue
                 if self.subagent_manager is not None:
+                    if self.subagent_manager.event_callback is not None:
+                        run_controller.discard_observations()
+                    async for event in run_controller.observe_until_delivery():
+                        yield _annotate_event(event, session_id, turn_id, step_id)
                     self.subagent_manager.raise_background_errors()
+                    if run_controller.ready_deliveries():
+                        continue
                 finished = True
                 break
 

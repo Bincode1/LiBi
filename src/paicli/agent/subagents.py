@@ -1087,20 +1087,6 @@ class SubagentManager:
         async with self._condition:
             self._condition.notify_all()
 
-    def acknowledge_delivery(self, activation: Activation) -> None:
-        if activation.delivered:
-            return
-        if activation.delivery_id and self.session_store and activation.parent_session_id:
-            self.session_store.append(
-                activation.parent_session_id,
-                "agent/child_delivery_acknowledged",
-                {"delivery_id": activation.delivery_id, "child_id": activation.id},
-                source="run-controller",
-            )
-        if activation.delivery_id:
-            self.deliveries.pop(activation.delivery_id, None)
-        activation.delivered = True
-
     def restore_deliveries(self, parent_id: str, parent_session_id: str) -> list[PersistedDelivery]:
         """Rebuild unacknowledged child results from the append-only parent event log."""
         if self.session_store is None:

@@ -107,6 +107,13 @@ def test_parent_natural_child_completion_delivers_once_and_sdk_closes(tmp_path, 
             ]
             assert len(deliveries) == 1
             assert len(deliveries[0].payload["delivery_ids"]) == 1
+            next_request = next(
+                event
+                for event in ctx.session_store.events(engine.session_id)
+                if event.event_type == "request/prepared"
+                and event.sequence > deliveries[0].sequence
+            )
+            assert next_request.step_id == deliveries[0].step_id
         assert not manager.active_for("root")
         assert all(a.settled for a in manager.activations.values())
 
@@ -278,19 +285,18 @@ def test_continuation_keeps_unacknowledged_rounds_and_capacity(tmp_path, monkeyp
             parent_session_id=ctx.session_id,
             session_store=ctx.session_store,
         )
-        assert controller.has_pending_children()
-        deliveries = controller.collect_deliveries(defer_ack=True)
+        deliveries = controller.ready_deliveries()
         rounds = [d for d in deliveries if d.child_id == first.id]
         assert [d.result for d in rounds] == ["first", "next"]
         assert len({d.delivery_id for d in rounds}) == 2
         controller.acknowledge_deliveries(deliveries)
-        assert controller.collect_deliveries() == []
+        assert controller.ready_deliveries() == []
         await manager.drain()
 
     asyncio.run(run())
 
 
-def test_restore_after_pending_check_and_acceptance_crash_window(tmp_path):
+def test_restore_after_acceptance_before_acknowledgement(tmp_path):
     ctx = context(tmp_path)
     store = ctx.session_store
     store.append(
@@ -307,8 +313,7 @@ def test_restore_after_pending_check_and_acceptance_crash_window(tmp_path):
     controller = RunController(
         manager=manager, parent_id="root", parent_session_id=ctx.session_id, session_store=store
     )
-    assert controller.has_pending_children()
-    deliveries = controller.collect_deliveries(defer_ack=True)
+    deliveries = controller.ready_deliveries()
     assert len(deliveries) == 1
     store.append(
         ctx.session_id,
@@ -324,8 +329,7 @@ def test_restore_after_pending_check_and_acceptance_crash_window(tmp_path):
         parent_session_id=ctx.session_id,
         session_store=store,
     )
-    assert not restarted.has_pending_children()
-    assert restarted.collect_deliveries() == []
+    assert restarted.ready_deliveries() == []
 
 
 def test_approval_failure_reaches_current_queued_and_future_requests():
@@ -530,7 +534,7 @@ def test_observer_failure_keeps_delivery_and_persistence_failure_is_visible(tmp_
             parent_session_id=ctx.session_id,
             session_store=ctx.session_store,
         )
-        deliveries = controller.collect_deliveries(defer_ack=True)
+        deliveries = controller.ready_deliveries()
         assert len(deliveries) == 1
         controller.acknowledge_deliveries(deliveries)
         await manager.flush_observations()
