@@ -114,36 +114,8 @@ def get_builtin_tools() -> list[Tool]:
             handler=_glob_files,
         ),
         Tool(
-            name="glob_files",
-            description="Alias of glob. Find files by glob pattern inside the current workspace.",
-            parameters=object_schema(
-                {
-                    "pattern": {"type": "string", "description": "Glob pattern"},
-                    "limit": {"type": "number", "description": "Maximum results"},
-                },
-                ["pattern"],
-            ),
-            required_keys=["pattern"],
-            handler=_glob_files,
-        ),
-        Tool(
             name="grep",
             description="Search text in workspace files.",
-            parameters=object_schema(
-                {
-                    "pattern": {"type": "string", "description": "Regex or plain text pattern"},
-                    "path": {"type": "string", "description": "Optional path to search"},
-                    "regex": {"type": "boolean", "description": "Treat pattern as regex"},
-                    "limit": {"type": "number", "description": "Maximum matches"},
-                },
-                ["pattern"],
-            ),
-            required_keys=["pattern"],
-            handler=_grep,
-        ),
-        Tool(
-            name="grep_code",
-            description="Alias of grep. Search text in workspace files.",
             parameters=object_schema(
                 {
                     "pattern": {"type": "string", "description": "Regex or plain text pattern"},
@@ -202,27 +174,6 @@ def get_builtin_tools() -> list[Tool]:
                 "Execute a command in the current workspace. On Windows, commands run through "
                 "PowerShell (pwsh or Windows PowerShell), so use PowerShell syntax such as "
                 "Get-ChildItem, Get-Content, and $env:NAME. Other platforms use their system shell."
-            ),
-            parameters=object_schema(
-                {
-                    "command": {"type": "string", "description": "Shell command"},
-                    "timeout": {"type": "number", "description": "Timeout seconds"},
-                },
-                ["command"],
-            ),
-            required_keys=["command"],
-            handler=_bash,
-            is_read_only=False,
-            is_concurrency_safe=False,
-            danger_level="high",
-            requires_approval=True,
-            needs_workspace_checkpoint=False,
-        ),
-        Tool(
-            name="execute_command",
-            description=(
-                "Alias of bash. On Windows, execute a command through PowerShell; use PowerShell "
-                "syntax such as Get-ChildItem, Get-Content, and $env:NAME."
             ),
             parameters=object_schema(
                 {

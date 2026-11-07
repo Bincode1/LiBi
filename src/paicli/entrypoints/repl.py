@@ -368,14 +368,17 @@ async def _handle_slash(
         _task_command(arg, console, cwd)
     elif command == "/agents":
         await _agents_command(agent, arg, console)
-    elif command == "/snapshot":
-        _snapshot_command(arg, console, cwd)
-    elif command == "/restore":
-        if not arg:
-            console.print("[red]Usage:[/red] /restore <snapshot-id-or-index>")
-        else:
-            record = SnapshotService(cwd).restore(arg)
-            console.print(f"Restored {record.id}")
+    elif command in {"/snapshot", "/restore"}:
+        try:
+            if command == "/snapshot":
+                _snapshot_command(arg, console, cwd)
+            elif arg:
+                record = SnapshotService(cwd).restore(arg)
+                console.print(f"Restored {record.id}")
+            else:
+                console.print("[red]Usage:[/red] /restore <snapshot-id-or-index>")
+        except (OSError, ValueError) as exc:
+            console.print(str(exc), style="red", markup=False, highlight=False)
     else:
         console.print(f"[red]Unknown command:[/red] {command}")
     return False

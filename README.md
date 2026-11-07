@@ -233,9 +233,9 @@ PaiCLI 内置了一组 Agent 可以调用的本地工具和联网工具：
 - `read_file`
 - `write_file`
 - `list_dir`
-- `glob` / `glob_files`
-- `grep` / `grep_code`
-- `bash` / `execute_command`
+- `glob`
+- `grep`
+- `bash`
 - `web_search`
 - `web_fetch`
 - `save_memory`
@@ -487,7 +487,13 @@ PaiCLI 支持在 prompt 里引用图片：
 
 回合首次获准执行可能修改工作区的工具前，创建 `pre-turn` 快照。创建失败时，工具会返回错误并停止写入。已经创建前置快照的回合结束后会尽力创建 `post-turn` 快照。只读、拒绝审批和仅预演的回合无需复制工作区。恢复操作会先保存自己的 `pre-restore` 快照。
 
-快照保存在 `~/.paicli/snapshots/`，不会写入项目 `.git`。快照仍覆盖工作区中可恢复的普通文件，便于恢复命令和 MCP 工具等写入路径不固定的操作。恢复前校验快照来源，并保留排除目录和现有链接。
+新快照保存在 `~/.paicli/snapshots/v2/`，覆盖工作区中可恢复的普通文件。旧格式的快照留在
+原目录，新版只列出和恢复新格式。快照排除 `.git` 及 Git 指针引用的元数据目录，保留
+Git 的 `HEAD`、暂存区和对象库，也保留排除目录和现有链接。
+
+创建、恢复和清理使用同一把工作区锁。恢复先检查路径并保存 `pre-restore`，随后按计划逐项
+替换文件。遇到路径冲突或检测到并发更改时会报错。恢复失败时仅尝试撤销本次已应用的操作，
+回滚失败时会显示 `pre-restore` 快照 ID。
 
 REPL 中可以使用：
 

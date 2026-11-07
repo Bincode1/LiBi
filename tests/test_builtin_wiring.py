@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import subprocess
 
 import pytest
 
@@ -12,7 +14,7 @@ def test_file_discovery_tools_are_wired_through_executor(tmp_path, tool_context,
     (tmp_path / "note.txt").write_text("needle", encoding="utf-8")
     calls = [
         {"id": "list", "name": "list_dir", "arguments": {"path": "."}},
-        {"id": "glob", "name": "glob_files", "arguments": {"pattern": "*.txt"}},
+        {"id": "glob", "name": "glob", "arguments": {"pattern": "*.txt"}},
         {"id": "grep", "name": "grep", "arguments": {"pattern": "needle", "regex": False}},
         {"id": "tree", "name": "directory_tree", "arguments": {}},
         {"id": "info", "name": "get_file_info", "arguments": {"path": "note.txt"}},
@@ -21,6 +23,24 @@ def test_file_discovery_tools_are_wired_through_executor(tmp_path, tool_context,
     assert len(results) == 5
     assert all(not result.is_error for result in results), [result.content for result in results]
     assert all("note.txt" in result.content for result in results)
+
+
+def test_git_commands_use_the_builtin_shell(tmp_path, tool_context, tool_registry):
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("Git is unavailable")
+    subprocess.run([git, "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "note.txt").write_text("note", encoding="utf-8")
+    tool_context.approval_callback = lambda _request: "approve"
+    calls = [
+        {"id": "status", "name": "bash", "arguments": {"command": "git status --porcelain"}},
+        {"id": "error", "name": "bash", "arguments": {"command": "git rev-parse HEAD"}},
+    ]
+
+    status, error = asyncio.run(ToolExecutor(tool_registry).execute_all(calls, tool_context))
+
+    assert not status.is_error and "?? note.txt" in status.content
+    assert error.is_error and "HEAD" in error.content
 
 
 @pytest.mark.parametrize("feature", ["memory", "skill"])

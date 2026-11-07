@@ -25,7 +25,9 @@ def test_mcp_tools_list(tmp_path):
     response = asyncio.run(run())
     tools = response["result"]["tools"]
     assert any(tool["name"] == "read_file" for tool in tools)
-    assert any(tool["name"] == "execute_command" for tool in tools)
+    names = {tool["name"] for tool in tools}
+    assert {"glob", "grep", "bash"} <= names
+    assert not {"glob_files", "grep_code", "execute_command"} & names
 
 
 @pytest.mark.parametrize("method", ["initialize", "notifications/initialized", "unknown"])

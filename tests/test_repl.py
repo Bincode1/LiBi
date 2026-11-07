@@ -74,6 +74,7 @@ def test_repl_local_commands_work_without_provider_calls(
             "/agents",
             "/snapshot list",
             "/restore",
+            "/restore missing",
             "/plan",
             "/save",
             "/unknown",
@@ -93,6 +94,7 @@ def test_repl_local_commands_work_without_provider_calls(
         "Indexed",
         "searchable_function",
         "Unknown command",
+        "snapshot not found: missing",
         "Cleared",
     ]:
         assert expected in output

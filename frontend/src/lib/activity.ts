@@ -34,7 +34,6 @@ const toolLabels = new Map([
   ['edit_file', '编辑文件'],
   ['bash', '执行命令'],
   ['grep', '搜索代码'],
-  ['grep_code', '搜索代码'],
   ['search_code', '搜索代码'],
   ['list_dir', '查看目录'],
   ['spawn_subagent', '委派子任务'],
