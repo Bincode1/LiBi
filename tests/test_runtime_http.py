@@ -255,16 +255,21 @@ def test_uploaded_attachments_reach_model_without_binary_in_history(
         )
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", provider)
-    result = client.post(f"{url}/turns", json={"attachment_ids": ids, "mode": mode})
+    question = "这里都有啥"
+    result = client.post(
+        f"{url}/turns", json={"message": question, "attachment_ids": ids, "mode": mode}
+    )
     assert result.is_success, result.text
     assert "Evidence verified." in result.json()["text"]
     for request in requests:
-        parts = [
-            part
+        parts = next(
+            msg["content"]
             for msg in request["messages"]
-            if isinstance(msg["content"], list)
-            for part in msg["content"]
-        ]
+            if msg["role"] == "user"
+            and isinstance(msg["content"], list)
+            and any(part["type"] == "image_url" for part in msg["content"])
+        )
+        assert sum("Resolve ambiguous references" in part.get("text", "") for part in parts) == 1
         image_url = next(part["image_url"]["url"] for part in parts if part["type"] == "image_url")
         prefix, data = image_url.split(",", 1)
         assert prefix == "data:image/jpeg;base64"
@@ -273,6 +278,7 @@ def test_uploaded_attachments_reach_model_without_binary_in_history(
         assert any("1: first line" in part.get("text", "") for part in parts)
     history = client.get(f"{url}/events.json").json()["events"]
     user = next(event for event in history if event["type"] == "user/message")
+    assert user["payload"]["content"] == question
     assert [item["id"] for item in user["payload"]["attachments"]] == ids
     assert "data:image" not in json.dumps(history)
 
