@@ -16,7 +16,6 @@ it('animates the live draft and keeps raw HTML out of the reply', () => {
           messages: [{ id: 'step-1', text, streaming }],
           tools: [],
           approvals: [],
-          tokens: 0,
         }}
         canApprove={false}
         onApprove={vi.fn()}
@@ -46,7 +45,6 @@ it('groups handled approvals behind one closed disclosure and leaves pending req
         replyPhase: 'waiting',
         messages: [],
         tools: [],
-        tokens: 0,
         approvals: [
           { id: 'a', status: 'approved', command: 'first-command' },
           { id: 'b', status: 'rejected', command: 'second-command' },

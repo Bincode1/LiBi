@@ -11,6 +11,7 @@ import { AgentMark } from './agent-avatar'
 import { ApprovalCard } from './approval'
 import { ConversationMarkdown } from './markdown'
 import { Delegation } from './subagent-activity'
+import { TurnUsageSummary } from './turn-usage'
 
 const delegationTools = new Set(['subagent', 'spawn_subagent'])
 const coordinationTools = new Set(['list_agents', 'send_message', 'interrupt_agent'])
@@ -101,6 +102,8 @@ export function Turn({
   )
   const drafts = turn.messages.filter((message) => message.superseded)
   const answers = turn.messages.filter((message) => !message.commentary && !message.superseded)
+  const canCopyAnswer = turn.status === 'completed' && answers.length > 0
+  const finishedUsage = turn.status !== 'running' ? turn.usage : undefined
   const progress =
     turn.status === 'running' && !unmanaged && !pending && !activeTool && !waitingForDelegation
       ? replyProgress[turn.replyPhase]
@@ -296,11 +299,14 @@ export function Turn({
             </div>
           )}
           {turn.status === 'canceled' && <p className="muted text-small">本轮执行已停止</p>}
-          {turn.status === 'completed' && answers.length > 0 && (
+          {(finishedUsage || canCopyAnswer) && (
             <div className="message-footer">
-              <button aria-label="复制回答" title="复制回答" onClick={() => void copy()}>
-                {copied ? <Check size={14} /> : <Copy size={14} />}
-              </button>
+              {canCopyAnswer && (
+                <button aria-label="复制回答" title="复制回答" onClick={() => void copy()}>
+                  {copied ? <Check size={14} /> : <Copy size={14} />}
+                </button>
+              )}
+              {finishedUsage && <TurnUsageSummary usage={finishedUsage} />}
             </div>
           )}
         </div>

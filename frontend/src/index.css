@@ -373,6 +373,24 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 6px;
+}
+.sidebar-bottom .turn-usage {
+  margin-inline-end: auto;
+}
+.sidebar-bottom > button {
+  flex-shrink: 0;
+}
+.turn-usage {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.turn-usage > span {
+  white-space: nowrap;
 }
 .connection-dot {
   width: 6px;
@@ -676,6 +694,7 @@ kbd {
 .message-footer {
   display: flex;
   align-items: center;
+  gap: 6px;
   margin-top: 8px;
 }
 .message-footer button {

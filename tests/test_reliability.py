@@ -582,7 +582,7 @@ def test_runtime_turn_closes_idle_children(tmp_path, monkeypatch):
     monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
     monkeypatch.setattr("paicli.runtime.api.QueryEngine", engine_factory)
     monkeypatch.setattr("paicli.runtime.api.build_tool_registry", registry)
-    monkeypatch.setattr("paicli.runtime.api.create_llm_client", lambda config: ctx.llm_client)
+    monkeypatch.setattr("paicli.runtime.api.create_llm_client", lambda config, **_: ctx.llm_client)
 
     async def run():
         server = RuntimeApiServer(

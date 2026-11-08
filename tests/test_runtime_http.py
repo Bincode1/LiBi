@@ -611,24 +611,52 @@ def test_http_turn_runs_real_engine_and_persists_terminal_state(
                             "finish_reason": "stop",
                         }
                     ]
-                }
+                },
+                {
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 5,
+                        "prompt_tokens_details": {"cached_tokens": 90},
+                    }
+                },
             ]
         )
     batches.append(
         [
             {"choices": [{"delta": {"content": "runtime answer"}, "finish_reason": "stop"}]},
-            {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 4}},
+            {
+                "usage": {
+                    "prompt_tokens": 900,
+                    "completion_tokens": 4,
+                    **({"prompt_tokens_details": {"cached_tokens": 0}} if mode == "plan" else {}),
+                }
+            },
         ]
     )
     sid = client.post("/v1/sessions").json()["id"]
     response = client.post(f"/v1/sessions/{sid}/turns", json={"message": "hello", "mode": mode})
     assert response.status_code == 200, response.text
     assert "runtime answer" in response.json()["text"]
-    assert response.json()["total_tokens"] == 14
+    total = 1009 if mode == "plan" else 904
+    assert response.json()["total_tokens"] == total
     events = runtime.session_store.events(sid)
     assert sum(item.event_type == "turn/started" for item in events) == 1
     assert sum(item.event_type == "turn/completed" for item in events) == 1
     assert runtime.session_store.state(sid).active_turn_id is None
+    with client.stream(
+        "GET", f"/v1/sessions/{sid}/events/stream", params={"view": "conversation"}
+    ) as opened:
+        page = next(_event_stream_pages(opened))
+    usage = [event for event in page["events"] if event["type"] == "turn/usage"]
+    assert [event["payload"]["total_tokens"] for event in usage] == (
+        [105, total] if mode == "plan" else [total]
+    )
+    assert usage[-1]["turn_id"] == next(e.turn_id for e in events if e.event_type == "turn/started")
+    assert usage[-1]["payload"] == {
+        "total_tokens": total,
+        "cache_hit_tokens": 90 if mode == "plan" else 0,
+        "cache_context_tokens": 1000 if mode == "plan" else 0,
+    }
 
 
 @pytest.mark.parametrize("mode", ["react", "plan"])
@@ -1498,7 +1526,9 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
         }
 
     def response(**values):
-        return httpx.Response(200, content=chunk(**values) + b"data: [DONE]\n\n")
+        usage = {"prompt_tokens": 100, "completion_tokens": 5, "prompt_cache_hit_tokens": 25}
+        usage_frame = f"data: {json.dumps({'usage': usage})}\n\n".encode()
+        return httpx.Response(200, content=chunk(**values) + usage_frame * 2 + b"data: [DONE]\n\n")
 
     class SearchStream(httpx.AsyncByteStream):
         async def __aiter__(self):
@@ -1606,6 +1636,8 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
         )
         assert await_one_result["state"]["status"] == "running"
         assert len(parent_requests) == 1
+        usage = [e["payload"] for e in await_one_result["events"] if e["type"] == "turn/usage"]
+        assert [item["total_tokens"] for item in usage] == [105, 210, 315]
         release.set()
         _wait_for_session_page(
             client,
@@ -1615,6 +1647,13 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
         assert (tmp_path / "child.txt").read_text(encoding="utf-8") == "ok"
         with client.stream("GET", stream) as opened:
             completed = next(_event_stream_pages(opened))
+        usage = [e["payload"] for e in completed["events"] if e["type"] == "turn/usage"]
+        assert [item["total_tokens"] for item in usage] == [105, 210, 315, 420]
+        assert usage[-1] == {
+            "total_tokens": 420,
+            "cache_hit_tokens": 100,
+            "cache_context_tokens": 400,
+        }
         assert [(child["status"], child["result_count"]) for child in completed["subagents"]] == [
             ("completed", 1),
             ("completed", 1),

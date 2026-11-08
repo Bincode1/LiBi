@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack
-from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, aclosing
+from dataclasses import dataclass, field, replace
 from time import monotonic
 from typing import Any
 
@@ -33,6 +33,7 @@ class OpenAICompatibleClient:
     max_context_window: int = 128_000
     prompt_cache: bool = False
     price_profile: ModelPriceProfile | None = None
+    on_usage: Callable[[Usage], None] | None = field(default=None, repr=False)
 
     @property
     def model_name(self) -> str:
@@ -108,8 +109,9 @@ class OpenAICompatibleClient:
                         )
                         response.raise_for_status()
                         stage = "response_stream"
-                        async for parsed in self._stream_completion(response):
-                            yield parsed
+                        async with aclosing(self._stream_completion(response)) as events:
+                            async for parsed in events:
+                                yield parsed
                     return
                 except (httpx.HTTPError, ProviderRequestError, TimeoutError) as exc:
                     error = self._classify_failure(exc)
@@ -178,42 +180,51 @@ class OpenAICompatibleClient:
     async def _stream_completion(self, response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
         finished = False
         has_output = False
-        async for data in _iter_sse(response):
-            if data.strip() == "[DONE]":
-                finished = True
-                break
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                raise ProviderRequestError(
-                    "Provider returned invalid JSON in an SSE event",
-                    kind="protocol",
-                    code="invalid_sse_json",
-                ) from None
-            if not isinstance(chunk, dict):
-                raise ProviderRequestError(
-                    "Provider returned an invalid SSE event",
-                    kind="protocol",
-                    code="invalid_sse_event",
-                )
-            if chunk.get("error") is not None:
-                raise ProviderRequestError(
-                    "Provider reported an error in the response stream",
-                    kind="protocol",
-                    code="provider_error_frame",
-                )
-            try:
-                async for event in self._parse_chunk(chunk):
-                    kind = event["type"]
-                    finished |= kind == "message_end"
-                    has_output |= kind in {"text_delta", "thinking_delta", "tool_call_delta"}
-                    yield event
-            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
-                raise ProviderRequestError(
-                    "Provider returned an invalid SSE event",
-                    kind="protocol",
-                    code="invalid_sse_event",
-                ) from None
+        usage = None
+        try:
+            async for data in _iter_sse(response):
+                if data.strip() == "[DONE]":
+                    finished = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    raise ProviderRequestError(
+                        "Provider returned invalid JSON in an SSE event",
+                        kind="protocol",
+                        code="invalid_sse_json",
+                    ) from None
+                if not isinstance(chunk, dict):
+                    raise ProviderRequestError(
+                        "Provider returned an invalid SSE event",
+                        kind="protocol",
+                        code="invalid_sse_event",
+                    )
+                if chunk.get("error") is not None:
+                    raise ProviderRequestError(
+                        "Provider reported an error in the response stream",
+                        kind="protocol",
+                        code="provider_error_frame",
+                    )
+                try:
+                    raw_usage = chunk.get("usage")
+                    if self.on_usage is not None and isinstance(raw_usage, dict) and raw_usage:
+                        # Usage frames report cumulative counts for this response.
+                        usage = Usage.from_mapping(raw_usage)
+                    async for event in self._parse_chunk(chunk):
+                        kind = event["type"]
+                        finished |= kind == "message_end"
+                        has_output |= kind in {"text_delta", "thinking_delta", "tool_call_delta"}
+                        yield event
+                except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                    raise ProviderRequestError(
+                        "Provider returned an invalid SSE event",
+                        kind="protocol",
+                        code="invalid_sse_event",
+                    ) from None
+        finally:
+            if self.on_usage is not None and usage is not None:
+                self.on_usage(usage)
         if not finished or not has_output:
             raise ProviderRequestError(
                 "Provider returned an empty or incomplete response stream",

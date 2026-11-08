@@ -26,6 +26,11 @@ interface MessageView {
   sequence?: number
   superseded?: boolean
 }
+export interface TurnUsage {
+  totalTokens: number
+  cacheHitTokens: number
+  cacheContextTokens: number
+}
 export interface TurnView {
   id: string
   user: string
@@ -36,7 +41,7 @@ export interface TurnView {
   replyPhase: 'starting' | 'waiting' | 'streaming' | 'ready'
   failureMessage?: string
   approvals: ApprovalView[]
-  tokens: number
+  usage?: TurnUsage
   optimistic?: boolean
 }
 export interface PendingTurn {
@@ -100,12 +105,33 @@ export function mergeEvents(previous: RuntimeEvent[], incoming: RuntimeEvent[]) 
   for (const event of incoming) map.set(event.id, event)
   return [...map.values()].sort((a, b) => a.sequence - b.sequence)
 }
+
+function tokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+function readUsage(payload: Record<string, unknown>): TurnUsage | undefined {
+  const totalTokens = tokenCount(payload.total_tokens)
+  if (totalTokens === undefined) return
+  const cacheHitTokens = tokenCount(payload.cache_hit_tokens) ?? 0
+  const cacheBuckets =
+    cacheHitTokens +
+    (tokenCount(payload.cache_miss_tokens) ?? 0) +
+    (tokenCount(payload.cache_write_tokens) ?? 0)
+  // Old request events omitted the cache context when it matched the input size.
+  const cacheContextTokens =
+    tokenCount(payload.cache_context_tokens) ??
+    (cacheBuckets ? tokenCount(payload.input_tokens) || cacheBuckets : 0)
+  return { totalTokens, cacheHitTokens, cacheContextTokens }
+}
+
 export function projectTurns(
   events: RuntimeEvent[],
   preview?: AssistantPreview | null,
   pending?: PendingTurn,
 ): TurnView[] {
   const turns = new Map<string, TurnView>()
+  const runtimeUsage = new Set<string>()
   const awaitingReplacement = new Map<string, MessageView>()
   for (const event of events) {
     if (!event.turn_id || event.source?.startsWith('child:')) continue
@@ -119,7 +145,6 @@ export function projectTurns(
         approvals: [],
         status: 'running',
         replyPhase: 'waiting',
-        tokens: 0,
       }
       turns.set(turn.id, turn)
     }
@@ -221,9 +246,38 @@ export function projectTurns(
         : turn.approvals.at(-1)
       if (approval?.status === 'pending') approval.status = outcome
     }
-    if (event.type === 'request/completed' && p.usage && typeof p.usage === 'object')
-      turn.tokens += Number((p.usage as Record<string, unknown>).total_tokens ?? 0)
+    if (event.type === 'turn/usage') {
+      const usage = readUsage(p)
+      if (usage) {
+        turn.usage = usage
+        runtimeUsage.add(turn.id)
+      }
+    } else if (!runtimeUsage.has(turn.id) && event.type === 'request/completed') {
+      const usage =
+        p.usage && typeof p.usage === 'object'
+          ? readUsage(p.usage as Record<string, unknown>)
+          : undefined
+      if (usage && usage.totalTokens > 0) {
+        const current = (turn.usage ??= {
+          totalTokens: 0,
+          cacheHitTokens: 0,
+          cacheContextTokens: 0,
+        })
+        current.totalTokens += usage.totalTokens
+        current.cacheHitTokens += usage.cacheHitTokens
+        current.cacheContextTokens += usage.cacheContextTokens
+      }
+    }
     if (terminalEvents.has(event.type)) {
+      const reportedTotal = tokenCount(p.total_tokens) ?? 0
+      if (!runtimeUsage.has(turn.id) && reportedTotal > (turn.usage?.totalTokens ?? 0)) {
+        turn.usage = {
+          cacheHitTokens: 0,
+          cacheContextTokens: 0,
+          ...turn.usage,
+          totalTokens: reportedTotal,
+        }
+      }
       turn.status = event.type.split('/')[1]
       if (turn.status === 'failed') turn.failureMessage = providerFailureMessage(p)
       for (const approval of turn.approvals)
@@ -257,7 +311,6 @@ export function projectTurns(
         messages: [],
         tools: [],
         approvals: [],
-        tokens: 0,
         optimistic: true,
       })
     }

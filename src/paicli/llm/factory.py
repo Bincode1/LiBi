@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from paicli.config import LlmConfig
 from paicli.llm.openai_compatible import OpenAICompatibleClient
 from paicli.llm.pricing import resolve_price_profile
+from paicli.types import Usage
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -74,7 +77,9 @@ def _provider_profile(provider: str) -> dict:
     return _PROVIDER_PROFILES.get(provider, _FALLBACK_PROFILE)
 
 
-def create_llm_client(config: LlmConfig) -> OpenAICompatibleClient:
+def create_llm_client(
+    config: LlmConfig, *, on_usage: Callable[[Usage], None] | None = None
+) -> OpenAICompatibleClient:
     provider = config.provider.lower()
     profile = _provider_profile(provider)
     context = config.context_window or MODEL_CONTEXT_WINDOWS.get(
@@ -91,6 +96,7 @@ def create_llm_client(config: LlmConfig) -> OpenAICompatibleClient:
         timeout=config.timeout,
         max_context_window=context,
         prompt_cache=profile["prompt_cache"],
+        on_usage=on_usage,
         price_profile=resolve_price_profile(
             config.model,
             context_window=context,

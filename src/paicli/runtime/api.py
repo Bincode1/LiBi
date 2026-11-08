@@ -39,6 +39,7 @@ from paicli.session import (
     default_runtime_db_path,
 )
 from paicli.tools.base import ToolDecision
+from paicli.types import Usage
 
 _APPROVAL_TIMEOUT = 300.0
 _TASK_LEASE_SECONDS = 300
@@ -73,6 +74,7 @@ _CONVERSATION_EVENT_TYPES = (
     "approval/rejected",
     "approval/canceled",
     "request/completed",
+    "turn/usage",
 )
 _PRIVATE_KEY_PREVIEW = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL
@@ -419,12 +421,28 @@ class RuntimeApiServer:
         engine: QueryEngine | None = None
         text = ""
         total_tokens = 0
+        usage_totals = Usage()
         plan_outcome = None
         preview_turns: dict[str, str] = {}
         canceled = False
 
         async def approve_tool(payload: dict[str, Any]) -> ToolDecision:
             return await self._request_approval(session_id, turn_id, payload)
+
+        def record_usage(usage: Usage) -> None:
+            nonlocal usage_totals
+            usage_totals += usage
+            self.session_store.append(
+                session_id,
+                "turn/usage",
+                {
+                    "total_tokens": usage_totals.total_tokens,
+                    "cache_hit_tokens": usage_totals.cache_hit_tokens,
+                    "cache_context_tokens": usage_totals.cache_context_tokens,
+                },
+                turn_id=turn_id,
+                source="runtime",
+            )
 
         def update_preview(event: dict[str, Any], *, child: bool = False) -> None:
             event_session_id = event.get("session_id") if child else session_id
@@ -453,7 +471,7 @@ class RuntimeApiServer:
             # Session selection does not extend the Runtime's trust for MCP configuration.
             registry, _manager = await build_tool_registry(config=config, cwd=self.cwd)
             engine = QueryEngine(
-                llm_client=create_llm_client(config.llm),
+                llm_client=create_llm_client(config.llm, on_usage=record_usage),
                 tool_registry=registry,
                 config=config,
                 cwd=cwd,

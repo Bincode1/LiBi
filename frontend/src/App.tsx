@@ -31,6 +31,7 @@ import { Disclosure } from '@/components/ui/disclosure'
 import { AgentMark } from '@/features/conversation/agent-avatar'
 import { Composer } from '@/features/conversation/composer'
 import { ModePicker } from '@/features/conversation/mode-picker'
+import { TurnUsageSummary } from '@/features/conversation/turn-usage'
 import { Details, type DetailsTab } from '@/features/workspace/details'
 import {
   SessionWorkspace,
@@ -163,13 +164,13 @@ export default function App() {
   const pending = pendingTurns[draftKey]
   const feed = useEventFeed(client, id, retry)
   const { refetch: checkHealth, isError: runtimeOffline } = health
+  const runtimeReady = health.isSuccess && health.data !== null
   const connectionError = runtimeOffline ? errorMessage(health.error) : feed.error
   const connectionSyncing = !runtimeOffline && (!runtimeReady || feed.syncing)
   const connectionLabel = runtimeOffline
     ? '连接异常'
     : feed.error
       ? '会话未同步'
-  const runtimeReady = health.isSuccess && health.data !== null
       : connectionSyncing
         ? '连接中'
         : '本地连接'
@@ -184,6 +185,7 @@ export default function App() {
     () => projectTurns(feed.events, feed.preview, pending),
     [feed.events, feed.preview, pending],
   )
+  const currentTurn = turns.at(-1)
   const agentsByTurn = useMemo(() => {
     const result = new Map<string, Subagent[]>()
     for (const agent of feed.subagents ?? []) {
@@ -613,6 +615,7 @@ export default function App() {
         ))}
       </div>
       <div className="sidebar-bottom">
+        {currentTurn && <TurnUsageSummary usage={currentTurn.usage} current />}
         <Button
           variant="ghost"
           size="icon"

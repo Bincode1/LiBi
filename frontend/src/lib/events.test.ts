@@ -78,6 +78,44 @@ describe('submitted run tracking', () => {
   })
 })
 describe('event projection', () => {
+  it('uses the latest Runtime usage snapshot without counting request events or replays twice', () => {
+    const start = event(1, 'user/message', { content: '检查项目' })
+    const first = event(2, 'turn/usage', {
+      total_tokens: 105,
+      cache_hit_tokens: 90,
+      cache_context_tokens: 100,
+    })
+    const request = event(3, 'request/completed', { usage: { total_tokens: 105 } })
+    const latest = event(4, 'turn/usage', {
+      total_tokens: 1009,
+      cache_hit_tokens: 90,
+      cache_context_tokens: 1000,
+    })
+    const finished = event(5, 'turn/completed', { total_tokens: 105 })
+    const history = mergeEvents([start, first, request], [request, latest, finished])
+    const [turn, pending] = projectTurns(history, null, { message: '继续', afterSequence: 5 })
+    expect(turn.usage).toEqual({ totalTokens: 1009, cacheHitTokens: 90, cacheContextTokens: 1000 })
+    expect(pending.usage).toBeUndefined()
+  })
+
+  it('keeps legacy plan totals and distinguishes unreported cache from zero hits', () => {
+    const [plan, chat] = projectTurns([
+      event(1, 'user/message', { content: '计划' }),
+      event(2, 'turn/completed', { total_tokens: 24 }),
+      event(3, 'user/message', { content: '继续' }, { turn_id: 'turn-2' }),
+      event(
+        4,
+        'request/completed',
+        {
+          usage: { total_tokens: 15, input_tokens: 10, cache_hit_tokens: 0, cache_miss_tokens: 10 },
+        },
+        { turn_id: 'turn-2' },
+      ),
+    ])
+    expect(plan.usage).toEqual({ totalTokens: 24, cacheHitTokens: 0, cacheContextTokens: 0 })
+    expect(chat.usage).toEqual({ totalTokens: 15, cacheHitTokens: 0, cacheContextTokens: 10 })
+  })
+
   it('deduplicates replayed events and orders non-contiguous sequences', () => {
     expect(
       mergeEvents(
