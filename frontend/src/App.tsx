@@ -17,9 +17,9 @@ import {
   PanelLeftClose,
   PanelRight,
   Pencil,
+  Plug,
   Plus,
   Search,
-  Settings2,
   ShieldCheck,
   Sparkles,
   Sun,
@@ -566,6 +566,10 @@ export default function App() {
           <Inbox size={16} />
           后台任务
         </button>
+        <button onClick={() => setSettings(true)}>
+          <Plug size={16} aria-hidden="true" />
+          连接器
+        </button>
       </nav>
       <div className="project-selector" title={health.data?.cwd ?? project}>
         <Folder size={15} aria-hidden="true" />
@@ -609,10 +613,6 @@ export default function App() {
         ))}
       </div>
       <div className="sidebar-bottom">
-        <button className="settings-nav" onClick={() => setSettings(true)}>
-          <Settings2 size={16} />
-          设置与连接
-        </button>
         <Button
           variant="ghost"
           size="icon"

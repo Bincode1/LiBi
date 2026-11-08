@@ -290,8 +290,7 @@ kbd {
   display: grid;
   gap: 3px;
 }
-.primary-nav button,
-.settings-nav {
+.primary-nav button {
   border: 0;
   background: transparent;
   color: var(--secondary);
@@ -303,8 +302,7 @@ kbd {
   border-radius: var(--radius-control);
   text-align: left;
 }
-.primary-nav button:hover,
-.settings-nav:hover {
+.primary-nav button:hover {
   background: var(--hover);
   color: var(--foreground);
 }
@@ -374,10 +372,7 @@ kbd {
   padding: 8px 0 12px;
   display: flex;
   align-items: center;
-  gap: 6px;
-}
-.settings-nav {
-  font-size: 13px;
+  justify-content: flex-end;
 }
 .connection-dot {
   width: 6px;
@@ -1867,10 +1862,6 @@ kbd {
 
 .new-chat:hover {
   background: color-mix(in srgb, var(--primary) 18%, var(--surface));
-}
-
-.sidebar-bottom > .btn-icon {
-  flex-shrink: 0;
 }
 
 .source-pill[data-state='pending'] > span {
