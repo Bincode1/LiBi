@@ -126,6 +126,8 @@ class PlanExecuteAgent:
                     elif kind == "error":
                         raise event["error"]
                     elif kind == "done":
+                        outcome = event["plan_outcome"]
+                        terminal = outcome["status"]
                         store.append(
                             session_id,
                             "assistant/message",
@@ -135,12 +137,16 @@ class PlanExecuteAgent:
                             source="plan-summary",
                         )
                         store.append(
-                            session_id, "step/completed", {}, turn_id=turn_id, step_id=step_id
+                            session_id, f"step/{terminal}", {}, turn_id=turn_id, step_id=step_id
                         )
                         store.append(
                             session_id,
-                            "turn/completed",
-                            {"mode": "plan", "total_tokens": event["total_tokens"]},
+                            f"turn/{terminal}",
+                            {
+                                "mode": "plan",
+                                "total_tokens": event["total_tokens"],
+                                "plan_outcome": outcome,
+                            },
                             turn_id=turn_id,
                         )
                         event = {
@@ -217,6 +223,15 @@ class PlanExecuteAgent:
                 snapshot.finish_turn()
         done: dict[str, Any] = {
             "type": "done",
+            "plan_outcome": {
+                "status": plan.status.value.lower(),
+                "failed_task_ids": [
+                    task.id for task in plan.tasks.values() if task.status == TaskStatus.FAILED
+                ],
+                "skipped_task_ids": [
+                    task.id for task in plan.tasks.values() if task.status == TaskStatus.SKIPPED
+                ],
+            },
             "total_turns": total_turns,
             "total_tokens": total_usage.total_tokens,
             "usage": total_usage.to_dict(),
@@ -291,6 +306,9 @@ class PlanExecuteAgent:
                 async for event in self._apply_task_result(result):
                     yield event
 
+        for task in plan.tasks.values():
+            if task.status == TaskStatus.PENDING:
+                task.mark_skipped()
         if plan.has_failed():
             plan.mark_failed()
             yield {"type": "text_delta", "text": "计划部分完成，但有任务执行失败。\n\n"}

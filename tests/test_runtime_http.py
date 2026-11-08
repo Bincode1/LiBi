@@ -577,6 +577,30 @@ def test_http_engine_failure_returns_error_and_persists_failed_turn(
     assert "synthetic-private" not in page.text
 
 
+def test_http_plan_child_failure_reports_failed_and_skipped_tasks(runtime_http, provider_stream):
+    runtime, client = runtime_http
+    batches, _ = provider_stream
+    plan = {
+        "tasks": [
+            {"id": "first", "description": "First operation"},
+            {"id": "second", "description": "Dependent operation", "dependencies": ["first"]},
+        ]
+    }
+    batches.append(
+        [{"choices": [{"delta": {"content": json.dumps(plan)}, "finish_reason": "stop"}]}]
+    )
+    batches.append([{"error": {"message": "synthetic child error"}}])
+    sid = runtime._create_session()
+    response = client.post(f"/v1/sessions/{sid}/turns", json={"message": "work", "mode": "plan"})
+    assert response.status_code == 200
+    assert response.json()["plan_outcome"] == {
+        "status": "failed",
+        "failed_task_ids": ["task_1"],
+        "skipped_task_ids": ["task_2"],
+    }
+    assert runtime.session_store.state(sid).status == "failed"
+
+
 def test_event_pages_bound_history_without_skipping_events(runtime_http, monkeypatch):
     runtime, client = runtime_http
     monkeypatch.setattr("paicli.runtime.api._EVENT_PAGE_SIZE", 2)

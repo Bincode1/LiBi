@@ -95,6 +95,12 @@ class TaskCanceledError(RuntimeError):
     pass
 
 
+class TaskPlanFailed(RuntimeError):
+    def __init__(self, partial_result: str):
+        super().__init__("Plan execution failed")
+        self.partial_result = partial_result
+
+
 class RuntimeStoppingError(RuntimeError):
     pass
 
@@ -395,6 +401,7 @@ class RuntimeApiServer:
         engine: QueryEngine | None = None
         text = ""
         total_tokens = 0
+        plan_outcome = None
         preview_turns: dict[str, str] = {}
         canceled = False
 
@@ -444,6 +451,7 @@ class RuntimeApiServer:
                         update_preview(event)
                     elif event_type == "done":
                         total_tokens = int(event.get("total_tokens") or 0)
+                        plan_outcome = event.get("plan_outcome")
                     elif event_type == "error":
                         raise event["error"]
         except asyncio.CancelledError:
@@ -476,6 +484,7 @@ class RuntimeApiServer:
             "text": text,
             "mode": mode,
             "total_tokens": total_tokens,
+            **({"plan_outcome": plan_outcome} if plan_outcome else {}),
         }
 
     def _start_background_turn(
@@ -521,8 +530,9 @@ class RuntimeApiServer:
         def runner() -> None:
             outcome: dict[str, Any] = {"status": "failed", "error": "interrupted"}
             try:
-                asyncio.run(run())
-                outcome = {"status": "completed"}
+                result = asyncio.run(run())
+                status = (result.get("plan_outcome") or {}).get("status", "completed")
+                outcome = {"status": status}
             except asyncio.CancelledError:
                 outcome = {"status": "canceled"}
                 self._close_turn(session_id, run_id, "turn/canceled", {"mode": mode})
@@ -978,6 +988,14 @@ class RuntimeApiServer:
                 )
             except TaskCanceledError:
                 pass
+            except TaskPlanFailed as exc:
+                self.task_manager.fail(
+                    task.id,
+                    str(exc),
+                    worker_id=worker_id,
+                    attempt=task.attempts,
+                    partial_result=exc.partial_result,
+                )
             except Exception as exc:  # noqa: BLE001
                 self.task_manager.fail(
                     task.id, str(exc), worker_id=worker_id, attempt=task.attempts
@@ -1043,6 +1061,10 @@ class RuntimeApiServer:
                         text += str(event.get("text") or "")
                     elif event.get("type") == "error":
                         raise event["error"]
+                    elif event.get("type") == "done":
+                        outcome = event.get("plan_outcome")
+                        if outcome and outcome["status"] == "failed":
+                            raise TaskPlanFailed(text)
         finally:
             await engine.aclose()
         return text

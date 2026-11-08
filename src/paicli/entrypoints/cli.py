@@ -418,12 +418,15 @@ async def _run_prompt(
                     "total_tokens": result.total_tokens,
                     "usage": result.usage.to_dict(),
                     "cost": result.cost,
+                    **({"plan_outcome": result.plan_outcome} if result.plan_outcome else {}),
                 },
                 ensure_ascii=False,
             )
         )
     else:
         typer.echo(result.text)
+    if result.plan_outcome and result.plan_outcome["status"] == "failed":
+        raise typer.Exit(1)
 
 
 def _version_of(command: str) -> str:

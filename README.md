@@ -464,6 +464,9 @@ Runtime 接收新会话的第一条用户消息后，在后台只尝试生成一
 模型请求失败时，`turn/failed` 可带 `provider_error`，提供错误类型和可用的 HTTP 状态码。
 `events.json` 中的 `request/attempt_failed` 按请求记录每次失败的尝试次数、阶段、耗时、
 错误类型、是否重试和可用的 HTTP 状态码、上游请求 ID。重试成功时，之前的失败仍可追溯。
+Plan 执行结束时提供 `plan_outcome`，包含整体状态、失败任务 ID 和因依赖跳过的任务 ID。
+部分失败时会话记录 `turn/failed` 并保留已生成的结果。同步 HTTP 响应返回该结构，后台任务标为
+`failed`，CLI 单次查询输出结果后以非零状态退出。
 
 异步回合可传入 `"interactive_approval": true` 启用交互审批。通过事件取得 `approval/started`
 中的 `approval_id` 后，向 `POST /v1/sessions/<session_id>/approvals/<approval_id>/decision`

@@ -26,6 +26,7 @@ async def collect_query_result(events: AsyncIterator[dict[str, Any]]) -> QueryRe
     turns = 0
     usage = Usage()
     cost: dict[str, Any] = {}
+    plan_outcome = None
     async with aclosing(events):
         async for event in events:
             event_type = event.get("type")
@@ -38,4 +39,12 @@ async def collect_query_result(events: AsyncIterator[dict[str, Any]]) -> QueryRe
                 turns += int(event.get("total_turns") or 0)
                 usage = usage + Usage.from_mapping(event.get("usage") or {})
                 cost = dict(event.get("cost") or cost)
-    return QueryResult(text=text, total_tokens=tokens, turns=turns, usage=usage, cost=cost)
+                plan_outcome = event.get("plan_outcome", plan_outcome)
+    return QueryResult(
+        text=text,
+        total_tokens=tokens,
+        turns=turns,
+        usage=usage,
+        cost=cost,
+        plan_outcome=plan_outcome,
+    )

@@ -194,6 +194,7 @@ class QueryResult:
     turns: int
     usage: Usage = field(default_factory=Usage)
     cost: dict[str, Any] = field(default_factory=dict)
+    plan_outcome: dict[str, Any] | None = None
 
 
 def _first_int(value: dict[str, Any], *keys: str, fallback: Any = 0) -> int:
