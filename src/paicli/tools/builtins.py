@@ -506,21 +506,44 @@ async def _bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
             stderr=asyncio.subprocess.PIPE,
             env=os.environ.copy(),
         )
+    assert proc.stdout is not None and proc.stderr is not None
+    capture = asyncio.gather(
+        _read_command_pipe(proc.stdout),
+        _read_command_pipe(proc.stderr),
+    )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.CancelledError:
-        await _stop_command(proc)
-        raise
-    except TimeoutError:
-        await _stop_command(proc)
+        async with asyncio.timeout(timeout):
+            (stdout, out_truncated), (stderr, err_truncated) = await asyncio.shield(capture)
+            await proc.wait()
+    except (asyncio.CancelledError, TimeoutError) as exc:
+        try:
+            # Keep draining pipes while the process tree exits.
+            with suppress(TimeoutError):
+                await asyncio.wait_for(_stop_command(proc), timeout=5)
+        finally:
+            capture.cancel()
+            await asyncio.gather(capture, return_exceptions=True)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return ToolResult(f"Command timed out after {timeout:.0f}s", is_error=True)
-    output = (stdout + stderr).decode("utf-8", errors="replace")
-    if len(output) > 20_000:
-        output = output[:20_000] + "\n... [truncated]"
+    combined = stdout + stderr
+    output = combined[:20_000].decode("utf-8", errors="replace")
+    if out_truncated or err_truncated or len(combined) > 20_000:
+        output += "\n... [truncated]"
     return ToolResult(
         output or f"(exit {proc.returncode}, no output)",
         is_error=proc.returncode != 0,
     )
+
+
+async def _read_command_pipe(stream: asyncio.StreamReader) -> tuple[bytearray, bool]:
+    output = bytearray()
+    truncated = False
+    while chunk := await stream.read(8192):
+        remaining = 20_000 - len(output)
+        output.extend(chunk[:remaining])
+        truncated |= len(chunk) > remaining
+    return output, truncated
 
 
 async def _stop_command(proc: asyncio.subprocess.Process) -> None:

@@ -5,11 +5,11 @@ import html
 import ipaddress
 import re
 import socket
+from contextlib import aclosing
 from urllib.parse import urlparse
 
 import httpx
 
-_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 TRUNCATION_MARKER = "\n... [truncated]"
 
 
@@ -53,31 +53,52 @@ class PublicNetworkTransport(httpx.AsyncBaseTransport):
 
 
 async def fetch_url(url: str, max_length: int = 10_000, timeout: float = 15.0) -> str:
+    if max_length <= 0:
+        raise ValueError("max_length must be positive")
     async with (
+        asyncio.timeout(timeout),
         httpx.AsyncClient(
             timeout=timeout,
-            follow_redirects=True,
-            max_redirects=10,
             transport=PublicNetworkTransport(),
             trust_env=False,
         ) as client,
-        client.stream("GET", url, headers={"user-agent": "PaiCLI-Python/0.1.0"}) as response,
     ):
-        response.raise_for_status()
-        body = bytearray()
-        truncated = False
-        async for chunk in response.aiter_bytes():
-            room = _MAX_RESPONSE_BYTES - len(body)
-            body.extend(chunk[:room])
-            if len(chunk) > room:
-                truncated = True
-                break
-        text = body.decode(response.encoding or "utf-8", errors="replace")
-        if "html" in response.headers.get("content-type", ""):
-            text = extract_text_from_html(text)
-        if truncated or len(text) > max_length:
-            text = text[:max_length] + TRUNCATION_MARKER
-        return text or "(empty page)"
+        request = client.build_request(
+            "GET",
+            url,
+            headers={
+                "user-agent": "PaiCLI-Python/0.1.0",
+                "accept-encoding": "identity",
+            },
+        )
+        for _ in range(11):
+            async with aclosing(await client.send(request, stream=True)) as response:
+                if response.next_request is not None:
+                    # Close redirect bodies without downloading them. Each next
+                    # request still goes through the public-address transport.
+                    request = response.next_request
+                    continue
+                response.raise_for_status()
+                return await _bounded_text(response, max_length)
+        raise httpx.TooManyRedirects("Exceeded maximum allowed redirects.", request=request)
+
+
+async def _bounded_text(response: httpx.Response, max_length: int) -> str:
+    if response.headers.get("content-encoding", "identity").lower() != "identity":
+        raise NetworkPolicyError("page returned an unsupported compressed response")
+    html_page = "html" in response.headers.get("content-type", "").lower()
+    byte_limit = min(max_length * (32 if html_page else 4), 1024 * 1024)
+    data = bytearray()
+    async for chunk in response.aiter_bytes():
+        data.extend(chunk[: byte_limit + 1 - len(data)])
+        if len(data) > byte_limit:
+            break
+    text = bytes(data[:byte_limit]).decode(response.encoding or "utf-8", errors="replace")
+    if html_page:
+        text = extract_text_from_html(text)
+    if len(data) > byte_limit or len(text) > max_length:
+        return text[:max_length] + TRUNCATION_MARKER
+    return text or "(empty page)"
 
 
 def extract_text_from_html(raw_html: str) -> str:

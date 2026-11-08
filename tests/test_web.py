@@ -213,6 +213,36 @@ def test_fetch_handles_empty_and_truncated_pages(monkeypatch, body):
     assert result == ("long\n... [truncated]" if body else "(empty page)")
 
 
+def test_fetch_closes_large_response_and_does_not_buffer_redirect_bodies(monkeypatch):
+    class LargeBody(httpx.AsyncByteStream):
+        chunks = 0
+        closed = False
+
+        async def __aiter__(self):
+            for _ in range(64):
+                self.chunks += 1
+                yield b"x" * 8192
+
+        async def aclose(self):
+            self.closed = True
+
+    redirect = LargeBody()
+    page = LargeBody()
+
+    async def respond(_transport, request):
+        assert request.headers["accept-encoding"] == "identity"
+        if request.url.path == "/":
+            return httpx.Response(302, headers={"location": "/page"}, stream=redirect)
+        return httpx.Response(200, stream=page)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", respond)
+    assert asyncio.run(fetch_url("https://93.184.215.14/", max_length=10)) == (
+        "xxxxxxxxxx\n... [truncated]"
+    )
+    assert redirect.chunks == 0 and redirect.closed
+    assert page.chunks == 1 and page.closed
+
+
 def test_fetch_redirect_loop_is_bounded(monkeypatch):
     requests = []
 
