@@ -1478,6 +1478,7 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
         ) as opened:
             child_replay = next(_event_stream_pages(opened))
         assert child_replay["subagent"]["status"] == "completed"
+        assert "Search progress" in child_replay["subagent"]["report"]
         assert child_replay["assistant_preview"] is None
         assert [
             e["payload"]["content"]

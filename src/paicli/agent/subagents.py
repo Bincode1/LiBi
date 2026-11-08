@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -27,6 +28,7 @@ from paicli.tools.call_parsing import tool_input
 
 
 class ActivationState(StrEnum):
+    QUEUED = "queued"
     STARTING = "starting"
     RUNNING = "running"
     STOPPING = "stopping"
@@ -38,12 +40,14 @@ class ActivationState(StrEnum):
     DISPOSED = "disposed"
 
 
+_MAX_BATCH_TASKS = 8
+_MAX_BATCH_CONCURRENCY = 4
 _LIVE_STATES = {
     ActivationState.STARTING,
     ActivationState.RUNNING,
     ActivationState.STOPPING,
 }
-_RESIDENT_STATES = _LIVE_STATES | {ActivationState.IDLE_WAITING}
+_RESIDENT_STATES = _LIVE_STATES | {ActivationState.IDLE_WAITING, ActivationState.QUEUED}
 _TERMINAL_STATES = {
     ActivationState.COMPLETED,
     ActivationState.FAILED,
@@ -52,6 +56,7 @@ _TERMINAL_STATES = {
     ActivationState.DISPOSED,
 }
 _ALLOWED_TRANSITIONS = {
+    ActivationState.QUEUED: {ActivationState.RUNNING, ActivationState.STOPPING},
     ActivationState.STARTING: {ActivationState.RUNNING, ActivationState.STOPPING},
     ActivationState.RUNNING: {
         ActivationState.IDLE_WAITING,
@@ -217,6 +222,8 @@ class Activation:
     diagnostic: dict[str, Any] | None = None
     cleanup_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     finished_at: float | None = None
+    provider_started: bool = True
+    batch_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -236,7 +243,7 @@ class SubagentManager:
     def __init__(
         self,
         *,
-        max_active: int = 8,
+        max_active: int = 4,
         max_resident: int = 32,
         max_depth: int = 2,
         default_deadline: float | None = None,
@@ -286,7 +293,30 @@ class SubagentManager:
     def register_provider(self, provider: SubagentProvider) -> None:
         self.providers.register(provider)
 
-    async def start(self, payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    def _at_capacity(self, batch_id: str | None = None) -> bool:
+        active = [
+            item
+            for item in self.activations.values()
+            if item.status in _LIVE_STATES and item.provider_started
+        ]
+        return len(active) >= self.max_active or (
+            batch_id is not None
+            and sum(item.batch_id == batch_id for item in active) >= _MAX_BATCH_CONCURRENCY
+        )
+
+    def _next_queued(self) -> str | None:
+        return next(
+            (
+                item.id
+                for item in self.activations.values()
+                if item.status == ActivationState.QUEUED and not self._at_capacity(item.batch_id)
+            ),
+            None,
+        )
+
+    async def start(
+        self, payload: dict[str, Any], context: ToolContext, *, batch_id: str | None = None
+    ) -> ToolResult:
         parent_id = context.agent_id or "root"
         if self._closed:
             return ToolResult("PARENT_CLOSED: subagent manager is shutting down.", is_error=True)
@@ -330,10 +360,24 @@ class SubagentManager:
             deadline_seconds = None if deadline is None else float(deadline)
         except (TypeError, ValueError):
             return ToolResult("INVALID_DEADLINE: timeout must be a positive number.", is_error=True)
-        if deadline_seconds is not None and deadline_seconds <= 0:
+        if deadline_seconds is not None and (
+            not math.isfinite(deadline_seconds) or deadline_seconds <= 0
+        ):
             return ToolResult("INVALID_DEADLINE: timeout must be a positive number.", is_error=True)
-        active_count = sum(item.status in _LIVE_STATES for item in self.activations.values())
-        if active_count >= self.max_active:
+        queued = self._at_capacity(batch_id) or self._next_queued() is not None
+        # A nested batch may queue behind a running sibling. If none could start,
+        # reserving a child behind its waiting ancestors could deadlock the pool.
+        if queued and (
+            self.max_active <= 0
+            or batch_id is None
+            or (
+                parent_id != "root"
+                and not any(
+                    item.parent_id == parent_id and item.status in _LIVE_STATES
+                    for item in self.activations.values()
+                )
+            )
+        ):
             return ToolResult(
                 "ACTIVATION_LIMIT_REACHED: active subagent capacity reached.",
                 is_error=True,
@@ -377,6 +421,8 @@ class SubagentManager:
         }
         if role:
             descriptor["role"] = role
+        if queued:
+            descriptor["queued"] = True
         try:
             session_id = store.start_child_session(
                 parent_session_id,
@@ -398,6 +444,19 @@ class SubagentManager:
 
         async def execute_provider() -> str | SubagentResult:
             await asyncio.sleep(0)
+            if queued:
+                async with self._condition:
+                    await self._condition.wait_for(
+                        lambda: not self._closed and self._next_queued() == agent_id
+                    )
+                    self._activate(activation)
+                    self._condition.notify_all()
+                store.append(
+                    parent_session_id,
+                    "agent/child_activated",
+                    {"child_id": agent_id},
+                    source="subagent-manager",
+                )
             return await provider.run(self, activation, payload, context)
 
         task = asyncio.create_task(execute_provider())
@@ -408,6 +467,10 @@ class SubagentManager:
             description,
             task,
             parent_session_id,
+            status=ActivationState.QUEUED if queued else ActivationState.STARTING,
+            current_phase="queued" if queued else "starting",
+            provider_started=not queued,
+            batch_id=batch_id,
             deadline_seconds=deadline_seconds,
             provider=provider_name,
             provider_adapter=provider,
@@ -416,6 +479,27 @@ class SubagentManager:
             config_snapshot=config_snapshot,
         )
         self.activations[agent_id] = activation
+        task.add_done_callback(self._schedule_settlement(agent_id))
+        if queued:
+            self._publish_event(
+                {
+                    "type": "subagent_event",
+                    "event": {"type": "queued", "description": description},
+                    "agent": agent_id,
+                    "parent_id": parent_id,
+                    "agent_description": description,
+                }
+            )
+            return ToolResult(f"Queued subagent {agent_id} (state=queued).")
+        self._activate(activation)
+        return ToolResult(
+            f"Started subagent {agent_id} (state=running, deadline={deadline_seconds or 'none'})."
+        )
+
+    def _activate(self, activation: Activation) -> None:
+        activation.provider_started = True
+        activation.started_at = time.monotonic()
+        activation.current_phase = "starting"
         self.transition(activation, ActivationState.RUNNING)
         self._publish_event(
             {
@@ -424,19 +508,15 @@ class SubagentManager:
                     "type": "started",
                     "description": activation.description,
                 },
-                "agent": agent_id,
-                "parent_id": parent_id,
+                "agent": activation.id,
+                "parent_id": activation.parent_id,
                 "agent_description": activation.description,
             }
         )
-        task.add_done_callback(self._schedule_settlement(agent_id))
-        if deadline_seconds is not None:
+        if activation.deadline_seconds is not None:
             activation.timeout_task = asyncio.create_task(
-                self._deadline_watch(agent_id, deadline_seconds)
+                self._deadline_watch(activation.id, activation.deadline_seconds)
             )
-        return ToolResult(
-            f"Started subagent {agent_id} (state=running, deadline={deadline_seconds or 'none'})."
-        )
 
     async def _deadline_watch(self, agent_id: str, deadline: float) -> None:
         await asyncio.sleep(deadline)
@@ -733,7 +813,7 @@ class SubagentManager:
                         sources[call.get("id")] = tool_input(call).get("url", "")
             elif (
                 event.event_type == "tool/result"
-                and event.payload.get("name") in {"web_fetch", "web_search"}
+                and event.payload.get("name") in {"web_fetch", "web_search", "web_read"}
                 and not event.payload.get("is_error")
             ):
                 content = str(event.payload.get("content") or "").strip()
@@ -998,7 +1078,11 @@ class SubagentManager:
                 and activation.timeout_task is not asyncio.current_task()
             ):
                 activation.timeout_task.cancel()
-        if activation.provider_adapter is not None and not activation.provider_disposed:
+        if (
+            activation.provider_started
+            and activation.provider_adapter is not None
+            and not activation.provider_disposed
+        ):
             try:
                 await activation.provider_adapter.dispose(activation)
                 activation.provider_disposed = True
@@ -1329,7 +1413,7 @@ class SubagentManager:
         elapsed = max(0.0, (activation.finished_at or time.monotonic()) - activation.started_at)
         deadline_remaining = (
             max(0.0, activation.deadline_seconds - elapsed)
-            if activation.deadline_seconds is not None
+            if activation.provider_started and activation.deadline_seconds is not None
             else None
         )
         return {
@@ -1410,7 +1494,9 @@ class SubagentManager:
         return [
             a
             for a in self.activations.values()
-            if a.parent_id == parent_id and a.status in _LIVE_STATES
+            if a.parent_id == parent_id
+            and not a.settled
+            and a.status != ActivationState.IDLE_WAITING
         ]
 
     def completed_for(self, parent_id: str) -> list[Activation]:
@@ -1431,6 +1517,7 @@ class SubagentManager:
         async with self._child_lock(agent_id):
             activation = self.activations.get(agent_id)
             if activation is None or activation.status not in {
+                ActivationState.QUEUED,
                 ActivationState.STARTING,
                 ActivationState.RUNNING,
                 ActivationState.IDLE_WAITING,
@@ -1452,7 +1539,7 @@ class SubagentManager:
 
     async def _dispose_provider(self, activation: Activation) -> None:
         async with self._child_lock(activation.id):
-            if activation.provider_disposed:
+            if activation.provider_disposed or not activation.provider_started:
                 return
             if activation.provider_adapter is None:
                 raise RuntimeError(f"activation {activation.id} has no provider adapter")
@@ -1465,6 +1552,9 @@ class SubagentManager:
                 activation.provider_disposed = True
 
     async def _interrupt_provider(self, activation: Activation) -> None:
+        if not activation.provider_started:
+            activation.task.cancel()
+            return
         adapter = activation.provider_adapter
         if adapter is None:
             raise RuntimeError(f"activation {activation.id} has no provider adapter")
@@ -1502,6 +1592,14 @@ class SubagentManager:
             current = self.activations.get(current.parent_id)
         return False
 
+    def _cancel_queued(self, activations: list[Activation], reason: str) -> None:
+        # Mark the entire queue subset before yielding to any running provider.
+        for activation in activations:
+            if activation.status == ActivationState.QUEUED:
+                self.transition(activation, ActivationState.STOPPING)
+                activation.error_code = reason
+                activation.task.cancel()
+
     async def dispose(self, agent_id: str) -> bool:
         targets = self.descendants_for(agent_id)
         targets.append(self.activations.get(agent_id))
@@ -1509,9 +1607,10 @@ class SubagentManager:
         owned = [item for item in targets if item.status in _RESIDENT_STATES]
         if not owned:
             return False
+        self._cancel_queued(owned, "DISPOSED")
         for activation in reversed(owned):
             async with self._child_lock(activation.id):
-                if activation.status not in _RESIDENT_STATES:
+                if not activation.provider_started or activation.status not in _RESIDENT_STATES:
                     continue
                 self.transition(activation, ActivationState.STOPPING)
                 activation.error_code = "DISPOSED"
@@ -1533,8 +1632,7 @@ class SubagentManager:
             if activation.inbox.qsize() >= 32:
                 return False, "CHILD_INBOX_FULL"
             if activation.status == ActivationState.IDLE_WAITING:
-                active = sum(a.status in _LIVE_STATES for a in self.activations.values())
-                if active >= self.max_active:
+                if self._at_capacity(activation.batch_id) or self._next_queued() is not None:
                     return False, "ACTIVATION_LIMIT_REACHED"
                 self.transition(activation, ActivationState.RUNNING)
             activation.inbox.put_nowait(message)
@@ -1548,9 +1646,10 @@ class SubagentManager:
         targets = [item for item in targets if item.status in _RESIDENT_STATES]
         if not targets:
             return
+        self._cancel_queued(targets, "PARENT_CANCELED")
         for activation in reversed(targets):
             async with self._child_lock(activation.id):
-                if activation.status in _RESIDENT_STATES:
+                if activation.provider_started and activation.status in _RESIDENT_STATES:
                     self.transition(activation, ActivationState.STOPPING)
                     activation.error_code = "PARENT_CANCELED"
                 else:
@@ -1661,44 +1760,76 @@ class SubagentManager:
 
 
 def make_subagent_tool():
+    task_properties = {
+        "description": {"type": "string", "description": "Short task label"},
+        "role": {
+            "type": "string",
+            "enum": list(SUBAGENT_ROLES),
+            "description": "Optional display role",
+        },
+        "prompt": {"type": "string", "description": "Complete, self-contained task instructions"},
+        "cwd": {"type": "string", "description": "Optional working directory"},
+        "timeout": {"type": "number", "description": "Optional deadline in seconds after start"},
+    }
+
+    def valid_task(task: Any) -> bool:
+        return isinstance(task, dict) and all(
+            isinstance(task.get(key), str) and task[key].strip()
+            for key in ("description", "prompt")
+        )
+
     async def handler(payload: dict[str, Any], context: ToolContext) -> ToolResult:
         if context.subagent_manager is None:
             return ToolResult("Subagent runtime is unavailable.", is_error=True)
-        return await context.subagent_manager.start(payload, context)
+        if "tasks" not in payload:
+            if not valid_task(payload):
+                return ToolResult("Provide a description and prompt.", is_error=True)
+            return await context.subagent_manager.start(payload, context)
+        tasks = payload["tasks"]
+        if any(key in payload for key in task_properties) or (
+            not isinstance(tasks, list)
+            or not 1 <= len(tasks) <= _MAX_BATCH_TASKS
+            or not all(valid_task(task) for task in tasks)
+        ):
+            return ToolResult(
+                f"INVALID_SUBAGENT_BATCH: provide 1–{_MAX_BATCH_TASKS} tasks "
+                "with description and prompt.",
+                is_error=True,
+            )
+        batch_id = uuid.uuid4().hex
+        results = [
+            await context.subagent_manager.start(task, context, batch_id=batch_id) for task in tasks
+        ]
+        return ToolResult(
+            "\n".join(f"{index}. {result.content}" for index, result in enumerate(results, 1)),
+            is_error=all(result.is_error for result in results),
+        )
 
     return Tool(
         name="subagent",
         description=(
-            "Delegate a self-contained task to a child agent. Returns immediately with its ID. "
+            "Delegate one task (description + prompt) or up to eight independent tasks (tasks). "
+            "Returns immediately with IDs; batch tasks wait for an available execution slot. "
             "Finished reports arrive automatically between model requests. "
             "While waiting, do independent work or end this response without tools so the runtime "
             "can wait for results. Do not poll or sleep for reports."
         ),
         parameters=object_schema(
             {
-                "description": {"type": "string", "description": "Short task label"},
-                "role": {
-                    "type": "string",
-                    "enum": list(SUBAGENT_ROLES),
-                    "description": "Optional display role for this task. Choose the closest role.",
+                **task_properties,
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": _MAX_BATCH_TASKS,
+                    "items": object_schema(task_properties, required=["description", "prompt"]),
+                    "description": "Independent tasks to queue together",
                 },
-                "prompt": {
-                    "type": "string",
-                    "description": "Complete, self-contained task instructions",
-                },
-                "cwd": {"type": "string", "description": "Optional working directory"},
-                "timeout": {
-                    "type": "number",
-                    "description": "Optional child deadline in seconds; cancellation is propagated",
-                },
-            },
-            required=["description", "prompt"],
+            }
         ),
         handler=handler,
         is_read_only=False,
         is_concurrency_safe=True,
         timeout=10.0,
-        required_keys=["description", "prompt"],
     )
 
 
@@ -1747,7 +1878,9 @@ def make_subagent_control_tools():
         if not activation.capabilities.continuable:
             return ToolResult("CONTINUATION_UNSUPPORTED: provider is one-shot.", is_error=True)
         if activation.status not in {ActivationState.RUNNING, ActivationState.IDLE_WAITING}:
-            return ToolResult("Cannot send a message to a settled subagent.", is_error=True)
+            return ToolResult(
+                "This subagent is not ready for follow-up instructions.", is_error=True
+            )
         if activation.status == ActivationState.RUNNING and not activation.capabilities.queue_idle:
             return ToolResult(
                 "CONTINUATION_UNSUPPORTED: provider cannot queue follow-ups.", is_error=True

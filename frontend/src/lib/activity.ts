@@ -43,6 +43,7 @@ const toolLabels = new Map([
   ['interrupt_agent', '停止子 agent'],
   ['web_search', '搜索网页'],
   ['web_fetch', '读取网页'],
+  ['web_read', '查阅网页摘录'],
 ])
 
 export const toolLabel = (name: string, fallback = name) => toolLabels.get(name) ?? fallback
@@ -50,6 +51,8 @@ export const toolLabel = (name: string, fallback = name) => toolLabels.get(name)
 export function subagentStatus(agent: Subagent) {
   const priorResult = agent.result_count > 0
   switch (agent.status) {
+    case 'queued':
+      return '排队中'
     case 'starting':
       return '正在启动'
     case 'running':
@@ -80,7 +83,7 @@ export function subagentStatus(agent: Subagent) {
 }
 
 export const subagentIsActive = (agent: Subagent) =>
-  agent.status === 'starting' || agent.status === 'running' || agent.status === 'approval'
+  ['queued', 'starting', 'running', 'approval'].includes(agent.status)
 
 const launchFailures = new Map([
   ['PARENT_CLOSED', '本轮正在结束'],

@@ -30,6 +30,22 @@ def estimate_text_tokens(text: str) -> int:
     return cjk + math.ceil(max(0, non_cjk) / 3)
 
 
+def fit_text(text: str, max_tokens: int, *, max_bytes: int | None = None) -> str:
+    """Take a character-aligned prefix under the byte and estimated token limits."""
+    if max_bytes is not None:
+        text = text.encode("utf-8", errors="replace")[:max_bytes].decode("utf-8", errors="ignore")
+    if estimate_text_tokens(text) <= max_tokens:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if estimate_text_tokens(text[:middle]) <= max_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
+
+
 def _message_text(message: Message) -> str:
     if isinstance(message.content, str):
         return message.content

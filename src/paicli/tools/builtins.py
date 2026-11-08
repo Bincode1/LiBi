@@ -1,26 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import re
 import shutil
 import signal
 import subprocess
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+from urllib.parse import urldefrag
 
 from paicli.memory import MemoryManager
 from paicli.policy import CommandGuard
 from paicli.rag import CodeIndex
+from paicli.session.models import WebDocument
 from paicli.skill import SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools import file_ops as fops
 from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
 from paicli.tools.file_ops import FileOpResult
 from paicli.web import fetch_url, search_web
+from paicli.web.fetch import TRUNCATION_MARKER
 
 
-def get_builtin_tools() -> list[Tool]:
+def get_builtin_tools(*, session_tools: bool = True) -> list[Tool]:
     tools = [
         Tool(
             name="read_file",
@@ -193,12 +198,18 @@ def get_builtin_tools() -> list[Tool]:
         Tool(
             name="web_search",
             description=(
-                "Search the web for current information. Returns titles, URLs, and snippets."
+                "Search the web for titles, URLs, and snippets. "
+                "For research, start with 2–4 queries from different angles."
             ),
             parameters=object_schema(
                 {
                     "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "number", "description": "Maximum result count"},
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Number of results (default 5)",
+                    },
                 },
                 ["query"],
             ),
@@ -207,7 +218,10 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="web_fetch",
-            description="Fetch a public HTTP/HTTPS page and return readable text.",
+            description=(
+                "Fetch a public HTTP/HTTPS page. In a session, returns an excerpt and a "
+                "response_id for web_read. Repeat requests reuse the saved page."
+            ),
             parameters=object_schema(
                 {
                     "url": {"type": "string", "description": "URL to fetch"},
@@ -217,6 +231,21 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["url"],
             handler=_web_fetch,
+        ),
+        Tool(
+            name="web_read",
+            description="Read a saved webpage from this session by offset or literal text.",
+            parameters=object_schema(
+                {
+                    "response_id": {"type": "string", "description": "ID returned by web_fetch"},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Character offset"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 30000},
+                    "query": {"type": "string", "maxLength": 256},
+                },
+                ["response_id"],
+            ),
+            required_keys=["response_id"],
+            handler=_web_read,
         ),
         Tool(
             name="save_memory",
@@ -347,7 +376,7 @@ def get_builtin_tools() -> list[Tool]:
             needs_workspace_checkpoint=False,
         ),
     ]
-    return tools
+    return tools if session_tools else [tool for tool in tools if tool.name != "web_read"]
 
 
 # ---------------------------------------------------------------------------
@@ -561,47 +590,123 @@ try {{
 
 
 async def _web_search(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    max_results = int(payload.get("max_results") or payload.get("maxResults") or 5)
+    max_results = max(1, min(int(payload.get("max_results") or payload.get("maxResults") or 5), 20))
     budget = context.research_budget
-    if budget is not None:
-        if not budget.reserve("search"):
-            return ToolResult(
-                "Research search budget exhausted. Use the available evidence to finish.",
-                is_error=True,
-            )
-        max_results = max(1, min(max_results, 10))
+    if budget is not None and not budget.reserve("search"):
+        return ToolResult(
+            "Research search budget exhausted. Use the available evidence to finish.",
+            is_error=True,
+        )
     try:
-        results = await search_web(str(payload["query"]), max_results=max_results)
+        async with asyncio.timeout(budget.remaining_seconds if budget is not None else None):
+            results = await search_web(str(payload["query"]), max_results=max_results)
     except Exception as exc:  # noqa: BLE001
         return ToolResult(f"Search error: {exc}", is_error=True)
     if not results:
         return ToolResult(f'No search results found for "{payload["query"]}".')
     content = "\n\n".join(
-        f"{index}. {result.title}\n{result.url}\n{result.snippet}"
+        f"{index}. {result.title[:256]}\n{result.url}\n{result.snippet[:500]}"
         for index, result in enumerate(results, start=1)
     )
     if budget is not None:
-        content = budget.take_text(content)
+        excerpt = budget.take_text(content)
+        if len(excerpt) < len(content):
+            excerpt += "\n[Research evidence budget reached. Summarize the available evidence.]"
+        content = excerpt
     return ToolResult(content, display_summary=f"Search: {len(results)} results")
 
 
-async def _web_fetch(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    max_length = int(payload.get("max_length") or payload.get("maxLength") or 10_000)
+_WEB_INLINE_LIMIT = 30_000
+_WEB_DOCUMENT_LIMIT = 200_000
+
+
+async def _fetch_text(url: str, limit: int, context: ToolContext) -> str:
     budget = context.research_budget
-    if budget is not None:
-        if not budget.reserve("fetch"):
-            return ToolResult(
-                "Research fetch budget exhausted. Use the available evidence to finish.",
-                is_error=True,
-            )
-        max_length = max(1, min(max_length, 10_000, budget.chars_left))
+    if budget is not None and not budget.reserve("fetch"):
+        raise ValueError("Research fetch budget exhausted. Use the available evidence to finish.")
+    async with asyncio.timeout(budget.remaining_seconds if budget is not None else None):
+        return await fetch_url(url, max_length=limit)
+
+
+async def _web_fetch(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    url = str(payload["url"])
+    store, session_id = context.session_store, context.session_id
+    in_session = store is not None and session_id is not None
+    requested = payload.get("max_length") or payload.get("maxLength")
+    limit = max(1, min(int(requested or (4_000 if in_session else 10_000)), _WEB_INLINE_LIMIT))
     try:
-        content = await fetch_url(str(payload["url"]), max_length=max_length)
+        if not in_session:
+            budget = context.research_budget
+            if budget is not None and budget.chars_left is not None:
+                limit = min(limit, max(1, budget.chars_left))
+            content = await _fetch_text(url, limit, context)
+            return ToolResult(
+                budget.take_text(content) if budget else content,
+                display_summary=f"Fetched {url}",
+            )
+        url = urldefrag(url).url
+        cache_key = hashlib.sha256(f"{context.turn_id or ''}\n{url}".encode()).hexdigest()
+        async with context.web_fetch_locks.setdefault(cache_key, asyncio.Lock()):
+            cached = store.get_web_document(session_id, cache_key, by_cache_key=True)
+            if cached is not None:
+                return ToolResult(
+                    f"Response ID: {cached.response_id}\nURL: {cached.url}\n"
+                    "Page already saved. Use web_read for a different excerpt."
+                )
+            text = await _fetch_text(url, _WEB_DOCUMENT_LIMIT, context)
+            document = store.save_web_document(
+                session_id,
+                cache_key,
+                url,
+                text.removesuffix(TRUNCATION_MARKER),
+                max_chars=_WEB_DOCUMENT_LIMIT,
+                truncated=text.endswith(TRUNCATION_MARKER),
+            )
     except Exception as exc:  # noqa: BLE001
         return ToolResult(f"Fetch error: {exc}", is_error=True)
-    if budget is not None:
-        content = budget.take_text(content)
-    return ToolResult(content, display_summary=f"Fetched {payload['url']}")
+    return _web_excerpt(document, context, start=0, limit=limit)
+
+
+async def _web_read(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    if context.session_store is None or context.session_id is None:
+        return ToolResult("Web reads require a PaiCLI session.", is_error=True)
+    document = context.session_store.get_web_document(
+        context.session_id, str(payload["response_id"])
+    )
+    if document is None:
+        return ToolResult("No saved webpage with that response ID in this session.", is_error=True)
+    offset = max(0, min(len(document.text), int(payload.get("offset") or 0)))
+    limit = max(1, min(int(payload.get("limit") or 4_000), _WEB_INLINE_LIMIT))
+    query = str(payload.get("query") or "").strip()
+    if query:
+        if len(query) > 256:
+            return ToolResult("Search text must be 256 characters or shorter.", is_error=True)
+        match = re.compile(re.escape(query), re.IGNORECASE).search(document.text, offset)
+        if match is None:
+            return ToolResult(f"No matching text in the saved page from offset {offset}.")
+        offset = max(offset, match.start() - limit // 3)
+    return _web_excerpt(document, context, start=offset, limit=limit)
+
+
+def _web_excerpt(
+    document: WebDocument, context: ToolContext, *, start: int, limit: int
+) -> ToolResult:
+    start = min(start, len(document.text))
+    excerpt = document.text[start : start + limit]
+    budget = context.research_budget
+    text = budget.take_text(excerpt) if budget else excerpt
+    end = start + len(text)
+    header = f"Response ID: {document.response_id}\nURL: {document.url}\n"
+    if len(text) < len(excerpt):
+        header += "Research evidence budget reached. Summarize the available evidence.\n"
+    elif end < len(document.text):
+        header += f"Next offset: {end}\n"
+    if document.truncated:
+        header += "The stored page is limited to its fetched prefix.\n"
+    return ToolResult(
+        header + f"Excerpt {start}–{end}:\n\n" + text,
+        display_summary=f"Web excerpt: {document.url}",
+    )
 
 
 # ---------------------------------------------------------------------------

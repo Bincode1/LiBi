@@ -13,7 +13,7 @@ from paicli.tools.base import ToolContext
 
 def _build_registry() -> ToolRegistry:
     registry = ToolRegistry()
-    registry.register_all(get_builtin_tools())
+    registry.register_all(get_builtin_tools(session_tools=False))
     return registry
 
 

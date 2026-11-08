@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from dataclasses import replace
 
 import httpx
 import pytest
 
 from paicli.config import PaiCliConfig
+from paicli.session import SessionStore
 from paicli.tools import get_builtin_tools
 from paicli.tools.base import ToolContext
 from paicli.web.budget import ResearchBudget
@@ -35,6 +37,43 @@ def test_child_fetches_share_call_and_evidence_budgets(tmp_path, monkeypatch):
     evidence = [r.content.split("\n", 1)[0] for r in results if not r.is_error]
     assert evidence == ["evidence", "ev"]
     assert sum(result.is_error for result in results) == 2
+
+
+def test_saved_web_page_can_be_read_later_only_in_its_session(tmp_path, monkeypatch):
+    db = tmp_path / "runtime.db"
+    store = SessionStore(db, sensitive_values=("test-sensitive-phrase",))
+    session_id = store.create_session()
+    context = ToolContext(str(tmp_path), PaiCliConfig(), session_store=store, session_id=session_id)
+    calls = []
+    source = "https://example.test/source"
+
+    async def fetch(url, *, max_length):
+        calls.append((url, max_length))
+        await asyncio.sleep(0)
+        return "preview " + "padding " * 20 + "Needle test-sensitive-phrase."
+
+    monkeypatch.setattr("paicli.tools.builtins.fetch_url", fetch)
+    tools = {tool.name: tool for tool in get_builtin_tools()}
+
+    async def run():
+        first, repeated = await asyncio.gather(
+            tools["web_fetch"].execute({"url": source, "max_length": 8}, context),
+            tools["web_fetch"].execute({"url": source + "#section"}, context),
+        )
+        response_id = first.content.splitlines()[0].removeprefix("Response ID: ")
+        assert response_id.startswith("web_") and response_id in repeated.content
+        assert "Next offset: 8" in first.content and "Needle" not in first.content
+        reopened = replace(context, session_store=SessionStore(db))
+        page = await tools["web_read"].execute(
+            {"response_id": response_id, "query": "needle", "limit": 50}, reopened
+        )
+        assert "Needle [redacted]" in page.content
+        other = replace(reopened, session_id=store.create_session())
+        denied = await tools["web_read"].execute({"response_id": response_id}, other)
+        assert denied.is_error and "Needle" not in denied.content
+
+    asyncio.run(run())
+    assert len(calls) == 1 and calls[0][0] == source
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,14 @@ MessageSource = dict[str, list[object]]
 
 
 @dataclass(slots=True, frozen=True)
+class WebDocument:
+    response_id: str
+    url: str
+    text: str
+    truncated: bool
+
+
+@dataclass(slots=True, frozen=True)
 class SessionEvent:
     event_id: str
     sequence: int

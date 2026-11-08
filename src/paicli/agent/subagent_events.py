@@ -25,6 +25,7 @@ def subagent_role(value: object) -> str | None:
 
 
 _FIELDS = {
+    "queued": {"description"},
     "started": {"description"},
     "continued": set(),
     "idle": {"result", "snapshot"},

@@ -8,6 +8,7 @@ from paicli.session import SessionEvent, SessionState, SessionStore
 
 SUBAGENT_STATE_EVENTS = (
     "agent/child_started",
+    "agent/child_activated",
     "agent/child_delivery_created",
     "agent/child_completed",
     "agent/child_failed",
@@ -30,9 +31,11 @@ class ChildActivity:
     sequence: int
     started_at: str
     role: str | None = None
+    queued: bool = False
     result_count: int = 0
     last_delivery: str | None = None
     delivered_at: str | None = None
+    report: str | None = None
     terminal: str | None = None
     terminal_reason: str | None = None
     ended_at: str | None = None
@@ -76,11 +79,18 @@ class SubagentCatalog:
                         sequence=event.sequence,
                         started_at=event.created_at,
                         role=subagent_role(payload.get("role")),
+                        queued=payload.get("queued") is True,
                     ),
                 )
             elif child := self.children.get(child_id):
-                if kind == "agent/child_delivery_created":
+                if kind == "agent/child_activated":
+                    child.queued = False
+                elif kind == "agent/child_delivery_created":
                     child.last_delivery = str(payload.get("result_status") or "")
+                    if child.last_delivery in {"completed", "partial"} and isinstance(
+                        payload.get("content"), str
+                    ):
+                        child.report = payload["content"]
                     if child.last_delivery == "completed":
                         child.result_count += 1
                         child.delivered_at = event.created_at
@@ -150,6 +160,7 @@ class SubagentCatalog:
                     "closed": child.terminal is not None,
                     "tool_name": tool_name,
                     **({"close_reason": "idle_expired"} if idle_expired else {}),
+                    **({"report": child.report} if only_session_id and child.report else {}),
                 }
             )
         return result
@@ -174,6 +185,8 @@ def _child_status(child: ChildActivity, session_status: str, owner_active: bool)
         return "idle" if owner_active else "completed"
     if not owner_active:
         return "unknown"
+    if child.queued and session_status == "created":
+        return "queued"
     return "starting" if session_status == "created" else "running"
 
 

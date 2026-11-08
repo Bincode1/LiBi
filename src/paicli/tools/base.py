@@ -41,6 +41,7 @@ class ToolContext:
     step_id: str | None = None
     tool_call_id: str | None = None
     research_budget: ResearchBudget | None = None
+    web_fetch_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

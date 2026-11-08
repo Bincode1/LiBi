@@ -182,6 +182,12 @@ function ChildTranscript({
             正在加载执行记录…
           </p>
         )}
+        {current.report && (
+          <details className="subagent-notice">
+            <summary>查看完整交付报告</summary>
+            <ConversationMarkdown text={current.report} />
+          </details>
+        )}
         {!feed.loading && !feed.error && !turns.length && (
           <p className="subagent-notice">
             {active ? '正在等待首条执行记录…' : '该子 agent 没有保存对话记录。'}
