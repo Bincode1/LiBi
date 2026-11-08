@@ -377,6 +377,17 @@ stdio 和 HTTP 都走统一工具策略，需要人工审批的调用会拒绝�
 
 Chrome DevTools MCP 会把浏览器页面和 DevTools 状态暴露给 Agent。不要随意把包含个人账号、敏感数据或生产后台的 Chrome 会话授权给 Agent。
 
+## Web 工作台
+
+从源码仓库启动时，先安装前端依赖，再运行统一入口。
+
+```powershell
+pnpm --dir frontend install
+uv run paicli workbench --cwd .
+```
+
+命令会启动本机 Runtime 和前端，验证连接后打开浏览器。退出启动命令会停止两者。需要更换端口或手动打开浏览器时，参见 [工作台启动说明](frontend/README.md)。
+
 ## Runtime API
 
 PaiCLI 内置轻量 Runtime API，适合外部系统接入线程、turn、事件和后台任务。

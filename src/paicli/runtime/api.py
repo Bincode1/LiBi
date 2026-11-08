@@ -9,8 +9,9 @@ import socket
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import aclosing, suppress
+from contextlib import aclosing, contextmanager, suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -155,6 +156,13 @@ class RuntimeApiServer:
         )
 
     def serve_forever(self) -> None:
+        with self.listen() as server:
+            self.start_background_work()
+            server.serve_forever()
+
+    @contextmanager
+    def listen(self) -> Iterator[ThreadingHTTPServer]:
+        """Bind the HTTP server and clean up active work on exit."""
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -182,15 +190,17 @@ class RuntimeApiServer:
                 raise RuntimeBindError(
                     f"Cannot listen on 127.0.0.1:{self.port}: {exc.strerror or exc}."
                 ) from exc
-            self.session_store.recover_interrupted_turns()
-            self._start_workers()
             print(
                 f"PaiCLI Runtime API listening on http://127.0.0.1:{server.server_port}", flush=True
             )
             try:
-                server.serve_forever()
+                yield server
             finally:
                 self._stop_and_drain_turns()
+
+    def start_background_work(self) -> None:
+        self.session_store.recover_interrupted_turns()
+        self._start_workers()
 
     def _stop_and_drain_turns(self) -> None:
         with self._background_turns_lock:

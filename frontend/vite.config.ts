@@ -40,7 +40,7 @@ export default defineConfig(({ mode }) => {
             }
             if (req.url === '/__paicli/status') {
               res.setHeader('Content-Type', 'application/json')
-              res.end(JSON.stringify({ configured: Boolean(key) }))
+              res.end(JSON.stringify({ configured: Boolean(key), runtimeOrigin: runtime.origin }))
               return
             }
             if (req.url?.startsWith('/v1/') && !key) {

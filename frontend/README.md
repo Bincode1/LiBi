@@ -7,14 +7,15 @@
 需要 Node.js 22.12+（或符合 Vite 要求的较新版本）与 pnpm 10。
 
 ```powershell
-cd D:\projects\PaiCLI-Python-main\frontend
-pnpm install
-pnpm dev
+pnpm --dir frontend install
+uv run paicli workbench --cwd .
 ```
 
-打开 http://127.0.0.1:24157。前端监听端口在 `vite.config.ts` 的 `workspacePort` 中配置，端口占用时启动会退出。工作台通过本地 Runtime 加载会话和后台任务。主题偏好保存在 localStorage。
+在仓库根目录运行上述命令。工作台会启动本机 Runtime，等待前端能访问后端后打开浏览器。默认前端端口为 `24157`，已占用时可用 `--port` 指定其他端口。使用 `--no-browser` 可手动打开终端中显示的地址。
 
-## 连接真实 Runtime
+每次启动使用独立的 Runtime 端口和临时访问凭据。模型凭据沿用项目现有配置。已启用的 STDIO MCP 由 Runtime 自动启动，HTTP 和 SSE 服务按配置地址连接。关闭浏览器标签后工作台继续运行。在启动终端按 Ctrl+C 停止工作台及其 Runtime。修改后端代码后，退出并重新运行启动命令。
+
+## 分别启动前端和 Runtime
 
 1. 在项目根目录按现有配置方式提供模型凭据，通过环境变量注入 Runtime 访问凭据 `PAICLI_RUNTIME_API_KEY`。
 2. 在根目录运行 `uv run paicli serve --cwd .`。后端按 `.paicli/config.json` 的 `runtime.port` 监听，默认 `24158`，端口占用时启动会退出。修改 Python 后端代码后，重启 Runtime 以加载新代码。

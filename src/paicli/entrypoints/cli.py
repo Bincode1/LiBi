@@ -262,6 +262,34 @@ def runtime_serve(
         raise typer.Exit(1) from exc
 
 
+@app.command("workbench")
+def workbench(
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+    port: Annotated[
+        int, typer.Option("--port", min=1, max=65535, help="Workbench frontend port")
+    ] = 24157,
+    open_browser: Annotated[
+        bool, typer.Option("--open/--no-browser", help="Open the browser after startup")
+    ] = True,
+) -> None:
+    """Start the local workbench and its Runtime together."""
+    import signal
+
+    from paicli.runtime.workbench import WorkbenchError, run_workbench
+
+    stop_signal = getattr(signal, "SIGBREAK", signal.SIGTERM)
+    previous_handler = signal.signal(stop_signal, signal.default_int_handler)
+    try:
+        run_workbench((cwd or Path.cwd()).resolve(), port=port, open_browser=open_browser)
+    except KeyboardInterrupt:
+        return
+    except (OSError, ValueError, WorkbenchError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        signal.signal(stop_signal, previous_handler)
+
+
 @app.command("worker")
 def task_worker(
     workers: Annotated[int, typer.Option("--workers", help="Concurrent task workers")] = 2,
