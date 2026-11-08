@@ -560,8 +560,16 @@ try {{
 # ---------------------------------------------------------------------------
 
 
-async def _web_search(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
+async def _web_search(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     max_results = int(payload.get("max_results") or payload.get("maxResults") or 5)
+    budget = context.research_budget
+    if budget is not None:
+        if not budget.reserve("search"):
+            return ToolResult(
+                "Research search budget exhausted. Use the available evidence to finish.",
+                is_error=True,
+            )
+        max_results = max(1, min(max_results, 10))
     try:
         results = await search_web(str(payload["query"]), max_results=max_results)
     except Exception as exc:  # noqa: BLE001
@@ -572,15 +580,27 @@ async def _web_search(payload: dict[str, Any], _context: ToolContext) -> ToolRes
         f"{index}. {result.title}\n{result.url}\n{result.snippet}"
         for index, result in enumerate(results, start=1)
     )
+    if budget is not None:
+        content = budget.take_text(content)
     return ToolResult(content, display_summary=f"Search: {len(results)} results")
 
 
-async def _web_fetch(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
+async def _web_fetch(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     max_length = int(payload.get("max_length") or payload.get("maxLength") or 10_000)
+    budget = context.research_budget
+    if budget is not None:
+        if not budget.reserve("fetch"):
+            return ToolResult(
+                "Research fetch budget exhausted. Use the available evidence to finish.",
+                is_error=True,
+            )
+        max_length = max(1, min(max_length, 10_000, budget.chars_left))
     try:
         content = await fetch_url(str(payload["url"]), max_length=max_length)
     except Exception as exc:  # noqa: BLE001
         return ToolResult(f"Fetch error: {exc}", is_error=True)
+    if budget is not None:
+        content = budget.take_text(content)
     return ToolResult(content, display_summary=f"Fetched {payload['url']}")
 
 

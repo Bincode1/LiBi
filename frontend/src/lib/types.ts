@@ -39,6 +39,7 @@ export interface Subagent {
   tool_call_id: string | null
   sequence: number
   status: string
+  close_reason?: 'idle_expired'
   result_count: number
   started_at: string
   updated_at: string

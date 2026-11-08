@@ -10,11 +10,12 @@ from paicli.agent import Agent, QueryEngine
 from paicli.agent.run_controller import RunController
 from paicli.agent.subagents import ActivationState, SubagentManager
 from paicli.config import PaiCliConfig
+from paicli.context import CompactionResponse
 from paicli.policy.redaction import Redactor
 from paicli.session import ContextProjector, SessionStore
-from paicli.tools import ToolRegistry
+from paicli.tools import ToolRegistry, get_builtin_tools
 from paicli.tools.approval import ApprovalBroker
-from paicli.tools.base import ToolContext
+from paicli.tools.base import Tool, ToolContext, ToolResult
 
 
 class DelegatingClient:
@@ -106,8 +107,152 @@ def test_parent_natural_child_completion_delivers_once_and_sdk_closes(tmp_path, 
             ]
             assert len(deliveries) == 1
             assert len(deliveries[0].payload["delivery_ids"]) == 1
+            next_request = next(
+                event
+                for event in ctx.session_store.events(engine.session_id)
+                if event.event_type == "request/prepared"
+                and event.sequence > deliveries[0].sequence
+            )
+            assert next_request.step_id == deliveries[0].step_id
         assert not manager.active_for("root")
         assert all(a.settled for a in manager.activations.values())
+
+    asyncio.run(run())
+
+
+def test_child_delivery_reaches_next_request_after_tool_batch(tmp_path):
+    ctx = context(tmp_path)
+
+    class Client(DelegatingClient):
+        async def chat(self, messages, tools, *, system_prompt):
+            if self.root_calls == 0 or messages[0].content == "inspect child":
+                async for event in super().chat(messages, tools, system_prompt=system_prompt):
+                    yield event
+                return
+            self.root_calls += 1
+            if self.root_calls == 2:
+                yield {
+                    "type": "tool_call_delta",
+                    "tool_call": {
+                        "index": 0,
+                        "id": "independent",
+                        "function": {"name": "independent_work", "arguments": "{}"},
+                    },
+                }
+                yield {"type": "message_end", "stop_reason": "tool_use"}
+                return
+            assert messages[-2].role == "tool"
+            assert messages[-2].content == "independent work finished"
+            assert "child findings" in messages[-1].content
+            yield {"type": "text_delta", "text": "final synthesis"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    async def run():
+        client = Client()
+        async with QueryEngine(
+            llm_client=client,
+            tool_registry=ctx.tool_registry,
+            config=ctx.config,
+            cwd=ctx.cwd,
+            session_store=ctx.session_store,
+        ) as engine:
+
+            async def independent_work(_payload, _context):
+                while not ctx.session_store.events(
+                    engine.session_id, event_types=("agent/child_delivery_created",)
+                ):
+                    await asyncio.sleep(0)
+                return ToolResult("independent work finished")
+
+            ctx.tool_registry.register(
+                Tool("independent_work", "Independent work", {}, independent_work)
+            )
+            async with asyncio.timeout(3):
+                result = await engine.ask_complete_async("delegate inspection")
+            assert result.text == "final synthesis"
+            assert client.root_calls == 3
+            assert (
+                len(
+                    ctx.session_store.events(
+                        engine.session_id, event_types=("agent/child_delivery_acknowledged",)
+                    )
+                )
+                == 1
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["output", "compaction"])
+def test_parent_receives_partial_child_results(tmp_path, monkeypatch, failure):
+    ctx = context(tmp_path)
+    ctx.config.llm.max_tokens = 128
+    ctx.config.memory.min_recent_messages = 1
+    ctx.config.memory.compression_reserve_tokens = 64
+    ctx.tool_registry.register(
+        next(tool for tool in get_builtin_tools() if tool.name == "web_fetch")
+    )
+
+    async def fetch(_url, **_kwargs):
+        return "Verified evidence. " * 1200
+
+    monkeypatch.setattr("paicli.tools.builtins.fetch_url", fetch)
+
+    class Client(DelegatingClient):
+        max_context_window = 4096
+
+        async def complete(self, _request):
+            return CompactionResponse("invalid")
+
+        async def chat(self, messages, tools, *, system_prompt):
+            if messages[0].content != "inspect child":
+                async for event in super().chat(messages, tools, system_prompt=system_prompt):
+                    yield event
+                return
+            if failure == "output":
+                yield {"type": "text_delta", "text": "Partial child answer"}
+                yield {"type": "message_end", "stop_reason": "max_tokens"}
+                return
+            assert len(messages) == 1, "Compaction should intercept the next model request"
+            yield {
+                "type": "tool_call_delta",
+                "tool_call": {
+                    "index": 0,
+                    "id": "fetch",
+                    "function": {
+                        "name": "web_fetch",
+                        "arguments": '{"url":"https://example.test/evidence"}',
+                    },
+                },
+            }
+            yield {"type": "message_end", "stop_reason": "tool_use"}
+
+    async def run():
+        async with QueryEngine(
+            llm_client=Client(),
+            tool_registry=ctx.tool_registry,
+            config=ctx.config,
+            cwd=ctx.cwd,
+            session_store=ctx.session_store,
+        ) as engine:
+            async with asyncio.timeout(3):
+                await engine.ask_complete_async("delegate inspection")
+            (delivery,) = ctx.session_store.events(
+                engine.session_id, event_types=("agent/child_delivery_created",)
+            )
+            assert delivery.payload["result_status"] == "partial"
+            expected = (
+                ("MAX_OUTPUT_TOKENS", "Partial child answer")
+                if failure == "output"
+                else ("COMPACTION_FAILED", "Web evidence from https://example.test/evidence")
+            )
+            assert delivery.payload["error_code"] == expected[0]
+            (accepted,) = [
+                event
+                for event in ctx.session_store.events(engine.session_id)
+                if event.source == "subagent-delivery"
+            ]
+            assert expected[1] in accepted.payload["content"]
 
     asyncio.run(run())
 
@@ -140,19 +285,18 @@ def test_continuation_keeps_unacknowledged_rounds_and_capacity(tmp_path, monkeyp
             parent_session_id=ctx.session_id,
             session_store=ctx.session_store,
         )
-        assert controller.has_pending_children()
-        deliveries = controller.collect_deliveries(defer_ack=True)
+        deliveries = controller.ready_deliveries()
         rounds = [d for d in deliveries if d.child_id == first.id]
         assert [d.result for d in rounds] == ["first", "next"]
         assert len({d.delivery_id for d in rounds}) == 2
         controller.acknowledge_deliveries(deliveries)
-        assert controller.collect_deliveries() == []
+        assert controller.ready_deliveries() == []
         await manager.drain()
 
     asyncio.run(run())
 
 
-def test_restore_after_pending_check_and_acceptance_crash_window(tmp_path):
+def test_restore_after_acceptance_before_acknowledgement(tmp_path):
     ctx = context(tmp_path)
     store = ctx.session_store
     store.append(
@@ -169,8 +313,7 @@ def test_restore_after_pending_check_and_acceptance_crash_window(tmp_path):
     controller = RunController(
         manager=manager, parent_id="root", parent_session_id=ctx.session_id, session_store=store
     )
-    assert controller.has_pending_children()
-    deliveries = controller.collect_deliveries(defer_ack=True)
+    deliveries = controller.ready_deliveries()
     assert len(deliveries) == 1
     store.append(
         ctx.session_id,
@@ -186,8 +329,7 @@ def test_restore_after_pending_check_and_acceptance_crash_window(tmp_path):
         parent_session_id=ctx.session_id,
         session_store=store,
     )
-    assert not restarted.has_pending_children()
-    assert restarted.collect_deliveries() == []
+    assert restarted.ready_deliveries() == []
 
 
 def test_approval_failure_reaches_current_queued_and_future_requests():
@@ -392,7 +534,7 @@ def test_observer_failure_keeps_delivery_and_persistence_failure_is_visible(tmp_
             parent_session_id=ctx.session_id,
             session_store=ctx.session_store,
         )
-        deliveries = controller.collect_deliveries(defer_ack=True)
+        deliveries = controller.ready_deliveries()
         assert len(deliveries) == 1
         controller.acknowledge_deliveries(deliveries)
         await manager.flush_observations()

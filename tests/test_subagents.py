@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from contextlib import closing
+from types import SimpleNamespace
 
 import pytest
 
 from paicli.agent.subagents import ActivationState, ProviderCapabilities, SubagentManager
 from paicli.config import load_config
+from paicli.runtime.conversation import SubagentCatalog
 from paicli.session import SessionStore
 from paicli.tools.approval import ApprovalBroker
 from paicli.tools.base import ToolContext
@@ -95,6 +97,50 @@ def test_subagent_deadline_cancels_and_settles_once(tmp_path, monkeypatch):
         assert activation.error_code == "CHILD_DEADLINE_EXCEEDED"
         assert activation.settled
         assert len(manager.completed_for("root")) == 1
+        await manager.drain()
+
+    asyncio.run(run())
+
+
+def test_subagent_expiring_while_idle_keeps_successful_delivery(tmp_path, monkeypatch):
+    from paicli.agent.agent import Agent
+
+    async def complete(self, message):
+        return SimpleNamespace(text="findings")
+
+    monkeypatch.setattr(Agent, "run_complete", complete)
+    manager = SubagentManager()
+    context = _context(tmp_path)
+
+    async def run():
+        started = await manager.start(
+            {"description": "research", "prompt": "work", "timeout": 0.1}, context
+        )
+        assert not started.is_error
+        activation = next(iter(manager.activations.values()))
+        async with asyncio.timeout(2):
+            await asyncio.gather(activation.task, return_exceptions=True)
+            await asyncio.gather(*tuple(manager._settlers))
+        assert activation.status == ActivationState.DISPOSED
+        assert activation.error_code == "CHILD_IDLE_EXPIRED"
+        (delivered,) = manager.deliveries.values()
+        assert (delivered.status, delivered.result) == ("completed", "findings")
+        catalog = SubagentCatalog()
+        catalog.advance(
+            context.session_store.state(context.session_id),
+            context.session_store.events(context.session_id),
+        )
+        (child,) = catalog.snapshot(
+            context.session_store,
+            context.session_id,
+            active_parent_turn=None,
+            waiting_agents=set(),
+        )
+        assert (child["status"], child["result_count"], child["close_reason"]) == (
+            "completed",
+            1,
+            "idle_expired",
+        )
         await manager.drain()
 
     asyncio.run(run())
@@ -370,10 +416,12 @@ def test_settlement_creates_and_acknowledges_durable_delivery(tmp_path, monkeypa
             parent_session_id=context.session_id,
             session_store=context.session_store,
         )
-        deliveries = controller.collect_deliveries()
+        deliveries = controller.ready_deliveries()
         assert len(deliveries) == 1
         assert deliveries[0].delivery_id == activation.delivery_id
-        assert controller.collect_deliveries() == []
+        assert controller.ready_deliveries() == deliveries
+        controller.acknowledge_deliveries(deliveries)
+        assert controller.ready_deliveries() == []
         acked = [
             event
             for event in context.session_store.events(context.session_id)
@@ -410,12 +458,12 @@ def test_pending_delivery_recovers_after_manager_restart(tmp_path):
         parent_session_id=parent_session_id,
         session_store=context.session_store,
     )
-    recovered = controller.collect_deliveries(defer_ack=True)
+    recovered = controller.ready_deliveries()
     assert len(recovered) == 1
     assert recovered[0].result == "recovered result"
     assert recovered[0].delivery_id == delivery_id
     controller.acknowledge_deliveries(recovered)
-    assert controller.collect_deliveries() == []
+    assert controller.ready_deliveries() == []
     assert any(
         event.event_type == "agent/child_delivery_acknowledged"
         and event.payload["delivery_id"] == delivery_id
@@ -803,7 +851,7 @@ def test_deferred_ack_marks_activation_and_persists_ack(tmp_path, monkeypatch):
             parent_session_id=context.session_id,
             session_store=context.session_store,
         )
-        deliveries = controller.collect_deliveries(defer_ack=True)
+        deliveries = controller.ready_deliveries()
         assert deliveries
         controller.acknowledge_deliveries(deliveries)
         assert activation.delivered

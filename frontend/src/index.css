@@ -1029,6 +1029,7 @@ kbd {
   overflow-wrap: anywhere;
 }
 .subagent-status[data-status='approval'],
+.subagent-status[data-status='partial'],
 .subagent-status[data-status='timed_out'] {
   color: var(--warning);
 }

@@ -1468,9 +1468,9 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
         assert [
             e["payload"]["content"] for e in completed["events"] if e["type"] == "user/message"
         ] == ["My question"]
-        marker = next(e for e in completed["events"] if e["type"] == "agent/results_received")
-        assert len(marker["payload"]["delivery_ids"]) == 2
-        assert "content" not in marker["payload"]
+        markers = [e for e in completed["events"] if e["type"] == "agent/results_received"]
+        assert len({i for e in markers for i in e["payload"]["delivery_ids"]}) == 2
+        assert all("content" not in e["payload"] for e in markers)
         assert "Write result" not in json.dumps(completed)
         assert any(e["payload"].get("content") == "Final synthesis" for e in completed["events"])
         with client.stream(

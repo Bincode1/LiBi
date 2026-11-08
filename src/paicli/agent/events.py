@@ -9,6 +9,12 @@ from typing import Any
 from paicli.types import QueryResult, Usage
 
 
+class OutputLimitError(RuntimeError):
+    def __init__(self, partial_text: str):
+        super().__init__("Model output reached its token limit.")
+        self.partial_text = partial_text
+
+
 async def collect_query_result(events: AsyncIterator[dict[str, Any]]) -> QueryResult:
     """Consume an agent event stream and aggregate it into a ``QueryResult``.
 

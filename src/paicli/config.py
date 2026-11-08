@@ -48,6 +48,15 @@ class SubagentConfig:
     default_deadline: float | None = None
     drain_timeout: float = 15.0
     observation_queue_size: int = 512
+    research_max_searches: int = 6
+    research_max_fetches: int = 8
+    research_max_chars: int = 32_000
+
+    def __post_init__(self) -> None:
+        for name in ("research_max_searches", "research_max_fetches", "research_max_chars"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"subagents.{name} must be a positive integer")
 
 
 @dataclass(slots=True)

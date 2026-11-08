@@ -428,6 +428,13 @@ Runtime 接收新会话的第一条用户消息后，在后台只尝试生成一
 配置示例为 `{"session_title":{"model":"deepseek-flash"}}`。留空会沿用 `llm.model`，连接配置沿用
 主模型。DeepSeek 标题请求固定关闭思考。可用 `session_title.enabled=false` 关闭自动生成。
 该视图通过 `subagents` 同步委派任务的状态，通过 `agent/results_received` 标记内部结果投递。
+已就绪的子任务结果会在工具批次结算后进入主 Agent 的下一次模型请求。
+压缩失败或输出达到上限时，已有证据可作为部分结果交付。空闲子 Agent 到期会保留已完成的轮次。
+
+本地子 Agent 的每轮网页调研默认最多搜索 6 次、抓取 8 次并接收 32,000 字符的网页内容。
+可通过 `subagents.research_max_searches`、`subagents.research_max_fetches` 和
+`subagents.research_max_chars` 配置。
+主模型收到的报告正文每份最多 8,000 字符、每批最多 24,000 字符，完整报告保存在子会话中。
 工作台在主对话显示委派入口，在右侧显示子 agent 的状态和独立执行记录。打开子会话时订阅
 `GET /v1/sessions/<parent_id>/subagents/<child_session_id>/events/stream?cursor=<sequence>`。
 子会话流沿用独立游标，并校验子会话属于当前工作区与指定父会话。通用会话 API 以根会话为入口，
