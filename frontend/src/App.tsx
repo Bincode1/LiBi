@@ -36,6 +36,12 @@ import { TurnUsageSummary } from '@/features/conversation/turn-usage'
 import { McpSettings } from '@/features/mcp/settings'
 import { Details, type DetailsTab } from '@/features/workspace/details'
 import {
+  WorkspaceSplit,
+  conversationMinWidth,
+  detailsMinWidth,
+  splitterWidth,
+} from '@/features/workspace/split'
+import {
   SessionWorkspace,
   WorkspacePicker,
   useRecentWorkspaces,
@@ -44,7 +50,7 @@ import { useEventFeed } from '@/hooks/use-event-feed'
 import { useTabDrafts } from '@/hooks/use-tab-drafts'
 import { ApiError, liveClient, request } from '@/lib/api'
 import { projectTurns, resolveActiveRun, type PendingTurn, type ToolView } from '@/lib/events'
-import { easeOut, useSurfaceMotion } from '@/lib/motion'
+import { useSurfaceMotion } from '@/lib/motion'
 import { errorMessage } from '@/lib/utils'
 import type { Mode, PermissionMode, Session, Subagent } from '@/lib/types'
 
@@ -92,6 +98,7 @@ export default function App() {
   const id = matchPath('/sessions/:id', inMcpSettings ? returnTo : route.pathname)?.params.id
   const reducedMotion = useReducedMotion()
   const toastMotion = useSurfaceMotion({ y: 8 }, 0.18)
+  const detailsMotion = useSurfaceMotion({ x: 6 }, 0.18)
   const [theme, setTheme] = useState(() =>
     localStorage.getItem('libi-theme') === 'dark' ? 'dark' : 'light',
   )
@@ -129,6 +136,7 @@ export default function App() {
   const navigationTrigger = useRef<HTMLButtonElement>(null)
   const focusComposerAfterNavigation = useRef(false)
   const detailsTrigger = useRef<HTMLButtonElement>(null)
+  const conversationWidth = useRef(0)
   const approvalFocus = useRef<string | null>(null)
   const previousRuntimeError = useRef(false)
   const draftKey = id ?? 'new',
@@ -319,6 +327,19 @@ export default function App() {
       return
     viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'instant' })
   }, [turns, nearBottom, busy])
+  useEffect(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    conversationWidth.current = viewport.clientWidth
+    const observer = new ResizeObserver(() => {
+      const width = viewport.clientWidth
+      if (width === conversationWidth.current) return
+      conversationWidth.current = width
+      if (nearBottom && width > 0) viewport.scrollTop = viewport.scrollHeight
+    })
+    observer.observe(viewport)
+    return () => observer.disconnect()
+  }, [nearBottom])
   useEffect(() => {
     if (!notice) return
     const timer = setTimeout(() => setNotice(''), 7000)
@@ -651,9 +672,239 @@ export default function App() {
       </div>
     </aside>
   )
+  const conversation = (
+    <main className="main-panel">
+      <header className="topbar">
+        <div className="topbar-leading">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="mobile-menu"
+            ref={navigationTrigger}
+            aria-label="打开导航"
+            aria-haspopup="dialog"
+            onClick={() => setSidebar(true)}
+          >
+            <Menu size={18} />
+          </Button>
+          <SessionHeading className="breadcrumb-title" title={title}>
+            {title}
+          </SessionHeading>
+          {id && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="rename-session"
+              aria-label="重命名会话"
+              title="重命名会话"
+              onClick={() => {
+                setRenameError('')
+                setRenameDraft(current?.title ?? feed.title ?? '')
+              }}
+            >
+              <Pencil size={13} aria-hidden="true" />
+            </Button>
+          )}
+        </div>
+        <div className="topbar-actions">
+          <button
+            className="source-pill"
+            data-state={connectionError ? 'offline' : connectionSyncing ? 'pending' : 'ready'}
+            onClick={() => setSettings(true)}
+          >
+            <span aria-hidden="true" />
+            {connectionLabel}
+            <ChevronDown size={12} aria-hidden="true" />
+          </button>
+          <Button
+            variant="ghost"
+            size="icon"
+            ref={detailsTrigger}
+            aria-label={details ? '隐藏详情面板' : '显示详情面板'}
+            aria-pressed={details}
+            onClick={() => setDetails(!details)}
+          >
+            <PanelRight size={17} />
+          </Button>
+        </div>
+      </header>
+      <div
+        className="conversation-scroll"
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget
+          // Scroll anchoring may fire before the resize observer processes reflow.
+          if (el.clientWidth !== conversationWidth.current) return
+          setNearBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 100)
+        }}
+      >
+        <div className={`conversation-content ${!id && !pending ? 'welcome-content' : ''}`}>
+          {!id && !pending ? (
+            <section className="welcome">
+              <AgentMark />
+              <h1>今天想做什么？</h1>
+              <div className="suggestions">
+                {[
+                  {
+                    icon: Code2,
+                    title: '读懂这个项目',
+                    prompt: '帮我梳理这个项目的目录结构和 Agent 的核心运行流程。',
+                  },
+                  {
+                    icon: Sparkles,
+                    title: '实现一个想法',
+                    prompt: '我想改进项目的会话管理，先分析现有实现，再提出方案。',
+                  },
+                  {
+                    icon: ShieldCheck,
+                    title: '检查代码质量',
+                    prompt: '检查工具执行器的错误处理和审批流程，找出需要改进的问题。',
+                  },
+                ].map((item) => (
+                  <button
+                    key={item.title}
+                    onClick={() => {
+                      setDrafts((previous) => {
+                        const currentDraft = previous[draftKey]
+                        return {
+                          ...previous,
+                          [draftKey]: currentDraft?.trim()
+                            ? `${currentDraft.trimEnd()}\n\n${item.prompt}`
+                            : item.prompt,
+                        }
+                      })
+                      window.dispatchEvent(new Event('libi:focus'))
+                    }}
+                  >
+                    <item.icon size={16} aria-hidden="true" />
+                    <span>{item.title}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          ) : (
+            <>
+              {!runtimeOffline && feed.loading && !pending && (
+                <div className="loading-state">
+                  <LoaderCircle className="spin" size={18} />
+                  正在恢复会话…
+                </div>
+              )}
+              {!runtimeOffline && !feed.loading && !feed.error && !busy && turns.length === 0 && (
+                <div className="empty-conversation">
+                  <AgentMark />
+                  <h2>准备就绪</h2>
+                </div>
+              )}
+              <Suspense
+                fallback={
+                  <div className="loading-state" role="status">
+                    正在加载对话…
+                  </div>
+                }
+              >
+                {turns.map((turn) => (
+                  <Turn
+                    key={turn.id}
+                    turn={turn}
+                    unmanaged={unmanagedRun || !busy}
+                    canApprove={client.capabilities.approvals && !runtimeOffline}
+                    onApprove={approval}
+                    agents={agentsByTurn.get(turn.id)}
+                    onOpenAgent={openAgent}
+                    agentLabel={(agentId) =>
+                      feed.subagents?.find((agent) => agent.id === agentId)?.label
+                    }
+                    onInspect={(selected) => {
+                      setTool(selected)
+                      setDetails(true)
+                    }}
+                    notify={notify}
+                  />
+                ))}
+              </Suspense>
+            </>
+          )}
+        </div>
+      </div>
+      {!nearBottom && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="jump-bottom"
+          onClick={() => {
+            setNearBottom(true)
+            scrollRef.current?.scrollTo({
+              top: scrollRef.current.scrollHeight,
+              behavior: reducedMotion ? 'instant' : 'smooth',
+            })
+          }}
+        >
+          <ArrowDown size={14} />
+          回到最新
+        </Button>
+      )}
+      <Composer
+        workspace={
+          id ? (
+            sessionCwd && <SessionWorkspace path={sessionCwd} />
+          ) : (
+            <WorkspacePicker
+              client={client}
+              defaultPath={runtimeCwd}
+              path={newSessionCwd}
+              recent={recentWorkspaces}
+              disabled={connectionSyncing || runtimeOffline || submitting}
+              onSelect={rememberWorkspace}
+            />
+          )
+        }
+        draft={draft}
+        setDraft={setDraft}
+        mode={mode}
+        setMode={setMode}
+        permissionMode={permissionMode}
+        setPermissionMode={(next) => void setPermissionMode(next)}
+        changingPermission={changingPermission}
+        busy={busy}
+        unmanagedRun={unmanagedRun}
+        submitting={submitting}
+        syncing={connectionSyncing}
+        connectionError={connectionError}
+        onReconnect={reconnect}
+        canStop={client.capabilities.cancelTurn && Boolean(id && runId)}
+        stopping={stopping}
+        onSend={() => void send()}
+        onStop={() => void stop()}
+        onNewConversation={openNewConversation}
+      />
+    </main>
+  )
+  const dockedDetails = !detailsOverlay && details
   const workspace = (
     <div className="workspace" style={inMcpSettings ? { display: 'none' } : undefined}>
-      {mobile ? (
+      <WorkspaceSplit
+        side="navigation"
+        panel={mobile ? undefined : navigation}
+        contentMinWidth={
+          conversationMinWidth + (dockedDetails ? detailsMinWidth + splitterWidth : 0)
+        }
+      >
+        <WorkspaceSplit
+          side="details"
+          contentMinWidth={conversationMinWidth}
+          panel={
+            dockedDetails ? (
+              <m.div className="details-docked" {...detailsMotion}>
+                {detailPanel}
+              </m.div>
+            ) : undefined
+          }
+        >
+          {conversation}
+        </WorkspaceSplit>
+      </WorkspaceSplit>
+      {mobile && (
         <Dialog
           open={sidebar}
           onOpenChange={setSidebar}
@@ -668,214 +919,8 @@ export default function App() {
         >
           {navigation}
         </Dialog>
-      ) : (
-        navigation
       )}
-      <main className="main-panel">
-        <header className="topbar">
-          <div className="topbar-leading">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="mobile-menu"
-              ref={navigationTrigger}
-              aria-label="打开导航"
-              aria-haspopup="dialog"
-              onClick={() => setSidebar(true)}
-            >
-              <Menu size={18} />
-            </Button>
-            <SessionHeading className="breadcrumb-title" title={title}>
-              {title}
-            </SessionHeading>
-            {id && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="rename-session"
-                aria-label="重命名会话"
-                title="重命名会话"
-                onClick={() => {
-                  setRenameError('')
-                  setRenameDraft(current?.title ?? feed.title ?? '')
-                }}
-              >
-                <Pencil size={13} aria-hidden="true" />
-              </Button>
-            )}
-          </div>
-          <div className="topbar-actions">
-            <button
-              className="source-pill"
-              data-state={connectionError ? 'offline' : connectionSyncing ? 'pending' : 'ready'}
-              onClick={() => setSettings(true)}
-            >
-              <span aria-hidden="true" />
-              {connectionLabel}
-              <ChevronDown size={12} aria-hidden="true" />
-            </button>
-            <Button
-              variant="ghost"
-              size="icon"
-              ref={detailsTrigger}
-              aria-label={details ? '隐藏详情面板' : '显示详情面板'}
-              aria-pressed={details}
-              onClick={() => setDetails(!details)}
-            >
-              <PanelRight size={17} />
-            </Button>
-          </div>
-        </header>
-        <div
-          className="conversation-scroll"
-          ref={scrollRef}
-          onScroll={(e) => {
-            const el = e.currentTarget
-            setNearBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 100)
-          }}
-        >
-          <div className={`conversation-content ${!id && !pending ? 'welcome-content' : ''}`}>
-            {!id && !pending ? (
-              <section className="welcome">
-                <AgentMark />
-                <h1>今天想做什么？</h1>
-                <div className="suggestions">
-                  {[
-                    {
-                      icon: Code2,
-                      title: '读懂这个项目',
-                      prompt: '帮我梳理这个项目的目录结构和 Agent 的核心运行流程。',
-                    },
-                    {
-                      icon: Sparkles,
-                      title: '实现一个想法',
-                      prompt: '我想改进项目的会话管理，先分析现有实现，再提出方案。',
-                    },
-                    {
-                      icon: ShieldCheck,
-                      title: '检查代码质量',
-                      prompt: '检查工具执行器的错误处理和审批流程，找出需要改进的问题。',
-                    },
-                  ].map((item) => (
-                    <button
-                      key={item.title}
-                      onClick={() => {
-                        setDrafts((previous) => {
-                          const currentDraft = previous[draftKey]
-                          return {
-                            ...previous,
-                            [draftKey]: currentDraft?.trim()
-                              ? `${currentDraft.trimEnd()}\n\n${item.prompt}`
-                              : item.prompt,
-                          }
-                        })
-                        window.dispatchEvent(new Event('libi:focus'))
-                      }}
-                    >
-                      <item.icon size={16} aria-hidden="true" />
-                      <span>{item.title}</span>
-                    </button>
-                  ))}
-                </div>
-              </section>
-            ) : (
-              <>
-                {!runtimeOffline && feed.loading && !pending && (
-                  <div className="loading-state">
-                    <LoaderCircle className="spin" size={18} />
-                    正在恢复会话…
-                  </div>
-                )}
-                {!runtimeOffline && !feed.loading && !feed.error && !busy && turns.length === 0 && (
-                  <div className="empty-conversation">
-                    <AgentMark />
-                    <h2>准备就绪</h2>
-                  </div>
-                )}
-                <Suspense
-                  fallback={
-                    <div className="loading-state" role="status">
-                      正在加载对话…
-                    </div>
-                  }
-                >
-                  {turns.map((turn) => (
-                    <Turn
-                      key={turn.id}
-                      turn={turn}
-                      unmanaged={unmanagedRun || !busy}
-                      canApprove={client.capabilities.approvals && !runtimeOffline}
-                      onApprove={approval}
-                      agents={agentsByTurn.get(turn.id)}
-                      onOpenAgent={openAgent}
-                      agentLabel={(agentId) =>
-                        feed.subagents?.find((agent) => agent.id === agentId)?.label
-                      }
-                      onInspect={(selected) => {
-                        setTool(selected)
-                        setDetails(true)
-                      }}
-                      notify={notify}
-                    />
-                  ))}
-                </Suspense>
-              </>
-            )}
-          </div>
-        </div>
-        {!nearBottom && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="jump-bottom"
-            onClick={() => {
-              setNearBottom(true)
-              scrollRef.current?.scrollTo({
-                top: scrollRef.current.scrollHeight,
-                behavior: reducedMotion ? 'instant' : 'smooth',
-              })
-            }}
-          >
-            <ArrowDown size={14} />
-            回到最新
-          </Button>
-        )}
-        <Composer
-          workspace={
-            id ? (
-              sessionCwd && <SessionWorkspace path={sessionCwd} />
-            ) : (
-              <WorkspacePicker
-                client={client}
-                defaultPath={runtimeCwd}
-                path={newSessionCwd}
-                recent={recentWorkspaces}
-                disabled={connectionSyncing || runtimeOffline || submitting}
-                onSelect={rememberWorkspace}
-              />
-            )
-          }
-          draft={draft}
-          setDraft={setDraft}
-          mode={mode}
-          setMode={setMode}
-          permissionMode={permissionMode}
-          setPermissionMode={(next) => void setPermissionMode(next)}
-          changingPermission={changingPermission}
-          busy={busy}
-          unmanagedRun={unmanagedRun}
-          submitting={submitting}
-          syncing={connectionSyncing}
-          connectionError={connectionError}
-          onReconnect={reconnect}
-          canStop={client.capabilities.cancelTurn && Boolean(id && runId)}
-          stopping={stopping}
-          onSend={() => void send()}
-          onStop={() => void stop()}
-          onNewConversation={openNewConversation}
-        />
-      </main>
-      {detailsOverlay ? (
+      {detailsOverlay && (
         <Dialog
           open={details}
           onOpenChange={setDetails}
@@ -890,25 +935,6 @@ export default function App() {
         >
           {detailPanel}
         </Dialog>
-      ) : (
-        <div className="details-slot" inert={!details}>
-          <AnimatePresence>
-            {details && (
-              <m.div
-                className="details-slide"
-                initial={reducedMotion ? false : { width: 0 }}
-                animate={{ width: 'var(--details-track)' }}
-                exit={{
-                  width: 0,
-                  transition: { duration: reducedMotion ? 0 : 0.2, ease: easeOut },
-                }}
-                transition={{ duration: reducedMotion ? 0 : 0.26, ease: easeOut }}
-              >
-                {detailPanel}
-              </m.div>
-            )}
-          </AnimatePresence>
-        </div>
       )}
       <AnimatePresence>
         {notice && (
