@@ -133,6 +133,8 @@ class SessionStore:
         }
         if "role" in descriptor:
             started["role"] = descriptor["role"]
+        if descriptor.get("queued"):
+            started["queued"] = True
         descriptor_json = json.dumps(
             self.sanitize_payload({**descriptor, "parent_session_id": parent_session_id}),
             ensure_ascii=False,

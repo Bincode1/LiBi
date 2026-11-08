@@ -7,7 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from paicli.agent.subagents import ActivationState, ProviderCapabilities, SubagentManager
+from paicli.agent.subagents import (
+    ActivationState,
+    ProviderCapabilities,
+    SubagentManager,
+    make_subagent_tool,
+)
 from paicli.config import load_config
 from paicli.runtime.conversation import SubagentCatalog
 from paicli.session import SessionStore
@@ -71,6 +76,63 @@ def test_subagent_admission_enforces_capacity_and_cwd(tmp_path, monkeypatch):
         assert outside.is_error
         assert "INVALID_CWD" in outside.content
         await manager.drain()
+
+    asyncio.run(run())
+
+
+def test_batch_queues_after_four_and_cancels_unstarted_tasks(tmp_path, monkeypatch):
+    from paicli.agent.agent import Agent
+
+    context = _context(tmp_path)
+    manager = SubagentManager(max_active=8)
+    context.subagent_manager = manager
+    context.turn_id = "parent-turn"
+    context.session_store.start_turn(
+        context.session_id, context.turn_id, mode="react", message="Run a batch"
+    )
+    tool = make_subagent_tool()
+    started = asyncio.Queue()
+    gates = {str(i): asyncio.Event() for i in range(8)}
+
+    async def complete(self, message):
+        started.put_nowait(message)
+        await gates[message].wait()
+        return SimpleNamespace(text=f"report {message}")
+
+    monkeypatch.setattr(Agent, "run_complete", complete)
+
+    async def run():
+        tasks = [{"description": key, "prompt": key, "timeout": 30} for key in gates]
+        result = await tool.execute({"tasks": [*tasks, tasks[0]]}, context)
+        assert result.is_error and not manager.activations
+        result = await tool.execute({"tasks": tasks}, context)
+        assert not result.is_error and result.content.count("state=queued") == 4
+        catalog = SubagentCatalog()
+        catalog.advance(
+            context.session_store.state(context.session_id),
+            context.session_store.events(context.session_id),
+        )
+        projected = catalog.snapshot(
+            context.session_store,
+            context.session_id,
+            active_parent_turn=context.turn_id,
+            waiting_agents=set(),
+        )
+        assert [item["status"] for item in projected].count("queued") == 4
+        activations = list(manager.activations.values())
+        assert all(item.timeout_task is None for item in activations[4:])
+        async with asyncio.timeout(3):
+            assert {await started.get() for _ in range(4)} == {"0", "1", "2", "3"}
+            assert await manager.interrupt(activations[-1].id)
+            assert activations[-1].status == ActivationState.CANCELED
+            gates["0"].set()
+            assert await started.get() == "4"
+            assert activations[4].timeout_task is not None
+            assert started.empty()
+        await manager.cancel_for_parent("root")
+        assert all(not item.provider_started for item in activations[5:])
+        await manager.drain()
+        assert not activations[-1].provider_started
 
     asyncio.run(run())
 

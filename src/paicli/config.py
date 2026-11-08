@@ -42,7 +42,7 @@ class ToolsConfig:
 class SubagentConfig:
     """Runtime limits for ReAct delegated agents."""
 
-    max_active: int = 8
+    max_active: int = 4
     max_resident: int = 32
     max_depth: int = 2
     default_deadline: float | None = None

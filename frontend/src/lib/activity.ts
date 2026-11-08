@@ -50,6 +50,8 @@ export const toolLabel = (name: string, fallback = name) => toolLabels.get(name)
 export function subagentStatus(agent: Subagent) {
   const priorResult = agent.result_count > 0
   switch (agent.status) {
+    case 'queued':
+      return '排队中'
     case 'starting':
       return '正在启动'
     case 'running':
@@ -80,7 +82,7 @@ export function subagentStatus(agent: Subagent) {
 }
 
 export const subagentIsActive = (agent: Subagent) =>
-  agent.status === 'starting' || agent.status === 'running' || agent.status === 'approval'
+  ['queued', 'starting', 'running', 'approval'].includes(agent.status)
 
 const launchFailures = new Map([
   ['PARENT_CLOSED', '本轮正在结束'],

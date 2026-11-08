@@ -433,6 +433,10 @@ Runtime 接收新会话的第一条用户消息后，在后台只尝试生成一
 已就绪的子任务结果会在工具批次结算后进入主 Agent 的下一次模型请求。
 压缩失败或输出达到上限时，已有证据可作为部分结果交付。空闲子 Agent 到期会保留已完成的轮次。
 
+`subagent` 接受单个任务，也可通过 `tasks` 一次提交 1–8 个独立任务。
+同一批最多运行 4 个，剩余任务排队，到实际启动时才开始计时。
+`subagents.max_active` 默认也为 4，可调整整个运行实例的并发上限。
+
 本地子 Agent 的每轮网页调研默认最多搜索 6 次、抓取 8 次并接收 32,000 字符的网页内容。
 可通过 `subagents.research_max_searches`、`subagents.research_max_fetches` 和
 `subagents.research_max_chars` 配置。
