@@ -5,10 +5,10 @@ import asyncio
 import httpx
 import pytest
 
-from paicli.config import LlmConfig
-from paicli.context import CompactionRequest
-from paicli.llm import create_llm_client
-from paicli.types import Message
+from libi.config import LlmConfig
+from libi.context import CompactionRequest
+from libi.llm import create_llm_client
+from libi.types import Message
 
 
 @pytest.fixture
@@ -85,7 +85,7 @@ def test_slow_first_provider_failure_does_not_start_another_request(client, monk
         elapsed += 15
         return httpx.Response(500)
 
-    monkeypatch.setattr("paicli.llm.openai_compatible.monotonic", lambda: elapsed)
+    monkeypatch.setattr("libi.llm.openai_compatible.monotonic", lambda: elapsed)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", respond)
     events = asyncio.run(collect(client))
     assert calls == 1
@@ -105,8 +105,8 @@ def test_retry_waiting_for_response_headers_uses_remaining_budget(client, monkey
         await asyncio.Event().wait()
         pytest.fail("The retry budget should have canceled this attempt")
 
-    monkeypatch.setattr("paicli.llm.openai_compatible._PROVIDER_RETRY_DELAY", 0)
-    monkeypatch.setattr("paicli.llm.openai_compatible._PROVIDER_RETRY_WINDOW", 0.5, raising=False)
+    monkeypatch.setattr("libi.llm.openai_compatible._PROVIDER_RETRY_DELAY", 0)
+    monkeypatch.setattr("libi.llm.openai_compatible._PROVIDER_RETRY_WINDOW", 0.5, raising=False)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", respond)
 
     async def run():

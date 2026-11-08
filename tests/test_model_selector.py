@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from paicli.config import load_config
-from paicli.entrypoints.model_selector import ModelSelectorState
-from paicli.entrypoints.repl import _activate_model
-from paicli.llm import create_llm_client
-from paicli.llm.model_profiles import (
+from libi.config import load_config
+from libi.entrypoints.model_selector import ModelSelectorState
+from libi.entrypoints.repl import _activate_model
+from libi.llm import create_llm_client
+from libi.llm.model_profiles import (
     DEFAULT_MODEL_PROFILES,
     CustomModelStore,
     ModelProfile,
@@ -18,7 +18,7 @@ from paicli.llm.model_profiles import (
 
 
 def test_curated_model_list_is_offline_and_returned_as_an_independent_list():
-    from paicli.llm.models import get_available_models, get_models_by_provider
+    from libi.llm.models import get_available_models, get_models_by_provider
 
     models = get_available_models()
     assert models
@@ -145,15 +145,15 @@ def test_activate_model_rebuilds_live_client_without_restart(tmp_path, monkeypat
     assert agent.llm_client.api_key == "glm-secret"
     assert config.llm.base_url == "https://open.bigmodel.cn/api/paas/v4"
     assert renderer.context_window == 200_000
-    assert "You are PaiCLI" in agent.system_prompt
+    assert "You are LiBi" in agent.system_prompt
 
 
 def test_glm_startup_uses_official_zai_api_key_and_context(tmp_path):
     config = load_config(
         project_root=tmp_path,
         env={
-            "PAICLI_PROVIDER": "glm",
-            "PAICLI_MODEL": "glm-5.2",
+            "LIBI_PROVIDER": "glm",
+            "LIBI_MODEL": "glm-5.2",
             "ZAI_API_KEY": "official-key",
         },
     )

@@ -1,6 +1,6 @@
 // Copyright 2023 Vercel, Inc.
 // SPDX-License-Identifier: Apache-2.0
-// Adapted from https://elements.ai-sdk.dev/components/confirmation for PaiCLI Runtime events.
+// Adapted from https://elements.ai-sdk.dev/components/confirmation for LiBi Runtime events.
 // License: frontend/public/licenses/ai-elements.txt
 import { createContext, useContext, type ComponentProps, type ReactNode } from 'react'
 import { Button } from '@/components/ui/button'

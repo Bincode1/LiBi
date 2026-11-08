@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from paicli.config import load_config
-from paicli.skill import SkillContextBuffer, SkillMatcher, SkillRegistry, SkillStateStore
-from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.tools.base import ToolContext
-from paicli.tools.builtins import load_skill
-from paicli.tools.executor import ToolExecutor
+from libi.config import load_config
+from libi.skill import SkillContextBuffer, SkillMatcher, SkillRegistry, SkillStateStore
+from libi.tools import ToolRegistry, get_builtin_tools
+from libi.tools.base import ToolContext
+from libi.tools.builtins import load_skill
+from libi.tools.executor import ToolExecutor
 
 
 def test_skill_registry_layers_and_state(tmp_path):
@@ -20,7 +20,7 @@ def test_skill_registry_layers_and_state(tmp_path):
     project = tmp_path / "project"
     _write_skill(builtin, "web-access", "builtin desc", "v0")
     _write_skill(user, "web-access", "user desc", "v1")
-    _write_skill(project / ".paicli" / "skills", "project-only", "project desc", "v2")
+    _write_skill(project / ".libi" / "skills", "project-only", "project desc", "v2")
     state = SkillStateStore(tmp_path / "skills.json")
     state.disable("web-access")
 
@@ -57,7 +57,7 @@ def test_skill_context_buffer_is_one_shot_and_capped():
 
 
 def test_load_skill_pushes_body_into_context_buffer(tmp_path):
-    _write_skill(tmp_path / ".paicli" / "skills", "demo", "demo desc", "v1", body="demo body")
+    _write_skill(tmp_path / ".libi" / "skills", "demo", "demo desc", "v1", body="demo body")
     config = load_config(project_root=tmp_path)
     buffer = SkillContextBuffer()
     context = ToolContext(cwd=str(tmp_path), config=config, skill_context_buffer=buffer)
@@ -75,7 +75,7 @@ def test_skill_matcher_ranks_explicit_names_and_chinese_english_terms(tmp_path):
     user = tmp_path / "user"
     builtin = tmp_path / "builtin"
     _write_skill(
-        project / ".paicli" / "skills",
+        project / ".libi" / "skills",
         "pdf-ocr",
         "从扫描图片和 PDF 文档中提取文字",
         "v1",
@@ -125,7 +125,7 @@ def test_skill_registry_create_update_and_scope(tmp_path):
         tags=["release", "verification"],
     )
     assert created.source == "project"
-    assert created.path == project / ".paicli" / "skills" / "release-check" / "SKILL.md"
+    assert created.path == project / ".libi" / "skills" / "release-check" / "SKILL.md"
     assert registry.load("release-check").tags == ["release", "verification"]
 
     with pytest.raises(FileExistsError):
@@ -192,7 +192,7 @@ def test_save_skill_tool_requires_approval_and_persists_after_approval(tmp_path)
         executor.execute_all([call], ToolContext(cwd=str(tmp_path), config=config))
     )[0]
     assert denied.is_error
-    assert not (tmp_path / ".paicli" / "skills" / "test-workflow" / "SKILL.md").exists()
+    assert not (tmp_path / ".libi" / "skills" / "test-workflow" / "SKILL.md").exists()
 
     approved = asyncio.run(
         executor.execute_all(
@@ -205,7 +205,7 @@ def test_save_skill_tool_requires_approval_and_persists_after_approval(tmp_path)
         )
     )[0]
     assert not approved.is_error
-    assert (tmp_path / ".paicli" / "skills" / "test-workflow" / "SKILL.md").is_file()
+    assert (tmp_path / ".libi" / "skills" / "test-workflow" / "SKILL.md").is_file()
 
 
 def _write_skill(

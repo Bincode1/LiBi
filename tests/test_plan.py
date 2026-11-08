@@ -5,13 +5,13 @@ from typing import Any
 
 import pytest
 
-from paicli.agent import PlanExecuteAgent
-from paicli.config import load_config
-from paicli.llm.base import ProviderRequestError
-from paicli.plan import ExecutionPlan, Planner, Task, TaskType
-from paicli.session import ContextProjector, SessionStore
-from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.tools.base import Tool, ToolResult, object_schema
+from libi.agent import PlanExecuteAgent
+from libi.config import load_config
+from libi.llm.base import ProviderRequestError
+from libi.plan import ExecutionPlan, Planner, Task, TaskType
+from libi.session import ContextProjector, SessionStore
+from libi.tools import ToolRegistry, get_builtin_tools
+from libi.tools.base import Tool, ToolResult, object_schema
 
 
 def test_execution_plan_exposes_dag_batches():
@@ -225,8 +225,8 @@ def test_plan_persists_provider_attempts_under_one_request(session_store, config
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_plan_worker_records_tools_and_terminal_state(tmp_path, monkeypatch, fails):
-    monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
-    monkeypatch.setattr("paicli.agent.plan_execute.SnapshotService.create", lambda *args: None)
+    monkeypatch.setattr("libi.agent.agent.SnapshotService.create", lambda *args: None)
+    monkeypatch.setattr("libi.agent.plan_execute.SnapshotService.create", lambda *args: None)
     config = load_config(project_root=tmp_path, env={})
     config.memory.compression_mode = "disabled"
     store = SessionStore(tmp_path / "runtime.db")

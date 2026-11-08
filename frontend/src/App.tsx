@@ -93,7 +93,7 @@ export default function App() {
   const reducedMotion = useReducedMotion()
   const toastMotion = useSurfaceMotion({ y: 8 }, 0.18)
   const [theme, setTheme] = useState(() =>
-    localStorage.getItem('paicli-theme') === 'dark' ? 'dark' : 'light',
+    localStorage.getItem('libi-theme') === 'dark' ? 'dark' : 'light',
   )
   const [settings, setSettings] = useState(false),
     [search, setSearch] = useState(false),
@@ -163,7 +163,7 @@ export default function App() {
   })
   const bridge = useQuery({
     queryKey: ['bridge'],
-    queryFn: () => request<{ configured: boolean }>('/__paicli/status'),
+    queryFn: () => request<{ configured: boolean }>('/__libi/status'),
     enabled: settings,
     retry: false,
   })
@@ -263,7 +263,7 @@ export default function App() {
     document.documentElement.dataset.theme = theme
     const themeColor = getComputedStyle(document.documentElement).getPropertyValue('--background')
     document.querySelector('meta[name="theme-color"]')?.setAttribute('content', themeColor.trim())
-    localStorage.setItem('paicli-theme', theme)
+    localStorage.setItem('libi-theme', theme)
   }, [theme])
   useEffect(() => {
     const navigationQuery = matchMedia(navigationDrawer)
@@ -334,7 +334,7 @@ export default function App() {
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'o') {
         event.preventDefault()
         navigate('/new')
-        window.dispatchEvent(new Event('paicli:focus'))
+        window.dispatchEvent(new Event('libi:focus'))
       }
     }
     window.addEventListener('keydown', onKey)
@@ -477,7 +477,7 @@ export default function App() {
     navigate('/new')
     setSidebar(false)
     if (mobile && sidebar) focusComposerAfterNavigation.current = true
-    else window.dispatchEvent(new Event('paicli:focus'))
+    else window.dispatchEvent(new Event('libi:focus'))
   }
   const addTask = async () => {
     if (!taskPrompt.trim() || submitting || !runtimeReady) return
@@ -500,7 +500,7 @@ export default function App() {
     ;(groups[label] ??= []).push(session)
     return groups
   }, {})
-  const project = health.data?.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? 'PaiCLI-Python'
+  const project = health.data?.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? 'LiBi'
   const SessionHeading = id ? 'h1' : 'span'
   const detailPanel = details && (
     <Details
@@ -557,7 +557,7 @@ export default function App() {
           }}
         >
           <AgentMark />
-          <span>PaiCLI</span>
+          <span>LiBi</span>
         </a>
         <Button
           variant="ghost"
@@ -662,7 +662,7 @@ export default function App() {
           restoreFocus={() => {
             if (focusComposerAfterNavigation.current) {
               focusComposerAfterNavigation.current = false
-              window.dispatchEvent(new Event('paicli:focus'))
+              window.dispatchEvent(new Event('libi:focus'))
             } else navigationTrigger.current?.focus()
           }}
         >
@@ -768,7 +768,7 @@ export default function App() {
                               : item.prompt,
                           }
                         })
-                        window.dispatchEvent(new Event('paicli:focus'))
+                        window.dispatchEvent(new Event('libi:focus'))
                       }}
                     >
                       <item.icon size={16} aria-hidden="true" />
@@ -976,7 +976,7 @@ export default function App() {
               <li>停止当前工作台。若前端和 Runtime 分开启动，请先停止两者。</li>
               <li>
                 在项目根目录重新启动工作台
-                <code className="command">uv run paicli workbench --cwd .</code>
+                <code className="command">uv run libi workbench --cwd .</code>
               </li>
             </ol>
           )}

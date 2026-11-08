@@ -4,9 +4,9 @@ import asyncio
 
 import pytest
 
-from paicli.entrypoints.repl import start_repl
-from paicli.memory import MemoryManager
-from paicli.session import SessionStore, default_runtime_db_path
+from libi.entrypoints.repl import start_repl
+from libi.memory import MemoryManager
+from libi.session import SessionStore, default_runtime_db_path
 
 pytestmark = pytest.mark.integration
 
@@ -27,7 +27,7 @@ def repl_input(monkeypatch):
                 raise item
             return item
 
-    monkeypatch.setattr("paicli.entrypoints.repl.PromptSession", ScriptedPrompt)
+    monkeypatch.setattr("libi.entrypoints.repl.PromptSession", ScriptedPrompt)
     return lines
 
 

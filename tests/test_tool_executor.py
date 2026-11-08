@@ -4,9 +4,9 @@ import asyncio
 
 import pytest
 
-from paicli.tools import ToolRegistry
-from paicli.tools.base import Tool, ToolResult, object_schema
-from paicli.tools.executor import ToolExecutor
+from libi.tools import ToolRegistry
+from libi.tools.base import Tool, ToolResult, object_schema
+from libi.tools.executor import ToolExecutor
 
 
 def test_unknown_tool_and_missing_input_return_correlated_errors(tool_context):

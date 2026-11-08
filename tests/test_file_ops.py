@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from paicli.policy.path_guard import PathPolicyError
-from paicli.rag.code_index import CodeIndex
-from paicli.tools import file_ops
+from libi.policy.path_guard import PathPolicyError
+from libi.rag.code_index import CodeIndex
+from libi.tools import file_ops
 
 
 def test_recursive_tools_do_not_enter_outside_directory_links(tmp_path):

@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from paicli.context import (
+from libi.context import (
     CompactionCoordinator,
     CompactionError,
     CompactionPlanner,
@@ -14,8 +14,8 @@ from paicli.context import (
     CompactionValidator,
     MessageSource,
 )
-from paicli.llm.base import ProviderRequestError
-from paicli.types import Message, Usage
+from libi.llm.base import ProviderRequestError
+from libi.types import Message, Usage
 
 
 @pytest.fixture

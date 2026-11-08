@@ -8,10 +8,10 @@ import socket
 import httpx
 import pytest
 
-from paicli.config import PaiCliConfig
-from paicli.session import SessionStore
-from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.tools.base import ToolContext
+from libi.config import LiBiConfig
+from libi.session import SessionStore
+from libi.tools import ToolRegistry, get_builtin_tools
+from libi.tools.base import ToolContext
 
 
 @pytest.fixture(autouse=True)
@@ -21,7 +21,7 @@ def isolated_home(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     for name in tuple(os.environ):
-        if name.startswith("PAICLI_") or name.endswith(("_API_KEY", "_BASE_URL", "_MODEL")):
+        if name.startswith("LIBI_") or name.endswith(("_API_KEY", "_BASE_URL", "_MODEL")):
             monkeypatch.delenv(name)
     return home
 
@@ -67,8 +67,8 @@ def offline_network(monkeypatch):
 
 
 @pytest.fixture
-def config(tmp_path) -> PaiCliConfig:
-    config = PaiCliConfig()
+def config(tmp_path) -> LiBiConfig:
+    config = LiBiConfig()
     config.session_title.enabled = False
     config.features.mcp = False
     config.memory.long_term_db_path = str(tmp_path / "memory.db")

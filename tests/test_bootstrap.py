@@ -4,8 +4,8 @@ import asyncio
 
 import pytest
 
-from paicli.bootstrap import build_runtime
-from paicli.tools.base import Tool, ToolResult, object_schema
+from libi.bootstrap import build_runtime
+from libi.tools.base import Tool, ToolResult, object_schema
 
 pytestmark = pytest.mark.integration
 
@@ -26,7 +26,7 @@ def test_shared_bootstrap_registers_builtins_and_optional_mcp(
         async def load_tools(self):
             return [Tool("mcp__test__echo", "Echo", object_schema({}), echo)]
 
-    monkeypatch.setattr("paicli.bootstrap.McpClientManager", Manager)
+    monkeypatch.setattr("libi.bootstrap.McpClientManager", Manager)
     config.features.mcp = enabled
     client, registry, manager, store = asyncio.run(build_runtime(config=config, cwd=str(tmp_path)))
     assert registry.get("read_file") is not None
@@ -41,7 +41,7 @@ def test_mcp_auto_start_disabled(tmp_path, config, monkeypatch):
     def unexpected_manager(_cwd):
         pytest.fail("Disabled MCP auto-start must not discover servers")
 
-    monkeypatch.setattr("paicli.bootstrap.McpClientManager", unexpected_manager)
+    monkeypatch.setattr("libi.bootstrap.McpClientManager", unexpected_manager)
     config.features.mcp = True
     config.mcp.auto_start = False
     _, registry, manager, _ = asyncio.run(build_runtime(config=config, cwd=str(tmp_path)))

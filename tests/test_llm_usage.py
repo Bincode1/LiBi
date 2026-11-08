@@ -6,12 +6,12 @@ import json
 import httpx
 import pytest
 
-from paicli.agent import Agent
-from paicli.config import LlmConfig, PaiCliConfig, load_config
-from paicli.llm import calculate_cost, create_llm_client, get_builtin_price_profile
-from paicli.llm.openai_compatible import OpenAICompatibleClient, _iter_sse
-from paicli.tools import ToolRegistry
-from paicli.types import Message, Usage
+from libi.agent import Agent
+from libi.config import LiBiConfig, LlmConfig, load_config
+from libi.llm import calculate_cost, create_llm_client, get_builtin_price_profile
+from libi.llm.openai_compatible import OpenAICompatibleClient, _iter_sse
+from libi.tools import ToolRegistry
+from libi.types import Message, Usage
 
 
 def test_streaming_payload_requests_usage() -> None:
@@ -107,7 +107,7 @@ def test_agent_propagates_connection_error_without_raising(tmp_path, monkeypatch
         raise httpx.ConnectError("temporary connection failure", request=request)
 
     monkeypatch.setattr(httpx.AsyncClient, "stream", fail_stream)
-    config = PaiCliConfig()
+    config = LiBiConfig()
     config.llm.api_key = "key"
     config.memory.long_term_db_path = str(tmp_path / "memory.db")
     agent = Agent(
@@ -295,7 +295,7 @@ def test_uncategorized_legacy_input_uses_cache_miss_price() -> None:
 
 
 def test_unknown_model_context_and_prices_can_be_configured(tmp_path) -> None:
-    project_config = tmp_path / ".paicli" / "config.json"
+    project_config = tmp_path / ".libi" / "config.json"
     project_config.parent.mkdir(parents=True)
     project_config.write_text(
         json.dumps(

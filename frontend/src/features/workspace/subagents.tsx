@@ -309,7 +309,7 @@ export function SubagentsPane({
           <p>
             {rootId && !syncing && !supported
               ? '当前连接未提供子 agent 状态。'
-              : 'PaiCLI 委派任务时，进度和交付会显示在这里。'}
+              : 'LiBi 委派任务时，进度和交付会显示在这里。'}
           </p>
         </div>
       )}

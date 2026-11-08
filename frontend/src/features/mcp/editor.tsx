@@ -188,7 +188,7 @@ export function McpEditor({
       }}
       className="mcp-editor"
       title={server ? '编辑 MCP 服务' : '添加自定义 MCP'}
-      description="用户级服务保存在 ~/.paicli/mcp.json，可在所有工作区使用。"
+      description="用户级服务保存在 ~/.libi/mcp.json，可在所有工作区使用。"
     >
       <form className="mcp-editor-form" onSubmit={submit}>
         {!server && (

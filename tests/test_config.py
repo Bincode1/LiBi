@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from paicli.config import load_config
+from libi.config import load_config
 
 
 @pytest.mark.parametrize("port", [0, 65536, True, "24158"])
@@ -16,20 +16,20 @@ def test_runtime_port_rejects_non_listening_values(port):
 def test_config_precedence(tmp_path, monkeypatch):
     home = tmp_path / "home"
     project = tmp_path / "project"
-    (home / ".paicli").mkdir(parents=True)
-    (project / ".paicli").mkdir(parents=True)
-    (home / ".paicli" / "config.json").write_text(
+    (home / ".libi").mkdir(parents=True)
+    (project / ".libi").mkdir(parents=True)
+    (home / ".libi" / "config.json").write_text(
         json.dumps({"llm": {"provider": "home", "model": "home-model"}}),
         encoding="utf-8",
     )
-    (project / ".paicli" / "config.json").write_text(
+    (project / ".libi" / "config.json").write_text(
         json.dumps({"llm": {"provider": "project", "model": "project-model"}}),
         encoding="utf-8",
     )
-    (project / ".env").write_text("PAICLI_MODEL=env-file-model\n", encoding="utf-8")
+    (project / ".env").write_text("LIBI_MODEL=env-file-model\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.setenv("PAICLI_PROVIDER", "process")
+    monkeypatch.setenv("LIBI_PROVIDER", "process")
 
     config = load_config(
         project_root=project,
@@ -42,8 +42,8 @@ def test_config_precedence(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("highest_layer", range(6))
 def test_config_precedence_at_every_layer(tmp_path, isolated_home, highest_layer):
-    user = isolated_home / ".paicli/config.json"
-    project = tmp_path / ".paicli/config.json"
+    user = isolated_home / ".libi/config.json"
+    project = tmp_path / ".libi/config.json"
     if highest_layer >= 1:
         user.parent.mkdir()
         user.write_text('{"llm":{"model":"user"}}', encoding="utf-8")
@@ -51,9 +51,9 @@ def test_config_precedence_at_every_layer(tmp_path, isolated_home, highest_layer
         project.parent.mkdir()
         project.write_text('{"llm":{"model":"project"}}', encoding="utf-8")
     if highest_layer >= 3:
-        (tmp_path / ".env").write_text("PAICLI_MODEL=dotenv\n", encoding="utf-8")
+        (tmp_path / ".env").write_text("LIBI_MODEL=dotenv\n", encoding="utf-8")
     overrides = {"llm": {"model": "cli"}} if highest_layer >= 4 else None
-    env = {"PAICLI_MODEL": "process"} if highest_layer >= 5 else {}
+    env = {"LIBI_MODEL": "process"} if highest_layer >= 5 else {}
     config = load_config(project_root=tmp_path, env=env, overrides=overrides)
     assert (
         config.llm.model
@@ -62,8 +62,8 @@ def test_config_precedence_at_every_layer(tmp_path, isolated_home, highest_layer
 
 
 def test_provider_specific_api_key(tmp_path, monkeypatch):
-    monkeypatch.setenv("PAICLI_PROVIDER", "deepseek")
-    monkeypatch.delenv("PAICLI_API_KEY", raising=False)
+    monkeypatch.setenv("LIBI_PROVIDER", "deepseek")
+    monkeypatch.delenv("LIBI_API_KEY", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
 
     config = load_config(project_root=tmp_path)
@@ -73,8 +73,8 @@ def test_provider_specific_api_key(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("trusted", [False, True])
 def test_project_configuration_cannot_retarget_process_credentials(tmp_path, trusted):
-    (tmp_path / ".paicli").mkdir()
-    (tmp_path / ".paicli/config.json").write_text(
+    (tmp_path / ".libi").mkdir()
+    (tmp_path / ".libi/config.json").write_text(
         json.dumps(
             {
                 "llm": {"base_url": "https://project.example/v1", "model": "project-model"},
@@ -85,13 +85,13 @@ def test_project_configuration_cannot_retarget_process_credentials(tmp_path, tru
         encoding="utf-8",
     )
     (tmp_path / ".env").write_text(
-        "PAICLI_TRUST_PROJECT_CONFIG=1\nDEEPSEEK_BASE_URL=https://dotenv.example/v1\n"
-        "PAICLI_HITL=never\n",
+        "LIBI_TRUST_PROJECT_CONFIG=1\nDEEPSEEK_BASE_URL=https://dotenv.example/v1\n"
+        "LIBI_HITL=never\n",
         encoding="utf-8",
     )
     env = {"DEEPSEEK_API_KEY": "synthetic-key"}
     if trusted:
-        env["PAICLI_TRUST_PROJECT_CONFIG"] = "1"
+        env["LIBI_TRUST_PROJECT_CONFIG"] = "1"
     config = load_config(project_root=tmp_path, env=env)
     assert config.llm.model == "project-model"
     assert config.llm.api_key == "synthetic-key"
@@ -104,9 +104,7 @@ def test_project_configuration_cannot_retarget_process_credentials(tmp_path, tru
 def test_project_dotenv_provider_key_only_applies_to_default_endpoint(tmp_path):
     (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=synthetic-project-key\n", encoding="utf-8")
     assert load_config(tmp_path, env={}).llm.api_key == "synthetic-project-key"
-    assert not load_config(
-        tmp_path, env={"PAICLI_BASE_URL": "https://proxy.example/v1"}
-    ).llm.api_key
+    assert not load_config(tmp_path, env={"LIBI_BASE_URL": "https://proxy.example/v1"}).llm.api_key
     assert (
         load_config(tmp_path, env={"DEEPSEEK_API_KEY": "synthetic-process-key"}).llm.api_key
         == "synthetic-process-key"
@@ -114,7 +112,7 @@ def test_project_dotenv_provider_key_only_applies_to_default_endpoint(tmp_path):
 
 
 def test_invalid_thinking_env_keeps_default(tmp_path, monkeypatch):
-    monkeypatch.setenv("PAICLI_THINKING", "maybe")
+    monkeypatch.setenv("LIBI_THINKING", "maybe")
 
     config = load_config(project_root=tmp_path)
 
@@ -122,7 +120,7 @@ def test_invalid_thinking_env_keeps_default(tmp_path, monkeypatch):
 
 
 def test_removed_team_mode_is_rejected_from_config(tmp_path):
-    config_dir = tmp_path / ".paicli"
+    config_dir = tmp_path / ".libi"
     config_dir.mkdir(parents=True)
     (config_dir / "config.json").write_text(
         json.dumps({"prompt": {"agent_mode": "team"}}),
@@ -134,8 +132,8 @@ def test_removed_team_mode_is_rejected_from_config(tmp_path):
 
 
 def test_existing_config_uses_llm_compression_default(tmp_path, monkeypatch):
-    monkeypatch.setattr("paicli.config._home", lambda: tmp_path)
-    config_dir = tmp_path / ".paicli"
+    monkeypatch.setattr("libi.config._home", lambda: tmp_path)
+    config_dir = tmp_path / ".libi"
     config_dir.mkdir()
     (config_dir / "config.json").write_text('{"render_mode":"plain"}', encoding="utf-8")
     assert load_config(project_root=tmp_path, env={}).memory.compression_mode == "llm"
@@ -162,10 +160,10 @@ def test_invalid_json_config_fails_without_exposing_content(tmp_path, monkeypatc
     home = tmp_path / "home"
     project = tmp_path / "project"
     root = home if source == "user" else project
-    path = root / ".paicli" / "config.json"
+    path = root / ".libi" / "config.json"
     path.parent.mkdir(parents=True)
     path.write_text(content, encoding="utf-8")
-    monkeypatch.setattr("paicli.config._home", lambda: home)
+    monkeypatch.setattr("libi.config._home", lambda: home)
 
     with pytest.raises(ValueError) as captured:
         load_config(project_root=project, env={})
@@ -173,11 +171,11 @@ def test_invalid_json_config_fails_without_exposing_content(tmp_path, monkeypatc
     assert content not in str(captured.value)
 
 
-@pytest.mark.parametrize("filename", [".paicli/config.json", ".env"])
+@pytest.mark.parametrize("filename", [".libi/config.json", ".env"])
 def test_unreadable_config_is_not_silently_ignored(tmp_path, monkeypatch, filename):
     from pathlib import Path
 
-    monkeypatch.setattr("paicli.config._home", lambda: tmp_path / "home")
+    monkeypatch.setattr("libi.config._home", lambda: tmp_path / "home")
     original = Path.read_text
     target = tmp_path / filename
 
@@ -204,7 +202,7 @@ def test_subagent_limits_survive_config_loading(tmp_path):
 
 @pytest.mark.parametrize("enabled", ["1", "true", "yes", "on", "enabled", " TRUE "])
 def test_thinking_enabled_aliases(tmp_path, monkeypatch, enabled):
-    monkeypatch.setenv("PAICLI_THINKING", enabled)
+    monkeypatch.setenv("LIBI_THINKING", enabled)
     assert load_config(project_root=tmp_path).llm.thinking_enabled
 
 
@@ -212,7 +210,7 @@ def test_thinking_enabled_aliases(tmp_path, monkeypatch, enabled):
 def test_thinking_disabled_aliases(tmp_path, disabled):
     assert not load_config(
         project_root=tmp_path,
-        env={"PAICLI_THINKING": disabled},
+        env={"LIBI_THINKING": disabled},
         overrides={"llm": {"thinking_enabled": True}},
     ).llm.thinking_enabled
 
@@ -226,10 +224,10 @@ def test_invalid_compaction_parameters_fail_explicitly(tmp_path, overrides):
 
 
 def test_public_config_masks_key_without_mutating_original(config):
-    from paicli.config import config_to_public_dict
+    from libi.config import config_to_public_dict
 
     config.llm.api_key = load_config(
-        env={"PAICLI_API_KEY": "synthetic-public-credential"}
+        env={"LIBI_API_KEY": "synthetic-public-credential"}
     ).llm.api_key
     public = config_to_public_dict(config)
     assert public["llm"]["api_key"] == "***"

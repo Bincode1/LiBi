@@ -5,15 +5,15 @@ import json
 
 import pytest
 
-from paicli.agent import QueryEngine
-from paicli.agent.subagents import ChildReport, _report_result
-from paicli.config import PaiCliConfig
-from paicli.context.tokens import estimate_text_tokens
-from paicli.runtime.conversation import SubagentCatalog
-from paicli.session import SessionStore
-from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.web.citations import CitationBook, ResearchSource
-from paicli.web.search import SearchResult
+from libi.agent import QueryEngine
+from libi.agent.subagents import ChildReport, _report_result
+from libi.config import LiBiConfig
+from libi.context.tokens import estimate_text_tokens
+from libi.runtime.conversation import SubagentCatalog
+from libi.session import SessionStore
+from libi.tools import ToolRegistry, get_builtin_tools
+from libi.web.citations import CitationBook, ResearchSource
+from libi.web.search import SearchResult
 
 READ_URL = "https://example.test/release"
 SEARCH_URL = "https://example.test/survey"
@@ -43,8 +43,8 @@ def test_delegated_research_links_are_validated_in_the_existing_summary_request(
         assert query == "survey"
         return [SearchResult("Survey results", SEARCH_URL, "A search excerpt.")]
 
-    monkeypatch.setattr("paicli.tools.builtins.fetch_url", fetch)
-    monkeypatch.setattr("paicli.tools.builtins.search_web", search)
+    monkeypatch.setattr("libi.tools.builtins.fetch_url", fetch)
+    monkeypatch.setattr("libi.tools.builtins.search_web", search)
 
     class Client:
         model_name = "fake-model"
@@ -108,7 +108,7 @@ def test_delegated_research_links_are_validated_in_the_existing_summary_request(
                 yield {"type": "text_delta", "text": f"Plain answer {MADE_UP_URL}"}
                 yield {"type": "message_end", "stop_reason": "end_turn"}
 
-    config = PaiCliConfig()
+    config = LiBiConfig()
     config.policy.hitl_mode = "never"
     config.features.memory = False
     config.features.skill = False

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 
-from paicli.mcp import load_mcp_server_specs, write_chrome_devtools_config
+from libi.mcp import load_mcp_server_specs, write_chrome_devtools_config
 
 
 def test_mcp_config_merges_scopes_and_expands_environment(tmp_path, isolated_home, monkeypatch):
     monkeypatch.setenv("TEST_MCP_HOST", "https://example.test/mcp")
-    user = isolated_home / ".paicli/mcp.json"
+    user = isolated_home / ".libi/mcp.json"
     user.parent.mkdir()
     user.write_text(
         json.dumps(
@@ -15,7 +15,7 @@ def test_mcp_config_merges_scopes_and_expands_environment(tmp_path, isolated_hom
         ),
         encoding="utf-8",
     )
-    project = tmp_path / ".paicli/mcp.json"
+    project = tmp_path / ".libi/mcp.json"
     project.parent.mkdir()
     project.write_text(
         json.dumps(
@@ -42,7 +42,7 @@ def test_mcp_config_merges_scopes_and_expands_environment(tmp_path, isolated_hom
 
 
 def test_chrome_config_preserves_other_servers_and_roundtrips_options(tmp_path):
-    path = tmp_path / ".paicli/mcp.json"
+    path = tmp_path / ".libi/mcp.json"
     path.parent.mkdir()
     path.write_text(json.dumps({"mcpServers": {"existing": {"command": "keep"}}}), encoding="utf-8")
     assert (

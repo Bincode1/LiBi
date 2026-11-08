@@ -13,16 +13,14 @@ coverage.xml
 htmlcov/
 dist/
 build/
-.paicli/
+.libi/
 /.playwright-cli
 
 # Local credentials and environment overrides
 .env.*
 !.env.example
 
-# Local design documents and workspace reports
-/docs/*
-!/docs/context-compaction-llm-design-2026-10-31.md
+# Local workspace reports
 /DIRECTORY_REPORT.md
 
 # Scratch files and command output

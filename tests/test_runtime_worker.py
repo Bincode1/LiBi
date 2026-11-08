@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from paicli.runtime.api import RuntimeApiServer, TaskCanceledError
+from libi.runtime.api import RuntimeApiServer, TaskCanceledError
 
 pytestmark = pytest.mark.integration
 
@@ -64,7 +64,7 @@ def test_canceled_task_never_initializes_provider(runtime, monkeypatch):
     async def unexpected(**_kwargs):
         pytest.fail("canceled task initialized tools")
 
-    monkeypatch.setattr("paicli.runtime.api.build_tool_registry", unexpected)
+    monkeypatch.setattr("libi.runtime.api.build_tool_registry", unexpected)
     with pytest.raises(TaskCanceledError):
         asyncio.run(runtime._run_task(claimed))
 
@@ -134,7 +134,7 @@ def test_runtime_cancellation_closes_turn_and_propagates(runtime, monkeypatch):
     async def canceled(**_kwargs):
         raise asyncio.CancelledError
 
-    monkeypatch.setattr("paicli.runtime.api.build_tool_registry", canceled)
+    monkeypatch.setattr("libi.runtime.api.build_tool_registry", canceled)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(runtime._run_turn(sid, "hello"))
     state = runtime.session_store.state(sid)

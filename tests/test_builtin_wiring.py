@@ -6,8 +6,8 @@ import subprocess
 
 import pytest
 
-from paicli.rag.code_index import CodeIndex
-from paicli.tools.executor import ToolExecutor
+from libi.rag.code_index import CodeIndex
+from libi.tools.executor import ToolExecutor
 
 
 def test_file_discovery_tools_are_wired_through_executor(tmp_path, tool_context, tool_registry):
@@ -67,7 +67,7 @@ def test_disabled_features_reject_tools_without_side_effects(
     results = asyncio.run(ToolExecutor(tool_registry).execute_all(calls, tool_context))
     assert all(result.is_error and "disabled" in result.content for result in results)
     assert not (tmp_path / "memory.db").exists()
-    assert not (tmp_path / ".paicli/skills").exists()
+    assert not (tmp_path / ".libi/skills").exists()
 
 
 def test_code_search_tool_uses_real_index(tmp_path, tool_context, tool_registry):
@@ -84,7 +84,7 @@ def test_code_search_tool_uses_real_index(tmp_path, tool_context, tool_registry)
 def test_web_tool_handlers_report_results_and_errors(
     tool_context, tool_registry, monkeypatch, fails
 ):
-    from paicli.web.search import SearchResult
+    from libi.web.search import SearchResult
 
     async def search(_query, **_kwargs):
         if fails:
@@ -96,8 +96,8 @@ def test_web_tool_handlers_report_results_and_errors(
             raise RuntimeError("fetch unavailable")
         return "page body"
 
-    monkeypatch.setattr("paicli.tools.builtins.search_web", search)
-    monkeypatch.setattr("paicli.tools.builtins.fetch_url", fetch)
+    monkeypatch.setattr("libi.tools.builtins.search_web", search)
+    monkeypatch.setattr("libi.tools.builtins.fetch_url", fetch)
     results = asyncio.run(
         ToolExecutor(tool_registry).execute_all(
             [

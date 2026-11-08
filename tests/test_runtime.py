@@ -5,10 +5,10 @@ import sys
 
 import pytest
 
-from paicli.config import load_config
-from paicli.runtime import TaskRecord
-from paicli.runtime.api import RuntimeApiServer, _engine_events
-from paicli.session import SessionStore
+from libi.config import load_config
+from libi.runtime import TaskRecord
+from libi.runtime.api import RuntimeApiServer, _engine_events
+from libi.session import SessionStore
 
 
 def test_runtime_loads_subagent_module_at_startup():
@@ -17,7 +17,7 @@ def test_runtime_loads_subagent_module_at_startup():
             sys.executable,
             "-B",
             "-c",
-            "import sys; import paicli.runtime; assert 'paicli.agent.subagents' in sys.modules",
+            "import sys; import libi.runtime; assert 'libi.agent.subagents' in sys.modules",
         ],
         check=True,
         timeout=15,
@@ -58,7 +58,7 @@ def test_runtime_initialization_failure_closes_canonical_turn(tmp_path, monkeypa
     async def fail_registry(**_kwargs):
         raise RuntimeError("registry initialization failed")
 
-    monkeypatch.setattr("paicli.runtime.api.build_tool_registry", fail_registry)
+    monkeypatch.setattr("libi.runtime.api.build_tool_registry", fail_registry)
 
     async def run():
         with pytest.raises(RuntimeError, match="registry initialization failed"):

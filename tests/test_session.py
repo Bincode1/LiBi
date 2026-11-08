@@ -9,10 +9,10 @@ import time
 
 import pytest
 
-from paicli.agent import Agent, QueryEngine
-from paicli.config import load_config
-from paicli.session import ContextProjector, RequestBuilder, SessionStore, TurnInProgressError
-from paicli.tools import ToolRegistry
+from libi.agent import Agent, QueryEngine
+from libi.config import load_config
+from libi.session import ContextProjector, RequestBuilder, SessionStore, TurnInProgressError
+from libi.tools import ToolRegistry
 
 
 @pytest.mark.integration
@@ -22,7 +22,7 @@ def test_process_exit_releases_turn_ownership_without_a_listener_port(tmp_path):
     sid = store.create_session()
     script = """
 import sys
-from paicli.session import SessionStore
+from libi.session import SessionStore
 store = SessionStore(sys.argv[1], workspace=sys.argv[2])
 store.start_turn(sys.argv[3], "crashed-turn", mode="react", message="Original")
 sys.stdin.read()
@@ -517,7 +517,7 @@ def test_agent_reuses_session_until_clear_then_starts_new_session(tmp_path):
 
 
 def test_query_engine_resumes_from_session_and_replays_requests(tmp_path, monkeypatch):
-    monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
+    monkeypatch.setattr("libi.agent.agent.SnapshotService.create", lambda *args: None)
     config = load_config(project_root=tmp_path, env={})
     config.memory.compression_mode = "disabled"
     config.features.skill = False

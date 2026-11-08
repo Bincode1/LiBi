@@ -172,7 +172,7 @@ export function Turn({
       <div className="agent-message">
         <AgentMark />
         <div className="agent-body">
-          <div className="message-label">PaiCLI</div>
+          <div className="message-label">LiBi</div>
           {(tools.length > 0 || drafts.length > 0) && (
             <div className="process">
               <button

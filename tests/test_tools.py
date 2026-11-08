@@ -6,11 +6,11 @@ import shutil
 
 import pytest
 
-from paicli.config import load_config
-from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.tools.base import ToolContext
-from paicli.tools.builtins import save_memory, search_memory
-from paicli.tools.executor import ToolExecutor
+from libi.config import load_config
+from libi.tools import ToolRegistry, get_builtin_tools
+from libi.tools.base import ToolContext
+from libi.tools.builtins import save_memory, search_memory
+from libi.tools.executor import ToolExecutor
 
 
 def test_read_write_file_tool(tmp_path):
@@ -40,9 +40,9 @@ def test_read_write_file_tool(tmp_path):
 @pytest.mark.parametrize("name", ["write_file", "edit_file"])
 @pytest.mark.parametrize("decision", [None, "approve"])
 def test_file_mutations_require_explicit_approval(tmp_path, name, decision):
-    from paicli.config import PaiCliConfig
+    from libi.config import LiBiConfig
 
-    config = PaiCliConfig()
+    config = LiBiConfig()
     config.policy.audit_log_path = str(tmp_path / "audit.jsonl")
     target = tmp_path / "note.txt"
     target.write_text("original", encoding="utf-8")

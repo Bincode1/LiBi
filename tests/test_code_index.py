@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from paicli.rag.code_index import CodeIndex
+from libi.rag.code_index import CodeIndex
 
 
 def test_code_index_rebuild_search_and_refresh(tmp_path):

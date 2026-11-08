@@ -9,9 +9,9 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from paicli.entrypoints.cli import app
-from paicli.runtime import workbench
-from paicli.runtime.tasks import DurableTaskManager
+from libi.entrypoints.cli import app
+from libi.runtime import workbench
+from libi.runtime.tasks import DurableTaskManager
 
 pytestmark = pytest.mark.integration
 
@@ -54,16 +54,16 @@ def test_workbench_port_conflict_leaves_listener_untouched(tmp_path, monkeypatch
 
 
 def test_workbench_stops_runtime_when_frontend_startup_fails(tmp_path, monkeypatch):
-    tasks = DurableTaskManager(Path.home() / ".paicli" / "tasks" / "tasks.db", scope=tmp_path)
+    tasks = DurableTaskManager(Path.home() / ".libi" / "tasks" / "tasks.db", scope=tmp_path)
     task_id = tasks.add("Run after the workbench is ready")
     setup_frontend(
         tmp_path,
         monkeypatch,
         "import json, os, urllib.request\n"
         "from pathlib import Path\n"
-        "origin = os.environ['PAICLI_WEB_RUNTIME_URL']\n"
+        "origin = os.environ['LIBI_WEB_RUNTIME_URL']\n"
         "request = urllib.request.Request(origin + '/v1/health', headers={\n"
-        "    'x-api-key': os.environ['PAICLI_WEB_RUNTIME_KEY']})\n"
+        "    'x-api-key': os.environ['LIBI_WEB_RUNTIME_KEY']})\n"
         "with urllib.request.urlopen(request, timeout=4) as response:\n"
         "    assert json.load(response)['status'] == 'ok'\n"
         "Path('origin.txt').write_text(origin, encoding='utf-8')\n"

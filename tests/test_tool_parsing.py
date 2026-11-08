@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from paicli.tools.call_parsing import (
+from libi.tools.call_parsing import (
     finalize_tool_calls,
     merge_tool_delta,
     tool_input,

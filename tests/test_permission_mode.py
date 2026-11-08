@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
-from paicli.config import load_config
-from paicli.entrypoints.repl import PermissionModeController
-from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
-from paicli.tools.executor import ToolExecutor
-from paicli.tools.registry import ToolRegistry
+from libi.config import load_config
+from libi.entrypoints.repl import PermissionModeController
+from libi.tools.base import Tool, ToolContext, ToolResult, object_schema
+from libi.tools.executor import ToolExecutor
+from libi.tools.registry import ToolRegistry
 
 
 def test_auto_mode_runs_approval_required_tool_without_callback(tmp_path):

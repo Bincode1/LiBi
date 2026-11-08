@@ -1,5 +1,5 @@
 # ============================================================
-# PaiCLI - Python Terminal AI Agent (like Claude Code)
+# LiBi - Python Terminal AI Agent (like Claude Code)
 # ============================================================
 # Install:  pip install -r requirements.txt
 # Dev:      pip install -r requirements.txt -r requirements-dev.txt

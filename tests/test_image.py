@@ -6,8 +6,8 @@ import io
 import pytest
 from PIL import Image
 
-from paicli.image import parse_image_references
-from paicli.llm.openai_compatible import OpenAICompatibleClient
+from libi.image import parse_image_references
+from libi.llm.openai_compatible import OpenAICompatibleClient
 
 
 def test_parse_local_image_reference(tmp_path):

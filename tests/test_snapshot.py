@@ -11,13 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from paicli.agent import Agent
-from paicli.agent.subagents import make_subagent_tool
-from paicli.snapshot import SnapshotService
-from paicli.snapshot._filetree import Directory
-from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.tools.base import ToolContext, ToolResult
-from paicli.tools.executor import ToolExecutor
+from libi.agent import Agent
+from libi.agent.subagents import make_subagent_tool
+from libi.snapshot import SnapshotService
+from libi.snapshot._filetree import Directory
+from libi.tools import ToolRegistry, get_builtin_tools
+from libi.tools.base import ToolContext, ToolResult
+from libi.tools.executor import ToolExecutor
 
 
 def test_snapshot_restore(tmp_path):
@@ -230,13 +230,13 @@ def test_snapshot_in_home(tmp_path_factory, monkeypatch, workspace_is_home):
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: home)
     workspace = home if workspace_is_home else parent
-    storage = home / ".paicli" / "snapshots"
+    storage = home / ".libi" / "snapshots"
     foreign = storage / "other" / "keep.txt"
     foreign.parent.mkdir(parents=True)
     foreign.write_text("keep", encoding="utf-8")
     note = workspace / "note.txt"
     note.write_text("original", encoding="utf-8")
-    settings = home / ".paicli" / "s.txt"
+    settings = home / ".libi" / "s.txt"
     settings.write_text("settings", encoding="utf-8")
     service = SnapshotService(workspace)
     original = service.create("original")
@@ -637,7 +637,7 @@ def test_failed_restore_rolls_back_files_that_were_already_replaced(tmp_path, mo
     )
     assert service.list()[0].phase == "pre-restore"
     assert (tmp_path / "external-edit.txt").read_text(encoding="utf-8") == "new"
-    assert not list(tmp_path.glob(".paicli-*.tmp"))
+    assert not list(tmp_path.glob(".libi-*.tmp"))
 
 
 def test_rollback_preserves_external_edit_made_after_file_installation(tmp_path, monkeypatch):

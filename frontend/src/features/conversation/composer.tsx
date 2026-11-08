@@ -64,8 +64,8 @@ export function Composer({
   }, [draft])
   useEffect(() => {
     const focus = () => ref.current?.focus()
-    window.addEventListener('paicli:focus', focus)
-    return () => window.removeEventListener('paicli:focus', focus)
+    window.addEventListener('libi:focus', focus)
+    return () => window.removeEventListener('libi:focus', focus)
   }, [])
   return (
     <div className="composer-area">
@@ -88,13 +88,13 @@ export function Composer({
       >
         <textarea
           ref={ref}
-          aria-label="向 PaiCLI 发送消息"
+          aria-label="向 LiBi 发送消息"
           placeholder={
             unmanagedRun
               ? '可先写下想法，或新建会话…'
               : busy
                 ? 'Agent 正在工作，你可以先写下下一步想法…'
-                : '描述你的想法，剩下的交给 PaiCLI…'
+                : '描述你的想法，剩下的交给 LiBi…'
           }
           value={draft}
           rows={1}

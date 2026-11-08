@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 
-const storageKey = 'paicli-drafts'
+const storageKey = 'libi-drafts'
 
 export function useTabDrafts() {
   const [drafts, setDrafts] = useState<Record<string, string>>(() => {

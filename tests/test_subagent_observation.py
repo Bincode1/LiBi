@@ -10,27 +10,27 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
-from paicli.agent import Agent
-from paicli.agent.subagent_events import ObservationBuffer, public_event
-from paicli.agent.subagents import (
+from libi.agent import Agent
+from libi.agent.subagent_events import ObservationBuffer, public_event
+from libi.agent.subagents import (
     ActivationState,
     ProviderCapabilities,
     SubagentManager,
     SubagentResult,
 )
-from paicli.config import PaiCliConfig
-from paicli.policy.redaction import Redactor
-from paicli.render.plain import PlainRenderer
-from paicli.render.rich_renderer import RichRenderer
-from paicli.session import SessionStore
-from paicli.tools.base import Tool, ToolContext, ToolResult
-from paicli.tools.executor import ToolExecutor
-from paicli.tools.registry import ToolRegistry
-from paicli.types import Usage
+from libi.config import LiBiConfig
+from libi.policy.redaction import Redactor
+from libi.render.plain import PlainRenderer
+from libi.render.rich_renderer import RichRenderer
+from libi.session import SessionStore
+from libi.tools.base import Tool, ToolContext, ToolResult
+from libi.tools.executor import ToolExecutor
+from libi.tools.registry import ToolRegistry
+from libi.types import Usage
 
 
 def make_context(tmp_path):
-    config = PaiCliConfig()
+    config = LiBiConfig()
     config.features.audit_log = False
     config.policy.hitl_mode = "never"
     store = SessionStore(tmp_path / "runtime.db")

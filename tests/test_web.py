@@ -7,12 +7,12 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from paicli.config import PaiCliConfig
-from paicli.session import SessionStore
-from paicli.tools import get_builtin_tools
-from paicli.tools.base import ToolContext
-from paicli.web.budget import ResearchBudget
-from paicli.web.fetch import NetworkPolicyError, PublicNetworkTransport, fetch_url
+from libi.config import LiBiConfig
+from libi.session import SessionStore
+from libi.tools import get_builtin_tools
+from libi.tools.base import ToolContext
+from libi.web.budget import ResearchBudget
+from libi.web.fetch import NetworkPolicyError, PublicNetworkTransport, fetch_url
 
 
 def test_child_fetches_share_call_and_evidence_budgets(tmp_path, monkeypatch):
@@ -23,8 +23,8 @@ def test_child_fetches_share_call_and_evidence_budgets(tmp_path, monkeypatch):
         await asyncio.sleep(0)
         return "evidence"[:max_length]
 
-    monkeypatch.setattr("paicli.tools.builtins.fetch_url", fetch)
-    context = ToolContext(str(tmp_path), PaiCliConfig(), research_budget=ResearchBudget(1, 2, 10))
+    monkeypatch.setattr("libi.tools.builtins.fetch_url", fetch)
+    context = ToolContext(str(tmp_path), LiBiConfig(), research_budget=ResearchBudget(1, 2, 10))
     tool = next(tool for tool in get_builtin_tools() if tool.name == "web_fetch")
 
     async def run():
@@ -43,7 +43,7 @@ def test_saved_web_page_can_be_read_later_only_in_its_session(tmp_path, monkeypa
     db = tmp_path / "runtime.db"
     store = SessionStore(db, sensitive_values=("test-sensitive-phrase",))
     session_id = store.create_session()
-    context = ToolContext(str(tmp_path), PaiCliConfig(), session_store=store, session_id=session_id)
+    context = ToolContext(str(tmp_path), LiBiConfig(), session_store=store, session_id=session_id)
     calls = []
     source = "https://example.test/source"
 
@@ -52,7 +52,7 @@ def test_saved_web_page_can_be_read_later_only_in_its_session(tmp_path, monkeypa
         await asyncio.sleep(0)
         return "preview " + "padding " * 20 + "Needle test-sensitive-phrase."
 
-    monkeypatch.setattr("paicli.tools.builtins.fetch_url", fetch)
+    monkeypatch.setattr("libi.tools.builtins.fetch_url", fetch)
     tools = {tool.name: tool for tool in get_builtin_tools()}
 
     async def run():
@@ -180,7 +180,7 @@ def test_fetch_tries_only_validated_addresses_with_bounded_backoff(monkeypatch, 
 
     monkeypatch.setattr(socket, "getaddrinfo", resolve)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", respond)
-    monkeypatch.setattr("paicli.web.fetch.asyncio.sleep", backoff)
+    monkeypatch.setattr("libi.web.fetch.asyncio.sleep", backoff)
     if all_fail:
         with pytest.raises(httpx.ConnectError):
             asyncio.run(fetch_url("https://example.test/"))
@@ -257,7 +257,7 @@ def test_fetch_redirect_loop_is_bounded(monkeypatch):
 
 
 def test_search_parses_html_decodes_destinations_and_limits_results(monkeypatch):
-    from paicli.web.search import search_web
+    from libi.web.search import search_web
 
     requests = []
 
@@ -286,7 +286,7 @@ def test_search_parses_html_decodes_destinations_and_limits_results(monkeypatch)
 
 
 def test_search_http_error_propagates(monkeypatch):
-    from paicli.web.search import search_web
+    from libi.web.search import search_web
 
     async def reject(_transport, _request):
         return httpx.Response(503)

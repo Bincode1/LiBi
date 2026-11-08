@@ -6,9 +6,9 @@ import httpx
 from mcp.types import Icon, Implementation
 from PIL import Image
 
-from paicli.mcp.config import McpServerSpec
-from paicli.mcp.identity import connection_identity, server_icons
-from paicli.mcp.management import McpManagement
+from libi.mcp.config import McpServerSpec
+from libi.mcp.identity import connection_identity, server_icons
+from libi.mcp.management import McpManagement
 
 
 def test_saved_connector_gets_its_brand_without_connecting(tmp_path):

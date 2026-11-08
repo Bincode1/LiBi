@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 
-from paicli.agent import QueryEngine
-from paicli.config import load_config
-from paicli.llm import create_llm_client
-from paicli.memory import MemoryManager
-from paicli.prompt import PromptAssembler
-from paicli.session import SessionStore
-from paicli.tools import ToolRegistry
+from libi.agent import QueryEngine
+from libi.config import load_config
+from libi.llm import create_llm_client
+from libi.memory import MemoryManager
+from libi.prompt import PromptAssembler
+from libi.session import SessionStore
+from libi.tools import ToolRegistry
 
 
 class CapturingClient:
@@ -63,7 +63,7 @@ def test_react_turn_keeps_the_previous_request_as_a_prefix(
         ("follow-up", "2030-01-02T03:04:21+00:00"),
     ]
     for question, timestamp in turns:
-        monkeypatch.setattr("paicli.session.store._now", lambda value=timestamp: value)
+        monkeypatch.setattr("libi.session.store._now", lambda value=timestamp: value)
         batches.append([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}])
         asyncio.run(engine.ask_complete_async(question))
 

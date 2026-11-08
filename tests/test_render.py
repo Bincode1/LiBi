@@ -9,14 +9,14 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
-from paicli.config import load_config
-from paicli.entrypoints.repl import (
+from libi.config import load_config
+from libi.entrypoints.repl import (
     PermissionModeController,
     _bottom_toolbar,
     _permission_key_bindings,
     _prompt_message,
 )
-from paicli.render import RichRenderer
+from libi.render import RichRenderer
 
 
 def test_banner_renders_pi_home_layout():
@@ -40,7 +40,7 @@ def test_banner_renders_pi_home_layout():
     output = stream.getvalue()
     assert "████████████" in output
     assert "  ██    ██" in output
-    assert "PaiCLI v0.1.0" in output
+    assert "LiBi v0.1.0" in output
     assert "Signed in API Key" in output
     assert "What's new (v0.1.0)" in output
 
@@ -143,8 +143,8 @@ def test_text_deltas_render_as_markdown_on_turn_complete():
     renderer = RichRenderer(console=console, context_window=1000)
 
     renderer.handle({"type": "thinking_delta", "thinking": "需要先确认项目结构"})
-    renderer.handle({"type": "text_delta", "text": "你好，我是 **Pai"})
-    renderer.handle({"type": "text_delta", "text": "CLI**\n\n- `read_file`\n- **网页搜索**"})
+    renderer.handle({"type": "text_delta", "text": "你好，我是 **Li"})
+    renderer.handle({"type": "text_delta", "text": "Bi**\n\n- `read_file`\n- **网页搜索**"})
     renderer.handle({"type": "usage", "usage": {"input_tokens": 250, "output_tokens": 50}})
     renderer.handle({"type": "turn_complete"})
     renderer.handle({"type": "done", "total_turns": 1, "total_tokens": 300})
@@ -153,11 +153,11 @@ def test_text_deltas_render_as_markdown_on_turn_complete():
     assert "Thinking" in output
     assert "需要先确认项目结构" in output
     assert "Final Output" in output
-    assert "PaiCLI" in output
+    assert "LiBi" in output
     assert "read_file" in output
     assert "网页搜索" in output
     assert "Run Summary" not in output
-    assert "**PaiCLI**" not in output
+    assert "**LiBi**" not in output
     assert "`read_file`" not in output
 
     stats = renderer.toolbar_status()

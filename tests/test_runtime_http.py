@@ -16,9 +16,9 @@ from queue import Queue
 import httpx
 import pytest
 
-from paicli.bootstrap import build_tool_registry
-from paicli.runtime.api import RuntimeApiServer
-from paicli.session import SessionStore, TurnInProgressError
+from libi.bootstrap import build_tool_registry
+from libi.runtime.api import RuntimeApiServer
+from libi.session import SessionStore, TurnInProgressError
 
 pytestmark = pytest.mark.integration
 
@@ -264,9 +264,9 @@ def test_session_uses_its_selected_directory_for_tools_and_resume(
     workspace.mkdir()
     runtime.config.policy.hitl_mode = "never"
     runtime.config.features.mcp = True
-    monkeypatch.setenv("PAICLI_TRUST_PROJECT_MCP", "1")
+    monkeypatch.setenv("LIBI_TRUST_PROJECT_MCP", "1")
     for root, name in [(tmp_path, "startup"), (workspace, "selected")]:
-        mcp_config = root / ".paicli" / "mcp.json"
+        mcp_config = root / ".libi" / "mcp.json"
         mcp_config.parent.mkdir(exist_ok=True)
         mcp_config.write_text(json.dumps({"mcpServers": {name: {"command": "echo"}}}))
 
@@ -276,7 +276,7 @@ def test_session_uses_its_selected_directory_for_tools_and_resume(
         discovered.extend(manager.specs)
         return []
 
-    monkeypatch.setattr("paicli.bootstrap.McpClientManager.load_tools", load_tools)
+    monkeypatch.setattr("libi.bootstrap.McpClientManager.load_tools", load_tools)
     batches, _ = provider_stream
     write = {
         "index": 0,
@@ -341,7 +341,7 @@ def test_async_receipt_is_durable_before_worker_starts(runtime_http, monkeypatch
     original_start = threading.Thread.start
 
     def defer_turn_thread(thread):
-        if not thread.name.startswith("paicli-turn-"):
+        if not thread.name.startswith("libi-turn-"):
             original_start(thread)
 
     monkeypatch.setattr(threading.Thread, "start", defer_turn_thread)
@@ -513,7 +513,7 @@ def test_http_restart_recovers_orphaned_turns_across_entry_points(
             ready.put(self)
             super().serve_forever(poll_interval=poll_interval)
 
-    monkeypatch.setattr("paicli.runtime.api.ThreadingHTTPServer", RestartedServer)
+    monkeypatch.setattr("libi.runtime.api.ThreadingHTTPServer", RestartedServer)
     batches, requests = provider_stream
     batches.append([{"choices": [{"delta": {"content": "Resumed"}, "finish_reason": "stop"}]}])
     thread = threading.Thread(target=runtime.serve_forever, daemon=True)
@@ -605,7 +605,7 @@ def test_http_shutdown_keeps_listener_bound_until_accepted_turn_exits(
     async def respond(_transport, _request):
         return httpx.Response(200, stream=GatedStream())
 
-    monkeypatch.setattr("paicli.runtime.api.ThreadingHTTPServer", CapturedServer)
+    monkeypatch.setattr("libi.runtime.api.ThreadingHTTPServer", CapturedServer)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", respond)
     thread = threading.Thread(target=runtime.serve_forever, daemon=True)
     thread.start()
@@ -823,7 +823,7 @@ def test_http_plan_child_failure_reports_failed_and_skipped_tasks(runtime_http, 
 
 def test_event_pages_bound_history_without_skipping_events(runtime_http, monkeypatch):
     runtime, client = runtime_http
-    monkeypatch.setattr("paicli.runtime.api._EVENT_PAGE_SIZE", 2)
+    monkeypatch.setattr("libi.runtime.api._EVENT_PAGE_SIZE", 2)
     sid = runtime._create_session()
     for index in range(5):
         runtime.session_store.append(sid, "user/message", {"content": str(index)})
@@ -1001,7 +1001,7 @@ def test_http_interactive_approval_controls_tool_execution(
     runtime, client = runtime_http
     batches, _requests = provider_stream
     if decision == "timeout":
-        monkeypatch.setattr("paicli.runtime.api._APPROVAL_TIMEOUT", 0.05)
+        monkeypatch.setattr("libi.runtime.api._APPROVAL_TIMEOUT", 0.05)
     if mode == "plan":
         plan = {"tasks": [{"id": "write", "description": "Write the requested file"}]}
         batches.append(
@@ -1183,7 +1183,7 @@ def test_http_cancel_interrupts_provider_stream_and_waits_for_cleanup(
             await asyncio.Event().wait()
 
         monkeypatch.setattr(
-            "paicli.agent.subagents.SubagentManager.cancel_for_parent", stuck_child_cleanup
+            "libi.agent.subagents.SubagentManager.cancel_for_parent", stuck_child_cleanup
         )
 
     class PendingStream(httpx.AsyncByteStream):
@@ -1905,7 +1905,7 @@ def test_background_turn_records_completion_or_failure(tmp_path, config, monkeyp
         return {"session_id": session_id, "text": message, "mode": mode}
 
     monkeypatch.setattr(runtime, "_run_turn", run_turn)
-    monkeypatch.setattr("paicli.runtime.api.threading.Thread", capture_thread)
+    monkeypatch.setattr("libi.runtime.api.threading.Thread", capture_thread)
     session_id = runtime._create_session()
     run_id, _after_sequence = runtime._start_background_turn(session_id, "hello", mode="react")
     assert completed.wait(timeout=5)

@@ -6,16 +6,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from paicli.agent import Agent, QueryEngine
-from paicli.agent.subagents import ActivationState, ChildReport, SubagentManager, _report_result
-from paicli.config import PaiCliConfig
-from paicli.context import CompactionResponse
-from paicli.context.tokens import estimate_text_tokens
-from paicli.policy.redaction import Redactor
-from paicli.session import ContextProjector, SessionStore
-from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.tools.approval import ApprovalBroker
-from paicli.tools.base import ToolContext
+from libi.agent import Agent, QueryEngine
+from libi.agent.subagents import ActivationState, ChildReport, SubagentManager, _report_result
+from libi.config import LiBiConfig
+from libi.context import CompactionResponse
+from libi.context.tokens import estimate_text_tokens
+from libi.policy.redaction import Redactor
+from libi.session import ContextProjector, SessionStore
+from libi.tools import ToolRegistry, get_builtin_tools
+from libi.tools.approval import ApprovalBroker
+from libi.tools.base import ToolContext
 
 
 class DelegatingClient:
@@ -58,7 +58,7 @@ class DelegatingClient:
 
 
 def context(tmp_path):
-    config = PaiCliConfig()
+    config = LiBiConfig()
     config.policy.hitl_mode = "never"
     config.features.memory = False
     config.features.skill = False
@@ -86,7 +86,7 @@ async def wait_idle(activation):
 
 
 def test_single_delegation_returns_as_tool_result_and_sdk_closes(tmp_path, monkeypatch):
-    monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
+    monkeypatch.setattr("libi.agent.agent.SnapshotService.create", lambda *args: None)
     ctx = context(tmp_path)
 
     async def run():
@@ -144,7 +144,7 @@ def test_parent_receives_partial_child_results(tmp_path, monkeypatch, failure):
     async def fetch(_url, **_kwargs):
         return "Verified evidence. " * 1200
 
-    monkeypatch.setattr("paicli.tools.builtins.fetch_url", fetch)
+    monkeypatch.setattr("libi.tools.builtins.fetch_url", fetch)
 
     class Client(DelegatingClient):
         max_context_window = 4096
@@ -467,7 +467,7 @@ def test_observer_failure_keeps_delivery_and_persistence_failure_is_visible(tmp_
 
 
 def test_recorded_request_can_be_reprojected_after_later_steps(tmp_path, monkeypatch):
-    monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
+    monkeypatch.setattr("libi.agent.agent.SnapshotService.create", lambda *args: None)
     ctx = context(tmp_path)
 
     async def run():
@@ -531,7 +531,7 @@ def test_stream_limit_and_two_children_do_not_share_buffers(tmp_path, monkeypatc
 def test_interrupted_partial_stream_is_hidden_and_plain_renderer_shows_status(
     tmp_path, monkeypatch, capsys
 ):
-    from paicli.render.plain import PlainRenderer
+    from libi.render.plain import PlainRenderer
 
     ctx = context(tmp_path)
     captured = []
@@ -564,7 +564,7 @@ def test_interrupted_partial_stream_is_hidden_and_plain_renderer_shows_status(
 
 
 def test_runtime_turn_closes_idle_children(tmp_path, monkeypatch):
-    from paicli.runtime.api import RuntimeApiServer
+    from libi.runtime.api import RuntimeApiServer
 
     ctx = context(tmp_path)
     ctx.config.llm.api_key = "unit-placeholder"
@@ -579,10 +579,10 @@ def test_runtime_turn_closes_idle_children(tmp_path, monkeypatch):
     async def registry(**kwargs):
         return ToolRegistry(), None
 
-    monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
-    monkeypatch.setattr("paicli.runtime.api.QueryEngine", engine_factory)
-    monkeypatch.setattr("paicli.runtime.api.build_tool_registry", registry)
-    monkeypatch.setattr("paicli.runtime.api.create_llm_client", lambda config, **_: ctx.llm_client)
+    monkeypatch.setattr("libi.agent.agent.SnapshotService.create", lambda *args: None)
+    monkeypatch.setattr("libi.runtime.api.QueryEngine", engine_factory)
+    monkeypatch.setattr("libi.runtime.api.build_tool_registry", registry)
+    monkeypatch.setattr("libi.runtime.api.create_llm_client", lambda config, **_: ctx.llm_client)
 
     async def run():
         server = RuntimeApiServer(
@@ -599,7 +599,7 @@ def test_runtime_turn_closes_idle_children(tmp_path, monkeypatch):
 
 
 def test_hanging_provider_interrupt_is_bounded_by_host_drain(tmp_path):
-    from paicli.agent.subagents import ProviderCapabilities
+    from libi.agent.subagents import ProviderCapabilities
 
     ctx = context(tmp_path)
 

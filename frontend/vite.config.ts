@@ -7,10 +7,10 @@ const workspacePort = 24157
 const defaultRuntimeOrigin = 'http://127.0.0.1:24158'
 
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), 'PAICLI_WEB_')
-  const key = process.env.PAICLI_WEB_RUNTIME_KEY || env.PAICLI_WEB_RUNTIME_KEY
+  const env = loadEnv(mode, process.cwd(), 'LIBI_WEB_')
+  const key = process.env.LIBI_WEB_RUNTIME_KEY || env.LIBI_WEB_RUNTIME_KEY
   const target =
-    process.env.PAICLI_WEB_RUNTIME_URL || env.PAICLI_WEB_RUNTIME_URL || defaultRuntimeOrigin
+    process.env.LIBI_WEB_RUNTIME_URL || env.LIBI_WEB_RUNTIME_URL || defaultRuntimeOrigin
   const runtime = new URL(target)
   if (
     !['127.0.0.1', 'localhost', '[::1]'].includes(runtime.hostname) ||
@@ -25,7 +25,7 @@ export default defineConfig(({ mode }) => {
       react(),
       tailwindcss(),
       {
-        name: 'paicli-local-bridge',
+        name: 'libi-local-bridge',
         configureServer(server) {
           server.middlewares.use((req, res, next) => {
             if (
@@ -38,7 +38,7 @@ export default defineConfig(({ mode }) => {
               res.end(JSON.stringify({ error: 'Cross-origin Runtime access is not allowed.' }))
               return
             }
-            if (req.url === '/__paicli/status') {
+            if (req.url === '/__libi/status') {
               res.setHeader('Content-Type', 'application/json')
               res.end(JSON.stringify({ configured: Boolean(key), runtimeOrigin: runtime.origin }))
               return
@@ -48,7 +48,7 @@ export default defineConfig(({ mode }) => {
               res.setHeader('Content-Type', 'application/json')
               res.end(
                 JSON.stringify({
-                  error: '本地 Runtime 桥接尚未配置。请用 paicli workbench 启动工作台。',
+                  error: '本地 Runtime 桥接尚未配置。请用 libi workbench 启动工作台。',
                 }),
               )
               return

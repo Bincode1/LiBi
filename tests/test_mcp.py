@@ -13,15 +13,15 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from paicli.config import load_config
-from paicli.entrypoints.repl import _count_mcp_servers
-from paicli.mcp import McpClientManager
-from paicli.tools.base import ToolContext
+from libi.config import load_config
+from libi.entrypoints.repl import _count_mcp_servers
+from libi.mcp import McpClientManager
+from libi.tools.base import ToolContext
 
 
 async def _check_public_mcp_session(session, cwd):
     initialized = await session.initialize()
-    assert initialized.serverInfo.name == "paicli"
+    assert initialized.serverInfo.name == "libi"
     tools = await session.list_tools()
     names = {tool.name for tool in tools.tools}
     assert {"read_file", "glob", "grep", "bash"} <= names
@@ -41,7 +41,7 @@ def test_public_mcp_stdio_uses_sdk_and_tool_policy(tmp_path, isolated_home):
     async def run():
         params = StdioServerParameters(
             command=sys.executable,
-            args=["-m", "paicli", "mcp", "serve", "--cwd", str(tmp_path)],
+            args=["-m", "libi", "mcp", "serve", "--cwd", str(tmp_path)],
             env={"HOME": str(isolated_home), "USERPROFILE": str(isolated_home)},
         )
         async with stdio_client(params) as streams, ClientSession(*streams) as session:
@@ -63,7 +63,7 @@ def test_public_mcp_http_requires_auth_and_valid_origin(tmp_path):
         [
             sys.executable,
             "-m",
-            "paicli",
+            "libi",
             "mcp",
             "serve",
             "--transport",
@@ -73,7 +73,7 @@ def test_public_mcp_http_requires_auth_and_valid_origin(tmp_path):
             "--cwd",
             str(tmp_path),
         ],
-        env=dict(os.environ, PAICLI_MCP_API_KEY=credential),
+        env=dict(os.environ, LIBI_MCP_API_KEY=credential),
     )
 
     async def run():
@@ -106,14 +106,14 @@ def test_public_mcp_http_requires_auth_and_valid_origin(tmp_path):
 
 @pytest.mark.integration
 def test_mcp_client_registers_and_calls_stdio_tool(tmp_path, monkeypatch):
-    monkeypatch.setenv("PAICLI_RUNTIME_API_KEY", "synthetic-mcp-parent-key")
+    monkeypatch.setenv("LIBI_RUNTIME_API_KEY", "synthetic-mcp-parent-key")
     server = tmp_path / "fake_mcp_server.py"
     server.write_text(
         """
 import os
 from mcp.server.fastmcp import FastMCP
 
-assert "PAICLI_RUNTIME_API_KEY" not in os.environ
+assert "LIBI_RUNTIME_API_KEY" not in os.environ
 
 mcp = FastMCP("fake")
 
@@ -126,8 +126,8 @@ if __name__ == "__main__":
 """.lstrip(),
         encoding="utf-8",
     )
-    (tmp_path / ".paicli").mkdir()
-    (tmp_path / ".paicli" / "mcp.json").write_text(
+    (tmp_path / ".libi").mkdir()
+    (tmp_path / ".libi" / "mcp.json").write_text(
         json.dumps(
             {
                 "mcpServers": {
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     )
 
     assert McpClientManager(tmp_path).specs == {}
-    monkeypatch.setenv("PAICLI_TRUST_PROJECT_MCP", "1")
+    monkeypatch.setenv("LIBI_TRUST_PROJECT_MCP", "1")
 
     async def run():
         manager = McpClientManager(tmp_path)
@@ -162,7 +162,7 @@ if __name__ == "__main__":
 
 @pytest.mark.integration
 def test_mcp_client_suppresses_stdio_server_stderr(tmp_path, capsys, monkeypatch):
-    monkeypatch.setenv("PAICLI_TRUST_PROJECT_MCP", "1")
+    monkeypatch.setenv("LIBI_TRUST_PROJECT_MCP", "1")
     server = tmp_path / "noisy_mcp_server.py"
     server.write_text(
         """
@@ -183,8 +183,8 @@ if __name__ == "__main__":
 """.lstrip(),
         encoding="utf-8",
     )
-    (tmp_path / ".paicli").mkdir()
-    (tmp_path / ".paicli" / "mcp.json").write_text(
+    (tmp_path / ".libi").mkdir()
+    (tmp_path / ".libi" / "mcp.json").write_text(
         json.dumps(
             {
                 "mcpServers": {
@@ -224,9 +224,9 @@ def test_http_error_is_concise_and_other_servers_still_load(
     caplog,
     bad_response,
 ):
-    monkeypatch.setenv("PAICLI_TRUST_PROJECT_MCP", "1")
-    (tmp_path / ".paicli").mkdir()
-    (tmp_path / ".paicli" / "mcp.json").write_text(
+    monkeypatch.setenv("LIBI_TRUST_PROJECT_MCP", "1")
+    (tmp_path / ".libi").mkdir()
+    (tmp_path / ".libi" / "mcp.json").write_text(
         json.dumps(
             {
                 "mcpServers": {
@@ -267,7 +267,7 @@ def test_http_error_is_concise_and_other_servers_still_load(
     def mock_client(**kwargs):
         return original_client(**kwargs, transport=httpx.MockTransport(respond))
 
-    monkeypatch.setattr("paicli.mcp.client.httpx.AsyncClient", mock_client)
+    monkeypatch.setattr("libi.mcp.client.httpx.AsyncClient", mock_client)
 
     async def run():
         manager = McpClientManager(tmp_path)

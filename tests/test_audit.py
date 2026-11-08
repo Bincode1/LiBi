@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 
-from paicli.config import PaiCliConfig
-from paicli.policy import AuditLog
-from paicli.tools import ToolRegistry, get_builtin_tools
-from paicli.tools.base import ToolContext
-from paicli.tools.executor import ToolExecutor
+from libi.config import LiBiConfig
+from libi.policy import AuditLog
+from libi.tools import ToolRegistry, get_builtin_tools
+from libi.tools.base import ToolContext
+from libi.tools.executor import ToolExecutor
 
 
 def test_audit_redacts_content_commands_nested_fields_and_known_values(tmp_path):
@@ -43,7 +43,7 @@ def test_audit_tail_sanitizes_legacy_log_entries(tmp_path):
 
 
 def test_executor_audit_masks_configured_key_without_changing_written_content(tmp_path):
-    config = PaiCliConfig()
+    config = LiBiConfig()
     config.llm.api_key = "synthetic-configured-value"
     config.policy.hitl_mode = "never"
     config.policy.audit_log_path = str(tmp_path / "audit.jsonl")

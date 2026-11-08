@@ -9,9 +9,9 @@ import sys
 import pytest
 from typer.testing import CliRunner
 
-from paicli import __version__
-from paicli.entrypoints.cli import app
-from paicli.session import SessionStore, default_runtime_db_path
+from libi import __version__
+from libi.entrypoints.cli import app
+from libi.session import SessionStore, default_runtime_db_path
 
 pytestmark = pytest.mark.integration
 
@@ -27,7 +27,7 @@ def test_cli_help_is_available_without_credentials(arguments):
 
 def test_python_module_entrypoint_works_without_credentials(tmp_path):
     result = subprocess.run(
-        [sys.executable, "-m", "paicli", "--version"],
+        [sys.executable, "-m", "libi", "--version"],
         cwd=tmp_path,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
         capture_output=True,
@@ -35,7 +35,7 @@ def test_python_module_entrypoint_works_without_credentials(tmp_path):
         timeout=10,
         check=True,
     )
-    assert result.stdout.strip() == f"paicli {__version__}"
+    assert result.stdout.strip() == f"libi {__version__}"
 
 
 @pytest.mark.parametrize(
@@ -66,8 +66,8 @@ def test_single_prompt_fails_cleanly_without_credentials(tmp_path):
 def test_cli_prompt_uses_real_runtime_and_persists_turn(
     tmp_path, monkeypatch, provider_stream, mode
 ):
-    monkeypatch.setenv("PAICLI_API_KEY", "synthetic-cli-credential")
-    monkeypatch.setenv("PAICLI_MCP", "false")
+    monkeypatch.setenv("LIBI_API_KEY", "synthetic-cli-credential")
+    monkeypatch.setenv("LIBI_MCP", "false")
     batches, requests = provider_stream
     if mode == "plan":
         batches.append(
@@ -113,8 +113,8 @@ def test_cli_prompt_uses_real_runtime_and_persists_turn(
 def test_cli_provider_failure_is_nonzero_and_records_failed_turn(tmp_path, monkeypatch):
     import httpx
 
-    monkeypatch.setenv("PAICLI_API_KEY", "synthetic-cli-credential")
-    monkeypatch.setenv("PAICLI_MCP", "false")
+    monkeypatch.setenv("LIBI_API_KEY", "synthetic-cli-credential")
+    monkeypatch.setenv("LIBI_MCP", "false")
 
     async def reject(_transport, _request):
         return httpx.Response(401, text="provider diagnostic must stay private")
@@ -136,7 +136,7 @@ def test_cli_session_selection_retries_invalid_input_then_resumes(tmp_path, monk
     async def repl(cwd, config, *, session_id):
         calls.append((cwd, session_id))
 
-    monkeypatch.setattr("paicli.entrypoints.repl.start_repl", repl)
+    monkeypatch.setattr("libi.entrypoints.repl.start_repl", repl)
     result = runner.invoke(app, ["--cwd", str(tmp_path), "--resume"], input="99\n1\n")
     assert result.exit_code == 0, result.output
     assert "Please enter a number" in result.output
@@ -163,7 +163,7 @@ def test_cli_cannot_resume_an_unbound_session(tmp_path):
 
 
 def test_cli_doctor_reports_status_without_disclosing_credentials(tmp_path, monkeypatch):
-    monkeypatch.setenv("PAICLI_API_KEY", "synthetic-doctor-credential")
+    monkeypatch.setenv("LIBI_API_KEY", "synthetic-doctor-credential")
     result = runner.invoke(app, ["doctor", "--cwd", str(tmp_path)])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["api_key"] == "configured"
@@ -173,18 +173,18 @@ def test_cli_doctor_reports_status_without_disclosing_credentials(tmp_path, monk
 def test_cli_serve_requires_runtime_credentials(tmp_path):
     result = runner.invoke(app, ["serve", "--cwd", str(tmp_path)])
     assert result.exit_code == 1
-    assert "PAICLI_RUNTIME_API_KEY is required" in result.output
+    assert "LIBI_RUNTIME_API_KEY is required" in result.output
 
 
 def test_cli_serve_fails_on_occupied_project_port(tmp_path, monkeypatch):
-    monkeypatch.setenv("PAICLI_RUNTIME_API_KEY", "synthetic-runtime-key")
-    config_dir = tmp_path / ".paicli"
+    monkeypatch.setenv("LIBI_RUNTIME_API_KEY", "synthetic-runtime-key")
+    config_dir = tmp_path / ".libi"
     config_dir.mkdir()
 
     def unexpected_listener(_server):
         pytest.fail("Runtime must not bind a different port")
 
-    monkeypatch.setattr("paicli.runtime.api.RuntimeApiServer._start_workers", unexpected_listener)
+    monkeypatch.setattr("libi.runtime.api.RuntimeApiServer._start_workers", unexpected_listener)
     with socket.socket() as occupied:
         occupied.bind(("127.0.0.1", 0))
         occupied.listen()

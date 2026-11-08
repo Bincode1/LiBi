@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from paicli.agent import QueryEngine
-from paicli.config import load_config
-from paicli.context import CompactionResponse
-from paicli.session import ContextProjector, SessionStore
-from paicli.skill import SkillRegistry
-from paicli.tools import ToolRegistry, get_builtin_tools
+from libi.agent import QueryEngine
+from libi.config import load_config
+from libi.context import CompactionResponse
+from libi.session import ContextProjector, SessionStore
+from libi.skill import SkillRegistry
+from libi.tools import ToolRegistry, get_builtin_tools
 
 
 class FakeClient:

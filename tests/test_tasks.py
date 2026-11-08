@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from paicli.runtime import DurableTaskManager
+from libi.runtime import DurableTaskManager
 
 
 @pytest.mark.parametrize("prompt", ["", " \n\t"])
@@ -41,9 +41,9 @@ def test_task_owner_and_terminal_transitions(tmp_path, finish):
 
 def test_task_lease_expiry_uses_controlled_time_and_rejects_stale_owner(tmp_path, monkeypatch):
     instant = datetime(2026, 1, 1, tzinfo=UTC)
-    monkeypatch.setattr("paicli.runtime.tasks._now", lambda: instant.isoformat())
+    monkeypatch.setattr("libi.runtime.tasks._now", lambda: instant.isoformat())
     monkeypatch.setattr(
-        "paicli.runtime.tasks._future",
+        "libi.runtime.tasks._future",
         lambda seconds: (instant + timedelta(seconds=seconds)).isoformat(),
     )
     manager = DurableTaskManager(tmp_path / "tasks.db")

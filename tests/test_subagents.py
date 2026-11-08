@@ -7,19 +7,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from paicli.agent.subagents import (
+from libi.agent.subagents import (
     Activation,
     ActivationState,
     ProviderCapabilities,
     SubagentManager,
     make_subagent_tool,
 )
-from paicli.config import load_config
-from paicli.runtime.conversation import SubagentCatalog
-from paicli.session import SessionStore
-from paicli.tools.approval import ApprovalBroker
-from paicli.tools.base import ToolContext
-from paicli.tools.registry import ToolRegistry
+from libi.config import load_config
+from libi.runtime.conversation import SubagentCatalog
+from libi.session import SessionStore
+from libi.tools.approval import ApprovalBroker
+from libi.tools.base import ToolContext
+from libi.tools.registry import ToolRegistry
 
 
 class FakeClient:
@@ -51,7 +51,7 @@ def _context(tmp_path):
 
 
 def test_subagent_admission_enforces_capacity_and_cwd(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     async def never_finishes(self, message):
         await asyncio.sleep(60)
@@ -82,7 +82,7 @@ def test_subagent_admission_enforces_capacity_and_cwd(tmp_path, monkeypatch):
 
 
 def test_batch_queues_after_four_and_cancels_unstarted_tasks(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     context = _context(tmp_path)
     manager = SubagentManager(max_active=8)
@@ -143,7 +143,7 @@ def test_batch_queues_after_four_and_cancels_unstarted_tasks(tmp_path, monkeypat
 
 
 def test_subagent_deadline_cancels_and_settles_once(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     async def never_finishes(self, message):
         await asyncio.sleep(60)
@@ -170,7 +170,7 @@ def test_subagent_deadline_cancels_and_settles_once(tmp_path, monkeypatch):
 
 
 def test_subagent_expiring_while_idle_keeps_successful_delivery(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     async def complete(self, message):
         return SimpleNamespace(text="findings")
@@ -213,7 +213,7 @@ def test_subagent_expiring_while_idle_keeps_successful_delivery(tmp_path, monkey
 
 
 def test_activation_state_machine_rejects_illegal_and_terminal_transitions(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     async def never_finishes(self, message):
         await asyncio.sleep(60)
@@ -247,8 +247,8 @@ def test_subagent_child_registry_isolated_from_parent(tmp_path):
 
 
 def test_send_message_continues_a_parked_local_child(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
-    from paicli.agent.subagents import make_subagent_control_tools
+    from libi.agent.agent import Agent
+    from libi.agent.subagents import make_subagent_control_tools
 
     calls = 0
 
@@ -294,7 +294,7 @@ def test_send_message_continues_a_parked_local_child(tmp_path, monkeypatch):
 
 
 def test_idle_children_do_not_consume_active_capacity(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     async def completes(self, message):
         class Result:
@@ -326,7 +326,7 @@ def test_idle_children_do_not_consume_active_capacity(tmp_path, monkeypatch):
 
 
 def test_dispose_cancels_activation_descendants(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     async def never_finishes(self, message):
         await asyncio.sleep(60)
@@ -381,7 +381,7 @@ def test_approval_broker_serializes_presenter_calls():
 
 
 def test_send_message_rejects_cross_tree_child(tmp_path):
-    from paicli.agent.subagents import make_subagent_control_tools
+    from libi.agent.subagents import make_subagent_control_tools
 
     manager = SubagentManager()
     context = _context(tmp_path)
@@ -399,7 +399,7 @@ def test_send_message_rejects_cross_tree_child(tmp_path):
 
 
 def test_internal_steering_of_running_child_is_consumed_at_safe_boundary(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     calls = 0
     release_first = asyncio.Event()
@@ -440,7 +440,7 @@ def test_internal_steering_of_running_child_is_consumed_at_safe_boundary(tmp_pat
 
 
 def test_settlement_keeps_one_durable_report(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
+    from libi.agent.agent import Agent
 
     async def completes(self, message):
         class Result:
@@ -538,7 +538,7 @@ def test_one_shot_activation_does_not_enter_idle_waiting(tmp_path):
 
         async def run(self, manager, activation, payload, context):
             self.started += 1
-            from paicli.agent.subagents import SubagentResult
+            from libi.agent.subagents import SubagentResult
 
             return SubagentResult(output="one-shot", stop_reason="completed")
 
@@ -573,7 +573,7 @@ def test_one_shot_activation_does_not_enter_idle_waiting(tmp_path):
 
 
 def test_external_provider_cleanup_failure_is_reported_separately(tmp_path):
-    from paicli.agent.subagents import SubagentResult
+    from libi.agent.subagents import SubagentResult
 
     class ExternalProvider:
         provider_name = "external-failing-cleanup"
@@ -651,7 +651,7 @@ def test_provider_capabilities_gate_requested_options(tmp_path):
 
 
 def test_external_provider_error_result_maps_to_failed_activation(tmp_path):
-    from paicli.agent.subagents import SubagentResult
+    from libi.agent.subagents import SubagentResult
 
     class FailedProvider:
         provider_name = "external-error"
@@ -766,8 +766,8 @@ def test_recovery_marks_started_child_orphaned_without_replay(tmp_path):
 
 
 def test_subagent_tool_allowlist_is_applied_to_child_registry(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
-    from paicli.tools.base import Tool, ToolResult, object_schema
+    from libi.agent.agent import Agent
+    from libi.tools.base import Tool, ToolResult, object_schema
 
     async def hold(self, message):
         await asyncio.sleep(60)
@@ -813,7 +813,7 @@ def test_subagent_tool_allowlist_is_applied_to_child_registry(tmp_path, monkeypa
 
 
 def test_file_tools_enforce_child_cwd_boundary(tmp_path):
-    from paicli.tools.builtins import _read_file
+    from libi.tools.builtins import _read_file
 
     outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
     outside.write_text("outside", encoding="utf-8")

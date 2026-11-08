@@ -1,0 +1,505 @@
+"""cli.py — LiBi terminal AI agent CLI entry point.
+
+Inspired by Claude Code: a terminal-native AI agent that understands your
+workspace, executes commands, edits files, and answers questions — all from
+the command line.
+
+Usage modes::
+
+    # Interactive REPL (default)
+    libi
+    libi --api-key sk-xxx
+    libi --model deepseek-chat --provider deepseek
+
+    # Single-shot prompt
+    libi -p "list all Python files"
+    libi -p "refactor this module" --mode plan
+
+    # Tooling
+    libi doctor              # system health check
+    libi serve               # Runtime HTTP API
+    libi mcp serve           # Expose tools via MCP
+    libi mcp init-chrome     # Configure Chrome DevTools MCP
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated
+
+import typer
+
+from libi import __version__
+
+if TYPE_CHECKING:
+    from libi.session import SessionStore
+
+app = typer.Typer(
+    name="libi",
+    help="LiBi — Terminal AI Agent in Python (Claude Code alternative)",
+    invoke_without_command=True,
+    no_args_is_help=False,
+)
+mcp_app = typer.Typer(help="MCP server management")
+app.add_typer(mcp_app, name="mcp")
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"libi {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    ctx: typer.Context,
+    # --- Interaction mode ---
+    prompt: Annotated[
+        str | None,
+        typer.Option("-p", "--prompt", help="Single prompt (non-interactive mode)"),
+    ] = None,
+    session_id: Annotated[
+        str | None,
+        typer.Option(
+            "--session-id",
+            "--session",
+            help="Resume an existing persisted session by ID",
+        ),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "-r",
+            "--resume",
+            help="List persisted sessions and choose one to resume",
+        ),
+    ] = False,
+    # --- LLM configuration ---
+    api_key: Annotated[
+        str | None,
+        typer.Option("--api-key", help="LLM API key (overrides env/config)"),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("-m", "--model", help="Override LLM model name"),
+    ] = None,
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", help="Override LLM provider (e.g. deepseek, glm)"),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option("--base-url", help="Override LLM API base URL"),
+    ] = None,
+    # --- Rendering ---
+    plain: Annotated[
+        bool,
+        typer.Option("--plain", help="Use plain text rendering (no rich formatting)"),
+    ] = False,
+    # --- Agent mode ---
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Agent mode: react or plan"),
+    ] = None,
+    # --- Output ---
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit result, usage, and cost as JSON (single-prompt only)"),
+    ] = False,
+    # --- Workspace ---
+    cwd: Annotated[
+        Path | None,
+        typer.Option("--cwd", help="Working directory (default: current dir)"),
+    ] = None,
+    # --- Version ---
+    version: Annotated[
+        bool,
+        typer.Option("--version", callback=_version_callback, is_eager=True, help="Show version"),
+    ] = False,
+) -> None:
+    """LiBi — a terminal AI agent that works in your workspace.
+
+    Start an interactive session (default), run a single prompt with -p,
+    or use the subcommands for diagnostics, serving, and MCP management.
+    """
+    _ = version
+    if ctx.invoked_subcommand is not None:
+        return
+
+    root = (cwd or Path.cwd()).resolve()
+
+    # Build overrides dict from all explicit CLI flags.
+    overrides: dict = {}
+    llm_overrides: dict = {}
+    if api_key is not None:
+        llm_overrides["api_key"] = api_key
+    if provider is not None:
+        llm_overrides["provider"] = provider
+    if model is not None:
+        llm_overrides["model"] = model
+    if base_url is not None:
+        llm_overrides["base_url"] = base_url
+    if llm_overrides:
+        overrides["llm"] = llm_overrides
+    if plain:
+        overrides["render_mode"] = "plain"
+
+    if resume and session_id is not None:
+        raise typer.BadParameter(
+            "use either --resume or --session-id, not both",
+            param_hint="--resume",
+        )
+    session_store = None
+    if resume:
+        from libi.session import SessionStore, default_runtime_db_path
+
+        session_store = SessionStore(default_runtime_db_path(), workspace=root)
+        session_id = _select_session(session_store)
+
+    from libi.config import load_config
+
+    config = load_config(project_root=root, overrides=overrides)
+    if plain:
+        config.render_mode = "plain"
+
+    if session_id is not None:
+        if session_store is None:
+            from libi.session import SessionStore, default_runtime_db_path
+
+            session_store = SessionStore(
+                default_runtime_db_path(),
+                workspace=root,
+                sensitive_values=(config.llm.api_key,),
+            )
+        if not session_store.session_exists(session_id, root_only=True):
+            raise typer.BadParameter(
+                f"session not found: {session_id}",
+                param_hint="--session-id",
+            )
+
+    if prompt is not None:
+        selected_mode = (mode or config.prompt.agent_mode or "react").lower()
+        if selected_mode not in {"react", "plan"}:
+            raise typer.BadParameter("mode must be react or plan", param_hint="--mode")
+        asyncio.run(
+            _run_prompt(
+                prompt,
+                str(root),
+                config,
+                mode=selected_mode,
+                json_output=json_output,
+                session_id=session_id,
+            )
+        )
+    else:
+        from libi.entrypoints.repl import start_repl
+
+        try:
+            asyncio.run(start_repl(str(root), config, session_id=session_id))
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--session-id") from exc
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+
+@app.command("doctor")
+def doctor(
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+) -> None:
+    """Inspect the system: Python, uv, Node, API key, and config."""
+    from rich.console import Console
+
+    from libi.config import get_config_paths, load_config
+
+    root = (cwd or Path.cwd()).resolve()
+    config = load_config(project_root=root)
+    checks = {
+        "python": sys.version.split()[0],
+        "uv": shutil.which("uv") or "missing",
+        "node": _version_of("node"),
+        "npx": shutil.which("npx") or "missing",
+        "rg": shutil.which("rg") or "missing",
+        "api_key": "configured" if config.llm.api_key else "missing",
+        "provider": config.llm.provider,
+        "model": config.llm.model,
+        "cwd": str(root),
+        "config_paths": [str(path) for path in get_config_paths(root)],
+    }
+    Console().print_json(json.dumps(checks, ensure_ascii=False))
+
+
+@app.command("serve")
+def runtime_serve(
+    port: Annotated[
+        int | None, typer.Option("--port", min=1, max=65535, help="Override the configured port")
+    ] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option("--api-key", help="Runtime API key. Defaults to LIBI_RUNTIME_API_KEY."),
+    ] = None,
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+) -> None:
+    """Start the durable task runtime server (HTTP API)."""
+    from libi.config import load_config
+    from libi.runtime import RuntimeApiServer
+    from libi.runtime.api import RuntimeBindError, runtime_api_key
+
+    root = (cwd or Path.cwd()).resolve()
+    try:
+        config = load_config(project_root=root)
+        key = runtime_api_key(api_key)
+        RuntimeApiServer(cwd=str(root), config=config, api_key=key, port=port).serve_forever()
+    except (ValueError, RuntimeBindError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+
+@app.command("workbench")
+def workbench(
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+    port: Annotated[
+        int, typer.Option("--port", min=1, max=65535, help="Workbench frontend port")
+    ] = 24157,
+    open_browser: Annotated[
+        bool, typer.Option("--open/--no-browser", help="Open the browser after startup")
+    ] = True,
+) -> None:
+    """Start the local workbench and its Runtime together."""
+    import signal
+
+    from libi.runtime.workbench import WorkbenchError, run_workbench
+
+    stop_signal = getattr(signal, "SIGBREAK", signal.SIGTERM)
+    previous_handler = signal.signal(stop_signal, signal.default_int_handler)
+    try:
+        run_workbench((cwd or Path.cwd()).resolve(), port=port, open_browser=open_browser)
+    except KeyboardInterrupt:
+        return
+    except (OSError, ValueError, WorkbenchError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        signal.signal(stop_signal, previous_handler)
+
+
+@app.command("worker")
+def task_worker(
+    workers: Annotated[int, typer.Option("--workers", help="Concurrent task workers")] = 2,
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+) -> None:
+    """Consume durable background tasks without the HTTP API server."""
+    from libi.config import load_config
+    from libi.runtime import RuntimeApiServer
+
+    if workers < 1:
+        raise typer.BadParameter("workers must be at least 1")
+    root = (cwd or Path.cwd()).resolve()
+    config = load_config(project_root=root)
+    RuntimeApiServer(
+        cwd=str(root),
+        config=config,
+        api_key="worker-only-not-exposed",
+        workers=workers,
+    ).work_forever()
+
+
+# ---------------------------------------------------------------------------
+# MCP subcommands
+# ---------------------------------------------------------------------------
+
+
+@mcp_app.command("serve")
+def mcp_serve(
+    transport: Annotated[
+        str,
+        typer.Option("--transport", help="Transport type: stdio or http"),
+    ] = "stdio",
+    port: Annotated[int, typer.Option("--port", help="HTTP port")] = 3000,
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+) -> None:
+    """Expose LiBi tools via the Model Context Protocol."""
+    from libi.mcp import serve_http, serve_stdio
+
+    root = str((cwd or Path.cwd()).resolve())
+    if transport == "http":
+        try:
+            serve_http(port=port, cwd=root)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1) from None
+    elif transport == "stdio":
+        asyncio.run(serve_stdio(cwd=root))
+    else:
+        raise typer.BadParameter("transport must be stdio or http")
+
+
+@mcp_app.command("init-chrome")
+def mcp_init_chrome(
+    scope: Annotated[
+        str,
+        typer.Option("--scope", help="Config scope: user or project"),
+    ] = "project",
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+    browser_url: Annotated[
+        str | None,
+        typer.Option("--browser-url", help="Connect to an existing Chrome remote debugging URL"),
+    ] = None,
+    headless: Annotated[bool, typer.Option("--headless", help="Start Chrome headless")] = False,
+    slim: Annotated[bool, typer.Option("--slim", help="Use Chrome DevTools slim mode")] = False,
+) -> None:
+    """Write Chrome DevTools MCP config to the project or user scope."""
+    from libi.mcp import write_chrome_devtools_config
+
+    if scope not in {"user", "project"}:
+        raise typer.BadParameter("scope must be user or project")
+    root = None if scope == "user" else (cwd or Path.cwd()).resolve()
+    path = write_chrome_devtools_config(
+        scope_root=root,
+        browser_url=browser_url,
+        headless=headless,
+        slim=slim,
+    )
+    typer.echo(f"Wrote Chrome DevTools MCP config to {path}")
+
+
+@mcp_app.command("list")
+def mcp_list(
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+) -> None:
+    """List configured MCP servers."""
+    from libi.mcp import load_mcp_server_specs
+
+    root = (cwd or Path.cwd()).resolve()
+    specs = load_mcp_server_specs(root)
+    if not specs:
+        typer.echo("No MCP servers configured.")
+        return
+    for spec in specs.values():
+        target = spec.url or f"{spec.command} {' '.join(spec.args)}".strip()
+        typer.echo(f"{spec.name}\t{spec.type}\t{target}")
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+async def _run_prompt(
+    prompt: str,
+    cwd: str,
+    config,
+    *,
+    mode: str = "react",
+    json_output: bool = False,
+    session_id: str | None = None,
+) -> None:
+    """Execute a single prompt and print the result."""
+    from libi.agent import QueryEngine
+    from libi.bootstrap import build_runtime
+
+    config.render_mode = "plain"
+    if not config.llm.api_key:
+        typer.echo(
+            "Fatal error: LLM API key is not configured. Set it with --api-key, "
+            "via the LIBI_API_KEY environment variable, or in "
+            "~/.libi/config.json.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    client, registry, manager, session_store = await build_runtime(config=config, cwd=cwd)
+    if manager and manager.last_errors:
+        for name, error in manager.last_errors.items():
+            typer.echo(f"MCP server {name} failed to load: {error}", err=True)
+    engine = QueryEngine(
+        llm_client=client,
+        tool_registry=registry,
+        config=config,
+        cwd=cwd,
+        session_store=session_store,
+        session_id=session_id,
+    )
+    try:
+        if mode == "plan":
+            result = await engine.plan_complete_async(prompt)
+        else:
+            result = await engine.ask_complete_async(prompt)
+    except Exception as exc:  # noqa: BLE001 - CLI should report model/config errors cleanly
+        typer.echo(f"Fatal error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        await engine.aclose()
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "text": result.text,
+                    "mode": mode,
+                    "turns": result.turns,
+                    "total_tokens": result.total_tokens,
+                    "usage": result.usage.to_dict(),
+                    "cost": result.cost,
+                    **({"plan_outcome": result.plan_outcome} if result.plan_outcome else {}),
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        typer.echo(result.text)
+    if result.plan_outcome and result.plan_outcome["status"] == "failed":
+        raise typer.Exit(1)
+
+
+def _version_of(command: str) -> str:
+    if not shutil.which(command):
+        return "missing"
+    try:
+        result = subprocess.run(
+            [command, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    return (result.stdout or result.stderr).strip() or "unknown"
+
+
+def _select_session(session_store: SessionStore) -> str:
+    """Interactively choose a persisted session for REPL or single-shot use."""
+    typer.echo("Loading persisted sessions...", err=True)
+    sessions = session_store.list_sessions(limit=20)
+    if not sessions:
+        typer.echo("No persisted sessions found.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo("Resume a LiBi session (20 most recent)")
+    typer.echo(" #  Session                    Updated                    Status      Events")
+    typer.echo("--  -------------------------  -------------------------  ----------  ------")
+    for index, item in enumerate(sessions, start=1):
+        typer.echo(
+            f"{index:>2}  {_short_session_id(item.session_id):<25}  "
+            f"{item.updated_at[:25]:<25}  {item.status:<10}  {item.last_sequence:>6}"
+        )
+
+    while True:
+        selected = typer.prompt("Select a session number (q to cancel)", default="1").strip()
+        if selected.lower() == "q":
+            raise typer.Exit()
+        if selected.isdigit() and 1 <= int(selected) <= len(sessions):
+            return sessions[int(selected) - 1].session_id
+        typer.echo(f"Please enter a number from 1 to {len(sessions)}, or q.", err=True)
+
+
+def _short_session_id(session_id: str, *, width: int = 25) -> str:
+    if len(session_id) <= width:
+        return session_id
+    return session_id[: width - 3] + "..."

@@ -1,11 +1,11 @@
 [project]
-name = "paicli-python"
+name = "libi"
 version = "0.1.0"
 description = "Python terminal AI agent CLI with ReAct tools, MCP, Runtime API, memory, snapshots, web search, and image input"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "PaiCLI Contributors" }]
+authors = [{ name = "LiBi Contributors" }]
 keywords = ["agent", "ai", "cli", "llm", "mcp", "react", "terminal"]
 dependencies = [
   "httpx>=0.27.0",
@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-paicli = "paicli.entrypoints.cli:app"
+libi = "libi.entrypoints.cli:app"
 
 [project.optional-dependencies]
 dev = [
@@ -36,8 +36,11 @@ build-backend = "hatchling.build"
 [tool.uv]
 package = true
 
+[tool.hatch.build.targets.sdist]
+exclude = ["/frontend/node_modules", "/frontend/dist", "/frontend/*.tsbuildinfo"]
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/paicli"]
+packages = ["src/libi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -51,7 +54,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["paicli"]
+source = ["libi"]
 branch = true
 
 [tool.coverage.report]

@@ -7,7 +7,7 @@ import { Dialog } from '@/components/ui/dialog'
 import type { RuntimeClient } from '@/lib/types'
 import { errorMessage } from '@/lib/utils'
 
-const storageKey = 'paicli-recent-workspaces-v1'
+const storageKey = 'libi-recent-workspaces-v1'
 const recentLimit = 8
 
 export function useRecentWorkspaces() {

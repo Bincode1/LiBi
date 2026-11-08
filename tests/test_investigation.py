@@ -5,9 +5,9 @@ import json
 import runpy
 from pathlib import Path
 
-from paicli.agent import QueryEngine
-from paicli.llm import create_llm_client
-from paicli.tools.base import Tool, ToolResult, object_schema
+from libi.agent import QueryEngine
+from libi.llm import create_llm_client
+from libi.tools.base import Tool, ToolResult, object_schema
 
 
 def test_investigation_batches_reads_and_reports_evidence_before_verifying(

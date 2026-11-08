@@ -4,14 +4,14 @@ import asyncio
 
 import pytest
 
-from paicli.sdk import create_default_engine
+from libi.sdk import create_default_engine
 
 pytestmark = pytest.mark.integration
 
 
 def test_default_sdk_engine_runs_and_resumes_conversation(tmp_path, monkeypatch, provider_stream):
-    monkeypatch.setenv("PAICLI_MCP", "false")
-    monkeypatch.setenv("PAICLI_API_KEY", "synthetic-sdk-credential")
+    monkeypatch.setenv("LIBI_MCP", "false")
+    monkeypatch.setenv("LIBI_API_KEY", "synthetic-sdk-credential")
     batches, requests = provider_stream
     batches.extend(
         [
@@ -34,8 +34,8 @@ def test_default_sdk_engine_runs_and_resumes_conversation(tmp_path, monkeypatch,
 def test_sdk_reassembles_streamed_tool_call_executes_and_replays_result(
     tmp_path, monkeypatch, provider_stream
 ):
-    monkeypatch.setenv("PAICLI_MCP", "false")
-    monkeypatch.setenv("PAICLI_API_KEY", "synthetic-sdk-credential")
+    monkeypatch.setenv("LIBI_MCP", "false")
+    monkeypatch.setenv("LIBI_API_KEY", "synthetic-sdk-credential")
     (tmp_path / "note.txt").write_text("tool chain content", encoding="utf-8")
     batches, requests = provider_stream
     batches.extend(
@@ -90,7 +90,7 @@ def test_sdk_reassembles_streamed_tool_call_executes_and_replays_result(
 
 
 def test_sdk_failure_propagates_and_closes_engine(tmp_path, monkeypatch):
-    monkeypatch.setenv("PAICLI_MCP", "false")
+    monkeypatch.setenv("LIBI_MCP", "false")
     engine = create_default_engine(str(tmp_path))
     closed = []
     original_close = engine.aclose
@@ -109,8 +109,8 @@ def test_sdk_failure_propagates_and_closes_engine(tmp_path, monkeypatch):
 def test_async_sdk_context_closes_after_caller_failure(
     tmp_path, config, session_store, monkeypatch
 ):
-    from paicli.agent import QueryEngine
-    from paicli.tools import ToolRegistry
+    from libi.agent import QueryEngine
+    from libi.tools import ToolRegistry
 
     class Client:
         model_name = provider_name = "fake"

@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from paicli.memory import MemoryManager
+from libi.memory import MemoryManager
 
 
 def test_reopening_memory_for_recall_does_not_repeat_schema_migration(tmp_path, monkeypatch):
@@ -34,11 +34,11 @@ def test_legacy_schema_is_migrated_and_normalized_duplicates_are_merged(tmp_path
         )
         conn.execute(
             "insert into memories(scope, content, created_at) values (?, ?, ?)",
-            ("project", "PaiCLI   Uses Memory", "2026-01-01T00:00:00+00:00"),
+            ("project", "LiBi   Uses Memory", "2026-01-01T00:00:00+00:00"),
         )
         conn.execute(
             "insert into memories(scope, content, created_at) values (?, ?, ?)",
-            ("project", "paicli uses memory", "2026-01-02T00:00:00+00:00"),
+            ("project", "libi uses memory", "2026-01-02T00:00:00+00:00"),
         )
 
     manager = MemoryManager(db_path, scope="project")
@@ -81,13 +81,13 @@ def test_save_deduplicates_normalized_content_and_updates_metadata(tmp_path):
     manager = MemoryManager(tmp_path / "memory.db", scope="project")
 
     first_id = manager.save(
-        "PaiCLI   Uses Memory",
+        "LiBi   Uses Memory",
         source="user",
         importance=0.4,
         confidence=0.6,
     )
     second_id = manager.save(
-        "paicli uses memory",
+        "libi uses memory",
         kind="preference",
         source="agent",
         importance=0.9,
@@ -97,7 +97,7 @@ def test_save_deduplicates_normalized_content_and_updates_metadata(tmp_path):
     assert first_id == second_id
     rows = manager.list()
     assert len(rows) == 1
-    assert rows[0].content == "paicli uses memory"
+    assert rows[0].content == "libi uses memory"
     assert rows[0].kind == "preference"
     assert rows[0].source == "agent"
     assert rows[0].importance == 0.9

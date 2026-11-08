@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from paicli.context import CompactionPlanner, CompactionPolicy, estimate_text_tokens
-from paicli.types import Message
+from libi.context import CompactionPlanner, CompactionPolicy, estimate_text_tokens
+from libi.types import Message
 
 
 def test_compaction_retains_complete_tool_batch():

@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from paicli.config import load_config
-from paicli.session import default_runtime_db_path
+from libi.config import load_config
+from libi.session import default_runtime_db_path
 
 
 def test_default_storage_and_config_are_isolated(isolated_home, tmp_path):
