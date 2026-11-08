@@ -35,6 +35,7 @@ class ChildActivity:
     result_count: int = 0
     last_delivery: str | None = None
     delivered_at: str | None = None
+    report: str | None = None
     terminal: str | None = None
     terminal_reason: str | None = None
     ended_at: str | None = None
@@ -86,6 +87,10 @@ class SubagentCatalog:
                     child.queued = False
                 elif kind == "agent/child_delivery_created":
                     child.last_delivery = str(payload.get("result_status") or "")
+                    if child.last_delivery in {"completed", "partial"} and isinstance(
+                        payload.get("content"), str
+                    ):
+                        child.report = payload["content"]
                     if child.last_delivery == "completed":
                         child.result_count += 1
                         child.delivered_at = event.created_at
@@ -155,6 +160,7 @@ class SubagentCatalog:
                     "closed": child.terminal is not None,
                     "tool_name": tool_name,
                     **({"close_reason": "idle_expired"} if idle_expired else {}),
+                    **({"report": child.report} if only_session_id and child.report else {}),
                 }
             )
         return result

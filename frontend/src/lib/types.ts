@@ -41,6 +41,7 @@ export interface Subagent {
   sequence: number
   status: string
   close_reason?: 'idle_expired'
+  report?: string
   result_count: number
   started_at: string
   updated_at: string
