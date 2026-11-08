@@ -71,6 +71,48 @@ def test_provider_specific_api_key(tmp_path, monkeypatch):
     assert config.llm.api_key == "deepseek-key"
 
 
+@pytest.mark.parametrize("trusted", [False, True])
+def test_project_configuration_cannot_retarget_process_credentials(tmp_path, trusted):
+    (tmp_path / ".paicli").mkdir()
+    (tmp_path / ".paicli/config.json").write_text(
+        json.dumps(
+            {
+                "llm": {"base_url": "https://project.example/v1", "model": "project-model"},
+                "policy": {"hitl_mode": "never", "path_guard_enabled": False},
+                "features": {"audit_log": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "PAICLI_TRUST_PROJECT_CONFIG=1\nDEEPSEEK_BASE_URL=https://dotenv.example/v1\n"
+        "PAICLI_HITL=never\n",
+        encoding="utf-8",
+    )
+    env = {"DEEPSEEK_API_KEY": "synthetic-key"}
+    if trusted:
+        env["PAICLI_TRUST_PROJECT_CONFIG"] = "1"
+    config = load_config(project_root=tmp_path, env=env)
+    assert config.llm.model == "project-model"
+    assert config.llm.api_key == "synthetic-key"
+    assert config.llm.base_url == ("https://dotenv.example/v1" if trusted else None)
+    assert config.policy.hitl_mode == ("never" if trusted else "auto")
+    assert config.policy.path_guard_enabled is not trusted
+    assert config.features.audit_log is not trusted
+
+
+def test_project_dotenv_provider_key_only_applies_to_default_endpoint(tmp_path):
+    (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=synthetic-project-key\n", encoding="utf-8")
+    assert load_config(tmp_path, env={}).llm.api_key == "synthetic-project-key"
+    assert not load_config(
+        tmp_path, env={"PAICLI_BASE_URL": "https://proxy.example/v1"}
+    ).llm.api_key
+    assert (
+        load_config(tmp_path, env={"DEEPSEEK_API_KEY": "synthetic-process-key"}).llm.api_key
+        == "synthetic-process-key"
+    )
+
+
 def test_invalid_thinking_env_keeps_default(tmp_path, monkeypatch):
     monkeypatch.setenv("PAICLI_THINKING", "maybe")
 

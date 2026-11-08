@@ -9,6 +9,17 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from paicli.policy.path_guard import PathGuard
+
+_BUILTIN_PROVIDER_KEYS = {
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "glm": ("ZAI_API_KEY", "GLM_API_KEY"),
+    "zhipu": ("ZAI_API_KEY", "GLM_API_KEY"),
+    "step": ("STEP_API_KEY",),
+    "kimi": ("KIMI_API_KEY",),
+    "moonshot": ("KIMI_API_KEY",),
+}
+
 
 def _home() -> Path:
     return Path.home()
@@ -187,18 +198,47 @@ def load_config(
         data = _deep_merge(data, user_config)
 
     root = Path(project_root).resolve() if project_root else None
+    trusted = env_map.get("PAICLI_TRUST_PROJECT_CONFIG") == "1"
+    project_env: dict[str, str] = {}
     if root:
-        project_config = _read_json(root / ".paicli" / "config.json")
+        guard = PathGuard(root)
+        project_config = _read_json(guard.validate(".paicli/config.json"))
         if project_config:
+            if not trusted:
+                project_config = _safe_project_settings(project_config)
             data = _deep_merge(data, project_config)
-        project_env = _read_env(root / ".env")
+        project_env = _read_env(guard.validate(".env"))
         if project_env:
-            data = _apply_env(data, project_env)
+            if not trusted:
+                provider = str(data["llm"]["provider"]).upper()
+                allowed = {
+                    "PAICLI_MODEL",
+                    "PAICLI_CONTEXT_WINDOW",
+                    "PAICLI_MAX_TOKENS",
+                    "PAICLI_TEMPERATURE",
+                    "PAICLI_THINKING",
+                    "PAICLI_RENDER_MODE",
+                    "PAICLI_RENDERER",
+                    "PAICLI_TUI",
+                    f"{provider}_MODEL",
+                }
+                data = _apply_env(
+                    data, {key: value for key, value in project_env.items() if key in allowed}
+                )
+            else:
+                data = _apply_env(data, project_env)
 
     if overrides:
         data = _deep_merge(data, overrides)
 
     data = _apply_env(data, env_map)
+    llm = data["llm"]
+    if not trusted and not llm.get("api_key") and not llm.get("base_url"):
+        # Keep local dotenv credentials working for built-in endpoints only.
+        for name in _BUILTIN_PROVIDER_KEYS.get(str(llm["provider"]).lower(), ()):
+            if project_env.get(name):
+                llm["api_key"] = project_env[name]
+                break
     memory = data.get("memory", {})
     if memory.get("compression_mode") not in {"llm", "disabled"}:
         raise ValueError(
@@ -221,6 +261,22 @@ def load_config(
     if config.compaction.temperature < 0:
         raise ValueError("compaction.temperature cannot be negative")
     return config
+
+
+def _safe_project_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    protected_fields = {
+        "llm": {"provider", "api_key", "base_url"},
+        "memory": {"long_term_db_path"},
+        "prompt": {"custom_prompt_paths"},
+        "features": {"audit_log", "mcp", "skill"},
+    }
+    safe = {key: value for key, value in settings.items() if key not in {"policy", "mcp"}}
+    for section, protected in protected_fields.items():
+        if section in safe and isinstance(safe[section], dict):
+            safe[section] = {
+                key: value for key, value in safe[section].items() if key not in protected
+            }
+    return safe
 
 
 def get_config_paths(project_root: str | Path | None = None) -> list[Path]:
@@ -306,12 +362,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
     provider = str(llm.get("provider") or "").lower()
     if not llm.get("api_key"):
         provider_key_map = {
-            "deepseek": ("DEEPSEEK_API_KEY",),
-            "glm": ("ZAI_API_KEY", "GLM_API_KEY"),
-            "zhipu": ("ZAI_API_KEY", "GLM_API_KEY"),
-            "step": ("STEP_API_KEY",),
-            "kimi": ("KIMI_API_KEY",),
-            "moonshot": ("KIMI_API_KEY",),
+            **_BUILTIN_PROVIDER_KEYS,
             "freellmapi": ("FREELLMAPI_API_KEY",),
             "xfyun": ("XFYUN_API_KEY",),
             "agnes": ("AGNES_API_KEY",),

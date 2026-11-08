@@ -126,20 +126,23 @@ PaiCLI 的配置优先级如下：
 配置文件不存在时使用下一层配置；已存在的 JSON 配置若损坏、不是 JSON 对象或无法读取，
 会明确报错。项目 `.env` 的读取错误也会向上传播，不会静默退回默认配置。
 
-可以像 Java 项目一样，把 DeepSeek Key 写到项目 `.env` 里：
+项目配置默认只接收模型名称等常规选项。模型提供商、连接地址、通用凭据、权限策略、
+审计和外部资源路径来自用户配置、命令行或当前进程环境。需要加载项目文件里的这些设置时，
+在该次启动的进程环境显式设置 `PAICLI_TRUST_PROJECT_CONFIG=1`。项目 `.env` 自身不能授予信任。
+项目级 MCP 连接仍有独立的信任开关。
+
+使用内置 DeepSeek 地址时，也可以在项目 `.env` 中提供 `DEEPSEEK_API_KEY`。
+这只在可信配置没有提供 Key 或自定义地址时作为后备：
 
 ```dotenv
-PAICLI_PROVIDER=deepseek
 PAICLI_MODEL=deepseek-flash
 DEEPSEEK_API_KEY=your_key_here
 ```
 
-也可以使用 PaiCLI 通用 Key：
+通用 Key 可以在当前进程环境中提供：
 
-```dotenv
-PAICLI_PROVIDER=deepseek
-PAICLI_MODEL=deepseek-flash
-PAICLI_API_KEY=your_key_here
+```bash
+PAICLI_API_KEY=your_key_here uv run paicli
 ```
 
 DeepSeek 的思考模式默认关闭。如需开启，可在 `.env` 或环境变量中设置：

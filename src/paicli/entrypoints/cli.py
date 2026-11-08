@@ -378,7 +378,7 @@ async def _run_prompt(
         typer.echo(
             "Fatal error: LLM API key is not configured. Set it with --api-key, "
             "via the PAICLI_API_KEY environment variable, or in "
-            "~/.paicli/config.json or .paicli/config.json.",
+            "~/.paicli/config.json.",
             err=True,
         )
         raise typer.Exit(1)
