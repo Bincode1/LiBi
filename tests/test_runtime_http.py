@@ -16,6 +16,7 @@ from queue import Queue
 import httpx
 import pytest
 
+from paicli.bootstrap import build_tool_registry
 from paicli.runtime.api import RuntimeApiServer
 from paicli.session import SessionStore, TurnInProgressError
 
@@ -72,6 +73,96 @@ def test_http_authentication_precedes_request_parsing(runtime_http, header):
     response = client.post("/v1/sessions", content=b"invalid", headers=headers)
     assert response.status_code == (400 if header in {"bearer", "x-api-key"} else 401)
     assert runtime.session_store.list_sessions() == []
+
+
+def test_mcp_config_import_preserves_legacy_entries_and_credentials(runtime_http):
+    runtime, client = runtime_http
+    root = "/v1/mcp/servers"
+    config_path = runtime.mcp.user_path
+    config_path.parent.mkdir(exist_ok=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "existing": {
+                    "url": "https://mcp.test/original",
+                    "headers": {"Authorization": "Bearer synthetic-secret-value"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inventory = client.get(root)
+    assert "synthetic-secret-value" not in inventory.text
+    revision = inventory.json()["revision"]
+    document = {"mcpServers": {"added": {"command": "echo"}}}
+    preview = client.post(root + "/preview", json={"document": document})
+    assert preview.json()["servers"][0]["conflict"] is False
+    assert list(json.loads(config_path.read_text(encoding="utf-8"))) == ["existing"]
+    assert client.post(
+        root + "/import", json={"document": document, "revision": revision}
+    ).is_success
+    assert (
+        client.post(root + "/import", json={"document": document, "revision": revision}).status_code
+        == 409
+    )
+
+    revision = client.get(root).json()["revision"]
+    saved = client.post(
+        root + "/edit",
+        json={
+            "name": "existing",
+            "revision": revision,
+            "config": {"url": "https://mcp.test/updated", "headers": {"Authorization": None}},
+        },
+    )
+    assert saved.is_success, saved.text
+    entries = json.loads(config_path.read_text(encoding="utf-8"))
+    assert entries["existing"]["headers"]["Authorization"] == "Bearer synthetic-secret-value"
+    assert entries["existing"]["url"] == "https://mcp.test/updated"
+    assert entries["added"]["enabled"] is False
+
+
+def test_mcp_management_discovers_and_registers_enabled_tools(runtime_http, tmp_path):
+    runtime, client = runtime_http
+    runtime.config.features.mcp = True
+    root = "/v1/mcp/servers"
+    script = tmp_path / "echo_server.py"
+    script.write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "server = FastMCP('test')\n"
+        "@server.tool()\n"
+        "def echo(text: str) -> str:\n"
+        "    return text\n"
+        "server.run()\n",
+        encoding="utf-8",
+    )
+    revision = client.get(root).json()["revision"]
+    saved = client.post(
+        root + "/add",
+        json={
+            "name": "echo",
+            "revision": revision,
+            "config": {"command": sys.executable, "args": [str(script)]},
+        },
+    )
+    assert saved.is_success, saved.text
+    check = client.post(root + "/test", json={"name": "echo", "scope": "user"})
+    assert check.json()["error"] is None
+    assert [tool["name"] for tool in check.json()["tools"]] == ["echo"]
+
+    for enabled in (True, False):
+        revision = client.get(root).json()["revision"]
+        assert client.post(
+            root + "/toggle",
+            json={
+                "name": "echo",
+                "revision": revision,
+                "enabled": enabled,
+            },
+        ).is_success
+        registry, _ = asyncio.run(build_tool_registry(config=runtime.config, cwd=runtime.cwd))
+        assert ("mcp__echo__echo" in registry.list_names()) is enabled
 
 
 def test_truncated_model_reply_preserves_text_without_executing_tools(

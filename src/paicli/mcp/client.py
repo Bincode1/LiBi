@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -9,21 +10,23 @@ from typing import Any
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from mcp.types import JSONRPCMessage
+from mcp.types import JSONRPCMessage, PaginatedRequestParams
 from pydantic import AnyUrl, ValidationError
 
-from paicli.mcp.config import McpServerSpec, load_mcp_server_specs
+from paicli.mcp.config import McpServerSpec, load_mcp_server_specs, project_mcp_trusted
 from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
 
 
 class McpClientManager:
-    def __init__(self, project_root: str | Path):
+    def __init__(self, project_root: str | Path, *, load_config: bool = True):
         self.project_root = str(Path(project_root).resolve())
-        self.specs = load_mcp_server_specs(
-            self.project_root,
-            include_project=os.environ.get("PAICLI_TRUST_PROJECT_MCP") == "1",
+        self.specs = (
+            load_mcp_server_specs(self.project_root, include_project=project_mcp_trusted())
+            if load_config
+            else {}
         )
         self.last_errors: dict[str, str] = {}
 
@@ -34,17 +37,40 @@ class McpClientManager:
             if not spec.enabled:
                 continue
             try:
-                tools.extend(await self._tools_for_server(spec))
-                tools.extend(self._virtual_resource_tools(spec))
-                tools.extend(self._virtual_prompt_tools(spec))
+                async with asyncio.timeout(spec.timeout):
+                    discovered, capabilities = await self.discover(spec)
+                tools.extend(self._tools_for_server(spec, discovered))
+                if capabilities.resources is not None:
+                    tools.extend(self._virtual_resource_tools(spec))
+                if capabilities.prompts is not None:
+                    tools.extend(self._virtual_prompt_tools(spec))
             except Exception as exc:  # noqa: BLE001 - keep broken MCP servers isolated
                 self.last_errors[spec.name] = _error_summary(exc)
         return tools
 
     async def list_server_tools(self, spec: McpServerSpec) -> list[Any]:
+        tools, _ = await self.discover(spec)
+        return tools
+
+    async def discover(self, spec: McpServerSpec):
         async with self._session(spec) as session:
-            result = await session.list_tools()
-            return list(result.tools)
+            capabilities = session.get_server_capabilities()
+            tools = []
+            if capabilities.tools is not None:
+                cursor = None
+                seen = set()
+                while True:
+                    result = await session.list_tools(
+                        params=PaginatedRequestParams(cursor=cursor) if cursor else None
+                    )
+                    tools.extend(result.tools)
+                    cursor = result.nextCursor
+                    if not cursor:
+                        break
+                    if cursor in seen:
+                        raise ValueError("MCP server repeated a tool pagination cursor")
+                    seen.add(cursor)
+            return tools, capabilities
 
     async def call_server_tool(
         self,
@@ -90,15 +116,14 @@ class McpClientManager:
             result = await session.get_prompt(name, arguments or {})
         return ToolResult(_content_to_text(result.messages))
 
-    async def _tools_for_server(self, spec: McpServerSpec) -> list[Tool]:
-        remote_tools = await self.list_server_tools(spec)
+    def _tools_for_server(self, spec: McpServerSpec, remote_tools: list[Any]) -> list[Tool]:
         wrapped: list[Tool] = []
         for remote_tool in remote_tools:
             tool_name = str(remote_tool.name)
             local_name = f"mcp__{spec.name}__{tool_name}"
             schema = remote_tool.inputSchema or object_schema({})
             annotations = getattr(remote_tool, "annotations", None)
-            read_only = bool(getattr(annotations, "readOnlyHint", False))
+            read_only = not spec.managed and bool(getattr(annotations, "readOnlyHint", False))
 
             async def handler(
                 payload: dict[str, Any],
@@ -203,7 +228,9 @@ class McpClientManager:
                 command=spec.command,
                 args=spec.args,
                 env=spec.env,
-                cwd=spec.cwd or self.project_root,
+                cwd=str(Path(self.project_root) / spec.cwd)
+                if spec.managed and spec.cwd
+                else spec.cwd or self.project_root,
             )
             with open(os.devnull, "w", encoding="utf-8") as errlog:
                 async with (
@@ -222,7 +249,7 @@ class McpClientManager:
                 httpx.AsyncClient(
                     headers=spec.headers or None,
                     timeout=httpx.Timeout(spec.timeout, read=spec.timeout),
-                    follow_redirects=True,
+                    follow_redirects=not spec.managed,
                     event_hooks={"response": [_validate_http_response]},
                 ) as http_client,
                 streamable_http_client(
@@ -233,6 +260,24 @@ class McpClientManager:
                     read,
                     write,
                     read_timeout_seconds=timedelta(seconds=spec.timeout),
+                ) as session,
+            ):
+                await session.initialize()
+                yield session
+            return
+        if spec.type == "sse":
+            if not spec.url:
+                raise ValueError(f"MCP server {spec.name} is missing url")
+            async with (
+                sse_client(
+                    spec.url,
+                    headers=spec.headers,
+                    timeout=spec.timeout,
+                    sse_read_timeout=spec.timeout,
+                    httpx_client_factory=httpx.AsyncClient,
+                ) as (read, write),
+                ClientSession(
+                    read, write, read_timeout_seconds=timedelta(seconds=spec.timeout)
                 ) as session,
             ):
                 await session.initialize()

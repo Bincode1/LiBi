@@ -36,6 +36,7 @@ uv run paicli workbench --cwd .
 | 历史与运行事件 | `GET /v1/sessions/{id}/events/stream?cursor=N&view=conversation`，SSE 推送会话界面所需的历史和更新 |
 | 异步执行 | `POST /v1/sessions/{id}/turns/async`，提交 message 和 react/plan mode |
 | 后台任务 | `GET / POST /v1/tasks`，`POST /v1/tasks/{id}/cancel` |
+| 连接器 | `GET /v1/mcp/servers` 查看服务，支持测试连接、编辑用户级服务、启停和导入 JSON |
 | 文字实时增量 | SSE 推送 `assistant_preview`，Streamdown 渲染生成中的 Markdown。带工具调用的 ReAct 文字作为中途说明 |
 | 子 agent | 主对话显示委派与状态，右侧「子 agent」列出进行中和已结束的任务。点开后订阅独立的历史与实时输出 |
 | 停止异步回合 | `POST /v1/sessions/{id}/runs/{runId}/cancel` 请求停止，收到 `turn/canceled` 后可继续原会话 |

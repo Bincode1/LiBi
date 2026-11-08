@@ -15,6 +15,7 @@ export function ChoiceMenu<Value extends string>({
   onValueChange,
   icon,
   className,
+  menuClassName,
   disabled,
   title,
 }: {
@@ -24,6 +25,7 @@ export function ChoiceMenu<Value extends string>({
   onValueChange: (value: Value) => void
   icon?: ReactNode
   className?: string
+  menuClassName?: string
   disabled?: boolean
   title?: string
 }) {
@@ -52,7 +54,7 @@ export function ChoiceMenu<Value extends string>({
         {open && (
           <DropdownPrimitive.Portal forceMount key="menu">
             <DropdownPrimitive.Content asChild align="start" sideOffset={6} collisionPadding={10}>
-              <m.div className="dropdown-content" {...menu}>
+              <m.div className={cn('dropdown-content', menuClassName)} {...menu}>
                 <DropdownPrimitive.RadioGroup
                   value={value}
                   onValueChange={(next) => {

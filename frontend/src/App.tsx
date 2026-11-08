@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
-import { useMatch, useNavigate } from 'react-router-dom'
+import { matchPath, useLocation, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { AnimatePresence, useReducedMotion } from 'motion/react'
 import * as m from 'motion/react-m'
@@ -32,6 +32,7 @@ import { AgentMark } from '@/features/conversation/agent-avatar'
 import { Composer } from '@/features/conversation/composer'
 import { ModePicker } from '@/features/conversation/mode-picker'
 import { TurnUsageSummary } from '@/features/conversation/turn-usage'
+import { McpSettings } from '@/features/mcp/settings'
 import { Details, type DetailsTab } from '@/features/workspace/details'
 import {
   SessionWorkspace,
@@ -83,7 +84,11 @@ function TaskResult({ text }: { text: string }) {
 export default function App() {
   const navigate = useNavigate(),
     queryClient = useQueryClient()
-  const id = useMatch('/sessions/:id')?.params.id
+  const route = useLocation()
+  const inMcpSettings = route.pathname === '/settings/mcp'
+  const from: unknown = route.state?.returnTo
+  const returnTo = typeof from === 'string' && matchPath('/sessions/:id', from) ? from : '/new'
+  const id = matchPath('/sessions/:id', inMcpSettings ? returnTo : route.pathname)?.params.id
   const reducedMotion = useReducedMotion()
   const toastMotion = useSurfaceMotion({ y: 8 }, 0.18)
   const [theme, setTheme] = useState(() =>
@@ -320,6 +325,7 @@ export default function App() {
   }, [notice])
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (inMcpSettings) return
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
         setSearch((value) => !value)
@@ -332,7 +338,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [navigate])
+  }, [navigate, inMcpSettings])
   const selectSession = (sessionId: string) => {
     navigate(`/sessions/${encodeURIComponent(sessionId)}`)
     setSidebar(false)
@@ -568,7 +574,12 @@ export default function App() {
           <Inbox size={16} />
           后台任务
         </button>
-        <button onClick={() => setSettings(true)}>
+        <button
+          onClick={() => {
+            setSidebar(false)
+            navigate('/settings/mcp', { state: { returnTo: route.pathname } })
+          }}
+        >
           <Plug size={16} aria-hidden="true" />
           连接器
         </button>
@@ -627,8 +638,11 @@ export default function App() {
       </div>
     </aside>
   )
-  return (
-    <div className={`workspace ${details && !detailsOverlay ? 'with-details' : ''}`}>
+  const workspace = (
+    <div
+      className={`workspace ${details && !detailsOverlay ? 'with-details' : ''}`}
+      style={inMcpSettings ? { display: 'none' } : undefined}
+    >
       {mobile ? (
         <Dialog
           open={sidebar}
@@ -1079,5 +1093,13 @@ export default function App() {
         </div>
       </Dialog>
     </div>
+  )
+  return (
+    <>
+      {inMcpSettings && (
+        <McpSettings onBack={() => navigate(returnTo)} onConnection={() => setSettings(true)} />
+      )}
+      {workspace}
+    </>
   )
 }

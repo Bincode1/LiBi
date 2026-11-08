@@ -12,6 +12,7 @@ export function Dialog({
   title,
   description,
   side,
+  className,
   restoreFocus,
   children,
 }: {
@@ -20,6 +21,7 @@ export function Dialog({
   title: string
   description?: string
   side?: 'left' | 'right'
+  className?: string
   restoreFocus?: () => void
   children: ReactNode
 }) {
@@ -52,7 +54,7 @@ export function Dialog({
               }}
             >
               <m.div
-                className={side ? `workspace-drawer drawer-${side}` : 'dialog-content'}
+                className={side ? `workspace-drawer drawer-${side}` : `dialog-content ${className ?? ''}`}
                 {...panel}
               >
                 <DialogPrimitive.Title className={side ? 'sr-only' : 'dialog-title'}>

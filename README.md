@@ -348,6 +348,10 @@ uv run paicli mcp init-chrome --scope project
 `PAICLI_TRUST_PROJECT_MCP=1`。用户级 MCP 配置仍可自动加载，`mcp.auto_start=false` 关闭自动发现。
 stdio 服务只继承 MCP SDK 的基础环境及该服务 `env` 中显式配置的变量。
 
+Web 工作台侧栏的「连接器」可以查看 MCP 服务，并添加、编辑、测试、启停或删除用户级服务。
+也可以预览并导入含 `mcpServers` 的 JSON 配置。支持 STDIO、Streamable HTTP 和 SSE，
+项目级服务仍由项目配置和信任开关管理。
+
 连接已有 remote-debugging Chrome：
 
 ```bash

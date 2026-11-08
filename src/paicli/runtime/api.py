@@ -26,6 +26,8 @@ from paicli.agent import QueryEngine
 from paicli.bootstrap import build_tool_registry
 from paicli.config import PaiCliConfig
 from paicli.llm import create_llm_client
+from paicli.mcp.config import McpConfigConflict
+from paicli.mcp.management import McpManagement
 from paicli.policy.permission_mode import PermissionMode, PermissionModeController
 from paicli.runtime.conversation import SUBAGENT_STATE_EVENTS, SubagentCatalog, conversation_event
 from paicli.runtime.tasks import TASK_MODES, DurableTaskManager, TaskRecord
@@ -132,6 +134,7 @@ class RuntimeApiServer:
         self.cwd = str(Path(cwd).resolve())
         self.config = config
         self.api_key = api_key
+        self.mcp = McpManagement(self.cwd, sensitive_values=(api_key, config.llm.api_key))
         self.port = config.runtime.port if port is None else port
         self.db_path = default_runtime_db_path()
         self.task_manager = DurableTaskManager(
@@ -258,6 +261,9 @@ class RuntimeApiServer:
             _send_json(request, 400, {"error": str(exc)})
             return
         try:
+            if path == "/v1/mcp/servers" or path.startswith("/v1/mcp/servers/"):
+                self._handle_mcp(request, path, body)
+                return
             if path.startswith("/v1/sessions/") and not self.session_store.session_exists(
                 _session_id_from_path(path), root_only=True
             ):
@@ -398,6 +404,41 @@ class RuntimeApiServer:
             _send_json(request, 400, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": str(exc)})
+
+    def _handle_mcp(self, request: BaseHTTPRequestHandler, path: str, body: dict) -> None:
+        base = "/v1/mcp/servers"
+        try:
+            if request.command == "GET" and path == base:
+                result = self.mcp.list(
+                    auto_start=self.config.features.mcp and self.config.mcp.auto_start
+                )
+            elif request.command == "POST" and path.startswith(base + "/"):
+                content_type = request.headers.get("Content-Type", "").partition(";")[0].strip()
+                if content_type.lower() != "application/json":
+                    raise ValueError("请使用 JSON 提交 MCP 配置。")
+                action = path.removeprefix(base + "/")
+                if action == "test":
+                    result = asyncio.run(self.mcp.test(body))
+                elif action == "preview":
+                    result = self.mcp.preview(body.get("document"))
+                elif action in {"add", "edit", "toggle", "remove", "import"}:
+                    self.mcp.mutate(action, body)
+                    result = {"saved": True}
+                else:
+                    _send_json(request, 404, {"error": "not found"})
+                    return
+            else:
+                _send_json(request, 404, {"error": "not found"})
+                return
+            _send_json(request, 200, result)
+        except McpConfigConflict as exc:
+            _send_json(request, 409, {"mcp_error": str(exc)})
+        except ValueError as exc:
+            _send_json(request, 400, {"mcp_error": str(exc)})
+        except OSError:
+            _send_json(request, 500, {"mcp_error": "无法访问 MCP 配置文件。请检查文件权限。"})
+        except Exception:
+            _send_json(request, 500, {"mcp_error": "处理 MCP 配置时出错。"})
 
     async def _run_turn(
         self,
