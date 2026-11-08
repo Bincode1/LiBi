@@ -29,6 +29,7 @@ it('animates the live draft and keeps raw HTML out of the reply', () => {
   expect(draft).toContain('data-sd-animate')
   expect(draft).toContain('正在生成回复')
   expect(draft).toContain('libi-icons/working.png')
+  expect(draft).not.toContain('agent-mark--effort')
 
   const final = render('completed', '**你好**\n\n<img src="https://example.invalid/pixel">')
   expect(final).toContain('data-streamdown="strong">你好</span>')
@@ -67,6 +68,7 @@ it('groups handled approvals behind one closed disclosure and leaves pending req
   expect(html.slice(0, historyStart)).toContain('pending-command')
   expect(html).not.toContain('等待模型响应')
   expect(html).toContain('libi-icons/avatar.png')
+  expect(html).not.toContain('agent-mark--effort')
 })
 
 function renderEvents(type: string, payload: RuntimeEvent['payload'], preview?: AssistantPreview) {
@@ -103,10 +105,13 @@ it.each([
 
 it('shows model progress after a tool and while the reply pauses after its first character', () => {
   const payload = { name: 'read_file', content: 'Read test.md' }
-  expect(renderEvents('tool/execution_started', payload)).toContain('正在读取项目文件')
+  const active = renderEvents('tool/execution_started', payload)
+  expect(active).toContain('正在读取项目文件')
+  expect(active).toContain('agent-mark--effort')
   const waiting = renderEvents('tool/result', payload)
   expect(waiting).toContain('已执行 1 个步骤')
   expect(waiting).toContain('等待模型响应')
+  expect(waiting).toContain('libi-icons/effort.png')
   expect(waiting).not.toContain('class="markdown"')
 
   const draft = renderEvents('tool/result', payload, {

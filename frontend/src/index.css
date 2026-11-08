@@ -285,8 +285,32 @@ kbd {
   border-radius: 10px;
   background: #eee9ff;
   display: inline-block;
-  object-fit: contain;
   flex-shrink: 0;
+}
+.agent-mark > img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.agent-mark--effort {
+  overflow: hidden;
+}
+.agent-mark--effort > img {
+  width: 600%;
+  max-width: none;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .agent-mark--effort > img {
+    animation: cursor-cat-effort 1.44s steps(6, end) 180ms infinite paused;
+  }
+  .agent-mark--effort[data-playing] > img {
+    animation-play-state: running;
+  }
+}
+@keyframes cursor-cat-effort {
+  to {
+    transform: translateX(-100%);
+  }
 }
 .brand .agent-mark {
   width: 30px;
@@ -1514,29 +1538,11 @@ kbd {
   overscroll-behavior: contain;
 }
 .thinking {
-  display: flex;
-  gap: 3px;
-  align-items: center;
   margin: 15px 0;
-  font-size: 12px;
-}
-.thinking > span:not(.thinking-label) {
-  width: 4px;
-  height: 4px;
-  background: var(--green);
-  border-radius: 50%;
-  animation: pulse 1.3s ease-in-out infinite;
-}
-.thinking > span:nth-child(2) {
-  animation-delay: 0.15s;
-}
-.thinking > span:nth-child(3) {
-  animation-delay: 0.3s;
 }
 .thinking-label {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--muted);
-  margin-left: 6px;
 }
 .muted {
   color: var(--muted);

@@ -1,5 +1,5 @@
 import { useId, useState, type ReactNode } from 'react'
-import { Check, ChevronRight, CircleAlert, Clock3, Copy, LoaderCircle } from 'lucide-react'
+import { Check, ChevronRight, CircleAlert, Clock3, Copy, LoaderCircle, Wrench } from 'lucide-react'
 import * as m from 'motion/react-m'
 import { Disclosure, DisclosureChevron, Reveal } from '@/components/ui/disclosure'
 import { subagentLaunchFailure, toolLabel } from '@/lib/activity'
@@ -104,6 +104,19 @@ export function Turn({
   const answers = turn.messages.filter((message) => !message.commentary && !message.superseded)
   const canCopyAnswer = turn.status === 'completed' && answers.length > 0
   const working = turn.status === 'running' && !unmanaged && !pending
+  const effort =
+    working &&
+    (activeTool ||
+      waitingForDelegation ||
+      turn.replyPhase === 'starting' ||
+      turn.replyPhase === 'waiting')
+  const markVariant = effort
+    ? 'effort'
+    : working
+      ? 'working'
+      : turn.status === 'completed'
+        ? 'done'
+        : 'avatar'
   const finishedUsage = turn.status !== 'running' ? turn.usage : undefined
   const progress =
     working && !activeTool && !waitingForDelegation ? replyProgress[turn.replyPhase] : ''
@@ -169,9 +182,7 @@ export function Turn({
         </div>
       )}
       <div className="agent-message">
-        <AgentMark
-          variant={working ? 'working' : turn.status === 'completed' ? 'done' : 'avatar'}
-        />
+        <AgentMark variant={markVariant} />
         <div className="agent-body">
           <div className="message-label">LiBi</div>
           {(tools.length > 0 || drafts.length > 0) && (
@@ -186,7 +197,7 @@ export function Turn({
                 {pending || (unmanaged && activeTool) ? (
                   <Clock3 size={14} />
                 ) : activeTool ? (
-                  <LoaderCircle size={14} className="spin" />
+                  <Wrench size={14} aria-hidden="true" />
                 ) : (
                   <Check size={14} />
                 )}
@@ -282,9 +293,6 @@ export function Turn({
           )}
           {progress && (
             <div className="thinking" role="status">
-              <span />
-              <span />
-              <span />
               <m.span className="thinking-label" key={progress} {...statusMotion}>
                 {progress}
               </m.span>
