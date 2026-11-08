@@ -366,16 +366,14 @@ uv run paicli mcp list
 
 ```bash
 uv run paicli mcp serve --transport stdio
-uv run paicli mcp serve --transport http --port 3000
+PAICLI_MCP_API_KEY=your_local_key uv run paicli mcp serve --transport http --port 3000
 ```
 
-HTTP smoke：
+HTTP 使用标准 Streamable HTTP，客户端连接 `http://127.0.0.1:3000/mcp`，
+并发送 `Authorization: Bearer <PAICLI_MCP_API_KEY>`。服务校验回环 Host 和 Origin。
+stdio 和 HTTP 都走统一工具策略，需要人工审批的调用会拒绝。
 
-```bash
-curl -sS -X POST http://127.0.0.1:3000 \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-```
+本地验证可使用 MCP SDK 客户端，按初始化、列工具、调用 `read_file` 的顺序执行。
 
 Chrome DevTools MCP 会把浏览器页面和 DevTools 状态暴露给 Agent。不要随意把包含个人账号、敏感数据或生产后台的 Chrome 会话授权给 Agent。
 

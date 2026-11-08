@@ -2,81 +2,106 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import socket
+import subprocess
 import sys
 
 import httpx
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
 from paicli.config import load_config
 from paicli.entrypoints.repl import _count_mcp_servers
 from paicli.mcp import McpClientManager
-from paicli.mcp.server import _handle_request, serve_stdio
 from paicli.tools.base import ToolContext
 
 
-def test_mcp_tools_list(tmp_path):
+async def _check_public_mcp_session(session, cwd):
+    initialized = await session.initialize()
+    assert initialized.serverInfo.name == "paicli"
+    tools = await session.list_tools()
+    names = {tool.name for tool in tools.tools}
+    assert {"read_file", "glob", "grep", "bash"} <= names
+    assert not {"glob_files", "grep_code", "execute_command"} & names
+    assert (await session.call_tool("missing-tool", {})).isError
+    result = await session.call_tool("read_file", {"path": "note.txt"})
+    assert not result.isError and result.content[0].text == "1: hello"
+    denied = await session.call_tool("write_file", {"path": "denied.txt", "content": "probe"})
+    assert denied.isError and "approval policy" in denied.content[0].text
+    assert not (cwd / "denied.txt").exists()
+
+
+@pytest.mark.integration
+def test_public_mcp_stdio_uses_sdk_and_tool_policy(tmp_path, isolated_home):
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
 
     async def run():
-        return await _handle_request(
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-            str(tmp_path),
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "paicli", "mcp", "serve", "--cwd", str(tmp_path)],
+            env={"HOME": str(isolated_home), "USERPROFILE": str(isolated_home)},
         )
+        async with stdio_client(params) as streams, ClientSession(*streams) as session:
+            await _check_public_mcp_session(session, tmp_path)
 
-    response = asyncio.run(run())
-    tools = response["result"]["tools"]
-    assert any(tool["name"] == "read_file" for tool in tools)
-    names = {tool["name"] for tool in tools}
-    assert {"glob", "grep", "bash"} <= names
-    assert not {"glob_files", "grep_code", "execute_command"} & names
+    asyncio.run(run())
 
 
-@pytest.mark.parametrize("method", ["initialize", "notifications/initialized", "unknown"])
-def test_mcp_protocol_methods_preserve_request_id(tmp_path, method):
-    response = asyncio.run(_handle_request({"id": 7, "method": method}, str(tmp_path)))
-    assert response["id"] == 7 and response["jsonrpc"] == "2.0"
-    assert ("error" in response) is (method == "unknown")
-
-
-def test_mcp_tool_call_reads_workspace_and_reports_missing_tool(tmp_path):
+@pytest.mark.integration
+def test_public_mcp_http_requires_auth_and_valid_origin(tmp_path):
     (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
-    response = asyncio.run(
-        _handle_request(
-            {
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": "read_file", "arguments": {"path": "note.txt"}},
-            },
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    url = f"http://127.0.0.1:{port}/mcp"
+    credential = "synthetic-mcp-key"
+    headers = {"authorization": f"Bearer {credential}"}
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "paicli",
+            "mcp",
+            "serve",
+            "--transport",
+            "http",
+            "--port",
+            str(port),
+            "--cwd",
             str(tmp_path),
-        )
+        ],
+        env=dict(os.environ, PAICLI_MCP_API_KEY=credential),
     )
-    assert response["result"] == {
-        "content": [{"type": "text", "text": "1: hello"}],
-        "isError": False,
-    }
-    missing = asyncio.run(
-        _handle_request(
-            {"id": 2, "method": "tools/call", "params": {"name": "missing"}}, str(tmp_path)
-        )
-    )
-    assert "not found" in missing["error"]["message"]
 
+    async def run():
+        async with httpx.AsyncClient() as client:
+            async with asyncio.timeout(5):
+                while True:
+                    try:
+                        response = await client.post(url, content=b"{}")
+                        break
+                    except httpx.ConnectError:
+                        await asyncio.sleep(0.05)
+            assert response.status_code == 401
+            response = await client.post(
+                url, json={}, headers={**headers, "origin": "https://untrusted.example"}
+            )
+            assert response.status_code == 403
+        async with (
+            httpx.AsyncClient(headers=headers) as client,
+            streamable_http_client(url, http_client=client) as (read, write, _),
+            ClientSession(read, write) as session,
+        ):
+            await _check_public_mcp_session(session, tmp_path)
 
-def test_mcp_stdio_handles_invalid_json_then_next_request_and_eof(tmp_path, monkeypatch, capsys):
-    lines = iter(["{invalid", json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})])
-
-    def read_line():
-        try:
-            return next(lines)
-        except StopIteration:
-            raise EOFError from None
-
-    monkeypatch.setattr("builtins.input", read_line)
-    asyncio.run(serve_stdio(cwd=str(tmp_path)))
-    responses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert len(responses) == 2
-    assert "error" in responses[0]
-    assert responses[1]["id"] == 9
-    assert any(tool["name"] == "read_file" for tool in responses[1]["result"]["tools"])
+    try:
+        asyncio.run(run())
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
 
 
 @pytest.mark.integration

@@ -1,14 +1,28 @@
 from __future__ import annotations
 
-import asyncio
-import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from hmac import compare_digest
 from pathlib import Path
 from typing import Any
 
+import uvicorn
+from mcp import types
+from mcp.server.lowlevel import Server
+from mcp.server.stdio import stdio_server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
+from starlette.requests import HTTPConnection
+from starlette.responses import Response
+from starlette.routing import Route
+
 from paicli.config import load_config
+from paicli.policy.redaction import Redactor
 from paicli.tools import ToolRegistry, get_builtin_tools
 from paicli.tools.base import ToolContext
+from paicli.tools.executor import ToolExecutor
 
 
 def _build_registry() -> ToolRegistry:
@@ -17,95 +31,83 @@ def _build_registry() -> ToolRegistry:
     return registry
 
 
-def _tool_list(registry: ToolRegistry) -> list[dict[str, Any]]:
-    tools = []
-    for definition in registry.definitions():
-        fn = definition["function"]
-        tools.append(
-            {
-                "name": fn["name"],
-                "description": fn["description"],
-                "inputSchema": fn["parameters"],
-            }
-        )
-    return tools
-
-
-async def _handle_request(request: dict[str, Any], cwd: str) -> dict[str, Any]:
+def _build_server(cwd: str, *, transport_key: str = "") -> Server:
+    server = Server("paicli")
     registry = _build_registry()
-    request_id = request.get("id")
-    method = request.get("method")
-    params = request.get("params") or {}
-    if method in {"initialize", "notifications/initialized"}:
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"serverInfo": {"name": "paicli"}}}
-    if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": _tool_list(registry)}}
-    if method == "tools/call":
-        name = params.get("name")
-        tool = registry.get(str(name))
-        if not tool:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {"message": f'Tool "{name}" not found'},
-            }
-        config = load_config(project_root=cwd)
-        config.policy.hitl_mode = "never"
-        result = await tool.execute(
-            params.get("arguments") or {},
-            ToolContext(cwd=cwd, config=config),
+    config = load_config(project_root=cwd)
+    # An MCP client cannot present a PaiCLI approval prompt.
+    config.policy.hitl_mode = "auto"
+    config.policy.path_guard_enabled = True
+    config.policy.command_guard_enabled = True
+    config.features.audit_log = True
+    secrets = (config.llm.api_key, transport_key)
+    executor = ToolExecutor(
+        registry, audit_log_path=config.policy.audit_log_path, sensitive_values=secrets
+    )
+    context = ToolContext(cwd=cwd, config=config)
+    redactor = Redactor(secrets)
+
+    @server.list_tools()
+    async def list_tools() -> list[types.Tool]:
+        return [
+            types.Tool(name=tool.name, description=tool.description, inputSchema=tool.parameters)
+            for name in registry.list_names()
+            if (tool := registry.get(name)) is not None
+        ]
+
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        (result,) = await executor.execute_all([{"name": name, "arguments": arguments}], context)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=redactor.clean(result.content))],
+            isError=result.is_error,
         )
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "content": [{"type": "text", "text": result.content}],
-                "isError": result.is_error,
-            },
-        }
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"message": f"Unknown method: {method}"}}
+
+    return server
 
 
 async def serve_stdio(cwd: str | None = None) -> None:
-    root = str(Path(cwd or ".").resolve())
-    loop = asyncio.get_running_loop()
-    while True:
-        try:
-            line = await loop.run_in_executor(None, input)
-        except EOFError:
-            break
-        try:
-            request = json.loads(line)
-            response = await _handle_request(request, root)
-        except Exception as exc:  # noqa: BLE001
-            response = {"jsonrpc": "2.0", "error": {"message": str(exc)}}
-        print(json.dumps(response, ensure_ascii=False), flush=True)
+    server = _build_server(str(Path(cwd or ".").resolve()))
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+
+def _http_app(cwd: str, port: int, api_key: str) -> Starlette:
+    hosts = [f"127.0.0.1:{port}", f"localhost:{port}"]
+    sessions = StreamableHTTPSessionManager(
+        app=_build_server(cwd, transport_key=api_key),
+        stateless=True,
+        json_response=True,
+        security_settings=TransportSecuritySettings(
+            allowed_hosts=hosts,
+            allowed_origins=[f"http://{host}" for host in hosts],
+        ),
+    )
+    bearer = f"Bearer {api_key}".encode()
+
+    class Endpoint:
+        async def __call__(self, scope, receive, send):
+            headers = HTTPConnection(scope).headers
+            token = headers.get("authorization", "").encode()
+            if not compare_digest(token, bearer):
+                await Response("Unauthorized", status_code=401)(scope, receive, send)
+                return
+            await sessions.handle_request(scope, receive, send)
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        async with sessions.run():
+            yield
+
+    return Starlette(
+        routes=[Route(path, Endpoint()) for path in ("/mcp", "/")],
+        lifespan=lifespan,
+    )
 
 
 def serve_http(port: int = 3000, cwd: str | None = None) -> None:
-    root = str(Path(cwd or ".").resolve())
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:  # noqa: N802 - stdlib API
-            length = int(self.headers.get("content-length") or 0)
-            raw = self.rfile.read(length).decode("utf-8")
-            try:
-                request = json.loads(raw)
-                response = asyncio.run(_handle_request(request, root))
-                status = 200
-            except Exception as exc:  # noqa: BLE001
-                response = {"jsonrpc": "2.0", "error": {"message": str(exc)}}
-                status = 200
-            body = json.dumps(response, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, _format: str, *args: Any) -> None:
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"PaiCLI MCP server listening on http://127.0.0.1:{port}", flush=True)
-    server.serve_forever()
+    key = os.environ.get("PAICLI_MCP_API_KEY")
+    if not key:
+        raise ValueError("PAICLI_MCP_API_KEY is required for MCP HTTP")
+    app = _http_app(str(Path(cwd or ".").resolve()), port, key)
+    uvicorn.run(app, host="127.0.0.1", port=port, proxy_headers=False)

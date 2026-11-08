@@ -12,6 +12,8 @@ pillow>=10.0               # Image processing (base64 encode for LLM vision)
 prompt-toolkit>=3.0.43     # REPL prompt UI with history & autocomplete
 rich>=13.7.0               # Rich terminal output (markdown, tables, layouts)
 typer>=0.12.3              # CLI argument parsing & subcommands
+starlette>=0.27.0          # MCP Streamable HTTP routing
+uvicorn>=0.31.1            # MCP Streamable HTTP server
 
 # --- LLM SDKs (optional: install one per provider) ---
 # openai>=1.0.0            # OpenAI / Azure / DeepSeek / 智谱 / 月之暗面 / Step

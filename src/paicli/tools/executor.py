@@ -12,11 +12,19 @@ from paicli.tools.registry import ToolRegistry
 
 
 class ToolExecutor:
-    def __init__(self, registry: ToolRegistry, *, audit_log_path: str | None = None):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        *,
+        audit_log_path: str | None = None,
+        sensitive_values: tuple[str, ...] = (),
+    ):
         self.registry = registry
         # Construct the audit log once per executor (one per agent run) instead of
         # reopening the file handle for every single tool call.
         self._audit_log = AuditLog(audit_log_path) if audit_log_path else None
+        if self._audit_log is not None:
+            self._audit_log.redactor.add_sensitive_values(sensitive_values)
 
     async def execute_all(
         self,

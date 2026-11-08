@@ -302,7 +302,11 @@ def mcp_serve(
 
     root = str((cwd or Path.cwd()).resolve())
     if transport == "http":
-        serve_http(port=port, cwd=root)
+        try:
+            serve_http(port=port, cwd=root)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1) from None
     elif transport == "stdio":
         asyncio.run(serve_stdio(cwd=root))
     else:
