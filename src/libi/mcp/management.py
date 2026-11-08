@@ -4,6 +4,8 @@ import asyncio
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -175,13 +177,22 @@ def _test_error(exc: BaseException) -> str:
 _PROTOCOL_ERROR = "未完成 MCP 握手或工具发现。请检查服务地址、传输类型或启动参数。"
 
 
+@dataclass
+class _Check:
+    config: dict
+    result: dict | None = None
+
+
 class McpManagement:
     def __init__(self, cwd: str, *, sensitive_values: tuple[str, ...] = ()):
         self.cwd = Path(cwd)
         self.user_path = mcp_config_path(Path.home())
         self.project_path = mcp_config_path(cwd)
         self.sensitive_values = sensitive_values
-        self.checks: dict[tuple[str, str], tuple[dict, dict]] = {}
+        self._checks: dict[tuple[str, str], _Check] = {}
+        self._check_lock = Lock()
+        self._closed = False
+        self._check_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="libi-mcp")
         self._identities: dict[str, dict] = {}
         self._identity_lock = Lock()
 
@@ -209,8 +220,7 @@ class McpManagement:
             if len(self._identities) > 64:
                 del self._identities[next(iter(self._identities))]
 
-    def list(self, *, auto_start: bool) -> dict:
-        trusted = project_mcp_trusted()
+    def _read_configs(self) -> tuple[dict[str, McpConfigFile], list[dict]]:
         files = {}
         warnings = []
         for scope, path in (("user", self.user_path), ("project", self.project_path)):
@@ -225,6 +235,47 @@ class McpManagement:
                         "message": "无法读取 MCP 配置文件。请检查文件格式和权限。",
                     }
                 )
+        return files, warnings
+
+    def check_at_startup(self) -> None:
+        with self._check_lock:
+            files, _ = self._read_configs()
+            trusted = project_mcp_trusted()
+            project = files["project"].servers if trusted and "project" in files else {}
+            for scope, config in files.items():
+                for name, raw in config.servers.items():
+                    if (scope == "user" and name not in project) or (
+                        scope == "project" and trusted
+                    ):
+                        self._schedule_check(scope, name, raw)
+
+    def close(self) -> None:
+        with self._check_lock:
+            self._closed = True
+        self._check_executor.shutdown(wait=True, cancel_futures=True)
+
+    def _schedule_check(self, scope: str, name: str, raw: Any) -> None:
+        try:
+            _validate(raw)
+        except ValueError:
+            return
+        if self._closed or not raw.get("enabled", True):
+            return
+
+        key = (scope, name)
+        check = self._checks[key] = _Check(raw)
+
+        def run() -> None:
+            with self._check_lock:
+                if self._closed or self._checks.get(key) is not check:
+                    return
+            asyncio.run(self._check(name, check))
+
+        self._check_executor.submit(run)
+
+    def list(self, *, auto_start: bool) -> dict:
+        trusted = project_mcp_trusted()
+        files, warnings = self._read_configs()
         servers = []
         project = files["project"].servers if "project" in files else {}
         for scope, config in files.items():
@@ -239,6 +290,7 @@ class McpManagement:
                     "config": {"type": "", "enabled": False},
                     "problem": None,
                     "check": None,
+                    "checking": False,
                     "identity": None,
                 }
                 if not blocked:
@@ -255,9 +307,11 @@ class McpManagement:
                             item["problem"] = f"缺少环境变量 {', '.join(missing)}。"
                     except (ValueError, TypeError) as exc:
                         item["problem"] = str(exc)
-                    checked = self.checks.get((scope, name))
-                    if checked and checked[0] == self._connection_fields(raw):
-                        item["check"] = checked[1]
+                    checked = self._checks.get((scope, name))
+                    if checked and checked.config == raw:
+                        result = checked.result
+                        item["check"] = result
+                        item["checking"] = result is None
                 servers.append(item)
         return {
             "servers": sorted(servers, key=lambda item: item["name"].casefold()),
@@ -282,8 +336,8 @@ class McpManagement:
         ]
         return {"servers": servers, "revision": config.revision}
 
-    def mutate(self, action: str, body: dict) -> None:
-        with lock_mcp_config(self.user_path):
+    def mutate(self, action: str, body: dict, *, auto_start: bool = False) -> None:
+        with lock_mcp_config(self.user_path), self._check_lock:
             config = McpConfigFile.read(self.user_path)
             if config.revision != body.get("revision"):
                 raise McpConfigConflict("配置已在其他位置修改，请刷新列表后重试。")
@@ -299,8 +353,19 @@ class McpManagement:
             else:
                 self._mutate_entry(config.servers, action, body)
             config.write(self.user_path)
-        if action == "remove":
-            self.checks.pop(("user", body["name"]), None)
+            if action in {"edit", "toggle", "remove"}:
+                name = body["name"]
+                self._checks.pop(("user", name), None)
+                if auto_start and action != "remove" and not self._project_overrides(name):
+                    self._schedule_check("user", name, config.servers[name])
+
+    def _project_overrides(self, name: str) -> bool:
+        if self.project_path == self.user_path or not project_mcp_trusted():
+            return False
+        try:
+            return name in McpConfigFile.read(self.project_path).servers
+        except (OSError, ValueError):
+            return False
 
     def _mutate_entry(self, servers: dict, action: str, body: dict) -> None:
         name = body.get("name")
@@ -335,10 +400,16 @@ class McpManagement:
             raise ValueError("请选择 MCP 服务。")
         if scope == "project" and not project_mcp_trusted():
             raise ValueError("当前项目的 MCP 配置尚未受信任。")
-        file = McpConfigFile.read(self.user_path if scope == "user" else self.project_path)
-        raw = file.servers.get(name)
-        _validate(raw)
+        with self._check_lock:
+            file = McpConfigFile.read(self.user_path if scope == "user" else self.project_path)
+            raw = _validate(file.servers.get(name))
+            check = self._checks[(scope, name)] = _Check(raw)
+        return await self._check(name, check)
+
+    async def _check(self, name: str, check: _Check) -> dict:
+        raw = check.config
         tools = []
+        tool_count = 0
         error = None
         missing = missing_mcp_variables(raw)
         if missing:
@@ -360,19 +431,13 @@ class McpManagement:
                     }
                     for tool in discovered[:100]
                 ]
+                tool_count = len(discovered)
             except Exception as exc:  # Keep process and server diagnostics out of the response.
                 error = _test_error(exc)
-        result = {
+        check.result = {
             "checked_at": datetime.now(UTC).isoformat(),
             "error": error,
             "tools": tools,
-            "tool_count": len(discovered) if error is None else 0,
+            "tool_count": tool_count,
         }
-        self.checks[(scope, name)] = (self._connection_fields(raw), result)
-        return result
-
-    @staticmethod
-    def _connection_fields(raw: Any) -> dict:
-        if not isinstance(raw, dict):
-            return {}
-        return {key: value for key, value in raw.items() if key != "enabled"}
+        return check.result

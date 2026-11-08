@@ -63,14 +63,19 @@ function ServiceAvatar({ server, title }: { server: McpServer; title: string }) 
   )
 }
 
-function status(server: McpServer, autoStart: boolean) {
+function status(server: McpServer, autoStart: boolean, testing: boolean) {
   if (server.blocked) return { label: '未受信任', tone: 'warning' }
   if (server.overridden) return { label: '已被项目覆盖', tone: 'neutral' }
-  if (server.problem || server.check?.error) return { label: '配置错误', tone: 'error' }
-  if (!server.config.enabled) return { label: '已停用', tone: 'neutral' }
+  if (server.problem && !server.config.type) return { label: '配置错误', tone: 'error' }
+  if (!server.config.enabled) {
+    return { label: testing ? '已关闭 · 检测中…' : '已关闭', tone: 'neutral' }
+  }
   if (!autoStart) return { label: 'Runtime 已关闭 MCP', tone: 'warning' }
-  if (server.check) return { label: '检测通过', tone: 'success' }
-  return { label: '待检测', tone: 'neutral' }
+  if (server.problem) return { label: '已启用 · 配置错误', tone: 'error' }
+  if (testing) return { label: '已启用 · 检测中…', tone: 'neutral' }
+  if (server.check?.error) return { label: '已启用 · 连接失败', tone: 'error' }
+  if (server.check) return { label: '已启用 · 连接正常', tone: 'success' }
+  return { label: '已启用 · 未检测', tone: 'neutral' }
 }
 
 function ServiceRow({
@@ -94,7 +99,8 @@ function ServiceRow({
   onToggle: () => void
   onRemove: () => void
 }) {
-  const state = testing ? { label: '检测中…', tone: 'neutral' } : status(server, autoStart)
+  const checking = testing || server.checking
+  const state = status(server, autoStart, checking)
   const detail = server.blocked
     ? '信任当前项目后，Runtime 才会加载此服务。'
     : server.overridden
@@ -102,6 +108,8 @@ function ServiceRow({
       : server.problem || server.check?.error
   const title = serviceTitle(server)
   const canTest = !server.blocked && !server.overridden && !!server.config.type
+  const canToggle = canWrite && canTest
+  const toggleLabel = server.config.enabled ? '关闭' : '启动'
   return (
     <div className="mcp-service">
       <div className="mcp-service-row">
@@ -109,7 +117,7 @@ function ServiceRow({
         <div className="mcp-service-copy">
           <div className="mcp-service-title">
             <span title={server.name === title ? undefined : server.name}>{title}</span>
-            <span className="mcp-state" data-tone={state.tone}>
+            <span className="mcp-state" data-tone={state.tone} role="status">
               {state.label}
             </span>
           </div>
@@ -124,39 +132,47 @@ function ServiceRow({
                 .join(' · ')}
           </p>
         </div>
-        {!server.blocked && (canWrite || canTest) && (
-          <Dropdown.Root>
-            <Dropdown.Trigger asChild>
-              <Button variant="ghost" size="icon" disabled={pending} aria-label={`管理 ${title}`}>
-                <Ellipsis size={18} />
-              </Button>
-            </Dropdown.Trigger>
-            <Dropdown.Portal>
-              <Dropdown.Content className="dropdown-content" align="end" sideOffset={4}>
-                {canTest && (
-                  <Dropdown.Item className="dropdown-item" onSelect={onTest}>
-                    测试连接
-                  </Dropdown.Item>
-                )}
-                {canWrite && server.config.type && (
-                  <>
+        <div className="mcp-service-actions">
+          {canToggle && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={pending || (!autoStart && !server.config.enabled)}
+              aria-label={`${toggleLabel} ${title}`}
+              onClick={onToggle}
+            >
+              {toggleLabel}
+            </Button>
+          )}
+          {!server.blocked && (canWrite || canTest) && (
+            <Dropdown.Root>
+              <Dropdown.Trigger asChild>
+                <Button variant="ghost" size="icon" disabled={pending} aria-label={`管理 ${title}`}>
+                  <Ellipsis size={18} />
+                </Button>
+              </Dropdown.Trigger>
+              <Dropdown.Portal>
+                <Dropdown.Content className="dropdown-content" align="end" sideOffset={4}>
+                  {canTest && (
+                    <Dropdown.Item className="dropdown-item" disabled={checking} onSelect={onTest}>
+                      测试连接
+                    </Dropdown.Item>
+                  )}
+                  {canWrite && server.config.type && (
                     <Dropdown.Item className="dropdown-item" onSelect={onEdit}>
                       编辑配置
                     </Dropdown.Item>
-                    <Dropdown.Item className="dropdown-item" onSelect={onToggle}>
-                      {server.config.enabled ? '停用服务' : '启用服务'}
+                  )}
+                  {canWrite && (
+                    <Dropdown.Item className="dropdown-item mcp-remove" onSelect={onRemove}>
+                      移除服务
                     </Dropdown.Item>
-                  </>
-                )}
-                {canWrite && (
-                  <Dropdown.Item className="dropdown-item mcp-remove" onSelect={onRemove}>
-                    移除服务
-                  </Dropdown.Item>
-                )}
-              </Dropdown.Content>
-            </Dropdown.Portal>
-          </Dropdown.Root>
-        )}
+                  )}
+                </Dropdown.Content>
+              </Dropdown.Portal>
+            </Dropdown.Root>
+          )}
+        </div>
       </div>
       {server.check && !server.check.error && (
         <details className="mcp-tools">
@@ -193,6 +209,8 @@ export function McpSettings({
     queryKey: ['mcp-servers'],
     queryFn: ({ signal }) => mcpApi.list(signal),
     retry: false,
+    refetchInterval: (query) =>
+      query.state.data?.servers.some((server) => server.checking) ? 1000 : false,
   })
   const [editor, setEditor] = useState<{ revision: string; server?: McpServer }>()
   const [remove, setRemove] = useState<McpServer>()
@@ -217,7 +235,7 @@ export function McpSettings({
       setNotice(
         action === 'remove'
           ? '服务已移除。'
-          : `服务已${server.config.enabled ? '停用' : '启用'}，从下一轮对话生效。`,
+          : `服务已${server.config.enabled ? '关闭' : '启用'}，从下一轮对话生效。`,
       )
       await list.refetch()
     },

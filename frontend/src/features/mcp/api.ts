@@ -30,6 +30,7 @@ export interface McpServer {
   overridden: boolean
   problem: string | null
   check: McpCheck | null
+  checking: boolean
   identity?: {
     source: string | null
     brand: 'amap' | null

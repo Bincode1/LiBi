@@ -208,6 +208,12 @@ class RuntimeApiServer:
     def start_background_work(self) -> None:
         self.session_store.recover_interrupted_turns()
         self._start_workers()
+        if self._mcp_auto_start:
+            self.mcp.check_at_startup()
+
+    @property
+    def _mcp_auto_start(self) -> bool:
+        return self.config.features.mcp and self.config.mcp.auto_start
 
     def _stop_and_drain_turns(self) -> None:
         with self._background_turns_lock:
@@ -219,6 +225,7 @@ class RuntimeApiServer:
         with self._background_turns_lock:
             self._background_turns_lock.wait_for(lambda: not self._active_turn_sessions)
         self._title_executor.shutdown(wait=True, cancel_futures=True)
+        self.mcp.close()
 
     def work_forever(self) -> None:
         self._start_workers()
@@ -409,9 +416,7 @@ class RuntimeApiServer:
         base = "/v1/mcp/servers"
         try:
             if request.command == "GET" and path == base:
-                result = self.mcp.list(
-                    auto_start=self.config.features.mcp and self.config.mcp.auto_start
-                )
+                result = self.mcp.list(auto_start=self._mcp_auto_start)
             elif request.command == "POST" and path.startswith(base + "/"):
                 content_type = request.headers.get("Content-Type", "").partition(";")[0].strip()
                 if content_type.lower() != "application/json":
@@ -422,7 +427,7 @@ class RuntimeApiServer:
                 elif action == "preview":
                     result = self.mcp.preview(body.get("document"))
                 elif action in {"add", "edit", "toggle", "remove", "import"}:
-                    self.mcp.mutate(action, body)
+                    self.mcp.mutate(action, body, auto_start=self._mcp_auto_start)
                     result = {"saved": True}
                 else:
                     _send_json(request, 404, {"error": "not found"})

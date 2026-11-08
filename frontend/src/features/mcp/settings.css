@@ -151,6 +151,13 @@
   gap: 12px;
 }
 
+.mcp-service-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+}
+
 .mcp-service-icon {
   display: inline-grid;
   flex: none;

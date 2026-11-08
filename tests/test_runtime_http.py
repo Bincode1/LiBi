@@ -15,8 +15,10 @@ from queue import Queue
 
 import httpx
 import pytest
+from mcp.types import ServerCapabilities
 
 from libi.bootstrap import build_tool_registry
+from libi.mcp.client import McpClientManager
 from libi.runtime.api import RuntimeApiServer
 from libi.session import SessionStore, TurnInProgressError
 
@@ -58,6 +60,7 @@ def runtime_http(tmp_path, config):
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
+        runtime.mcp.close()
 
 
 @pytest.mark.parametrize("header", ["missing", "wrong", "bearer", "x-api-key"])
@@ -123,6 +126,82 @@ def test_mcp_config_import_preserves_legacy_entries_and_credentials(runtime_http
     assert entries["added"]["enabled"] is False
 
 
+def _wait_for_mcp_checks(client):
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        servers = client.get("/v1/mcp/servers").raise_for_status().json()["servers"]
+        if not any(server["checking"] for server in servers):
+            return servers
+        time.sleep(0.05)
+    pytest.fail("MCP checks did not finish")
+
+
+@pytest.mark.parametrize(("trusted", "auto_start"), [(False, True), (True, True), (True, False)])
+def test_runtime_checks_effective_enabled_mcp_servers_on_startup(
+    runtime_http, monkeypatch, trusted, auto_start
+):
+    runtime, client = runtime_http
+    runtime.config.features.mcp = True
+    runtime.config.mcp.auto_start = auto_start
+    if trusted:
+        monkeypatch.setenv("LIBI_TRUST_PROJECT_MCP", "1")
+
+    for path, config in (
+        (
+            runtime.mcp.user_path,
+            {
+                "working": {"command": "user-working"},
+                "failing": {"command": "user-failing"},
+                "off": {"command": "disabled", "enabled": False},
+                "invalid": {"command": "", "enabled": True},
+            },
+        ),
+        (runtime.mcp.project_path, {"working": {"command": "project-working"}}),
+    ):
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(config), encoding="utf-8")
+
+    attempted = Queue()
+    release = threading.Event()
+
+    async def discover(self, spec):
+        attempted.put(spec.command)
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        if spec.name == "failing":
+            raise TimeoutError
+        return [], ServerCapabilities()
+
+    monkeypatch.setattr(McpClientManager, "discover", discover)
+    try:
+        runtime.start_background_work()
+        response = client.get("/v1/mcp/servers").raise_for_status().json()
+        assert response["auto_start"] is auto_start
+        pending = {(row["scope"], row["name"]) for row in response["servers"] if row["checking"]}
+        expected = {("user", "failing"), ("project" if trusted else "user", "working")}
+        assert pending == (expected if auto_start else set())
+        assert client.get("/v1/health").status_code == 200
+    finally:
+        release.set()
+
+    results = {
+        (row["scope"], row["name"]): row["check"]
+        for row in _wait_for_mcp_checks(client)
+        if row["check"] is not None
+    }
+    if auto_start:
+        assert results.keys() == expected
+        assert "超时" in results["user", "failing"]["error"]
+        assert results["project" if trusted else "user", "working"]["error"] is None
+        assert {attempted.get_nowait(), attempted.get_nowait()} == {
+            "project-working" if trusted else "user-working",
+            "user-failing",
+        }
+    else:
+        assert results == {}
+    assert attempted.empty()
+
+
 def test_mcp_management_discovers_and_registers_enabled_tools(runtime_http, tmp_path):
     runtime, client = runtime_http
     runtime.config.features.mcp = True
@@ -173,6 +252,13 @@ def test_mcp_management_discovers_and_registers_enabled_tools(runtime_http, tmp_
                 "enabled": enabled,
             },
         ).is_success
+        entry = _wait_for_mcp_checks(client)[0]
+        assert entry["config"]["enabled"] is enabled
+        if enabled:
+            assert entry["check"]["error"] is None
+            assert [tool["name"] for tool in entry["check"]["tools"]] == ["echo"]
+        else:
+            assert entry["check"] is None
 
         async def load():
             registry, manager = await build_tool_registry(config=runtime.config, cwd=runtime.cwd)
