@@ -136,15 +136,15 @@ export default function App() {
   const health = useQuery({
     queryKey: ['health'],
     queryFn: ({ signal }) => client.health(signal),
+    // A cached placeholder keeps a failed first check visible during refetches.
+    initialData: null,
+    initialDataUpdatedAt: 0,
     retry: false,
     refetchInterval: 4000,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
   })
   const changes = useQuery({
-    // A cached placeholder keeps a failed first check visible during refetches.
-    initialData: null,
-    initialDataUpdatedAt: 0,
     queryKey: ['changes', id],
     queryFn: () => client.changes(id!),
     enabled: Boolean(id) && client.capabilities.changes,
