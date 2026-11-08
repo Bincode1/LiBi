@@ -48,7 +48,7 @@ export default defineConfig(({ mode }) => {
               res.setHeader('Content-Type', 'application/json')
               res.end(
                 JSON.stringify({
-                  error: '请在 frontend/.env.local 配置 PAICLI_WEB_RUNTIME_KEY 并重启前端。',
+                  error: '本地 Runtime 桥接尚未配置。请用 paicli workbench 启动工作台。',
                 }),
               )
               return

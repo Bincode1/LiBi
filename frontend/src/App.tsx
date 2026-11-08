@@ -973,18 +973,14 @@ export default function App() {
           {connectionError && <p>{connectionError}</p>}
           {runtimeOffline && (
             <ol className="connection-steps">
+              <li>停止当前工作台。若前端和 Runtime 分开启动，请先停止两者。</li>
               <li>
-                设置 <code>PAICLI_RUNTIME_API_KEY</code>，在项目根目录运行
-                <code className="command">uv run paicli serve --cwd .</code>
-              </li>
-              <li>
-                在 <code>frontend/.env.local</code> 中把 <code>PAICLI_WEB_RUNTIME_KEY</code>{' '}
-                设为同一凭据，再从前端目录运行
-                <code className="command">pnpm dev</code>
+                在项目根目录重新启动工作台
+                <code className="command">uv run paicli workbench --cwd .</code>
               </li>
             </ol>
           )}
-          {runtimeOffline && bridge.isError && <p>请通过开发服务打开工作台，以启用本地桥接。</p>}
+          {runtimeOffline && bridge.isError && <p>当前页面无法访问本地工作台代理。</p>}
           {!runtimeOffline && health.data && <p className="workspace-path">{health.data.cwd}</p>}
         </div>
         <div className="settings-footer">

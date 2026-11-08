@@ -390,7 +390,7 @@ pnpm --dir frontend install
 uv run paicli workbench --cwd .
 ```
 
-命令会启动本机 Runtime 和前端，验证连接后打开浏览器。退出启动命令会停止两者。需要更换端口或手动打开浏览器时，参见 [工作台启动说明](frontend/README.md)。
+命令会启动本机 Runtime 和前端，自动配置两者的连接，验证就绪后打开浏览器。重启时停止原命令，再运行同一个命令。更换端口或后台启动时，参见 [工作台启动说明](frontend/README.md)。
 
 ## Runtime API
 
@@ -403,7 +403,7 @@ PAICLI_RUNTIME_API_KEY=dev-key \
 uv run paicli serve --cwd .
 ```
 
-Runtime 默认监听 `127.0.0.1:24158`。项目配置 `.paicli/config.json` 的 `runtime.port` 可指定固定端口，`--port` 仅用于显式覆盖。端口被占用时启动会报错并退出。前端默认使用 `127.0.0.1:24157`，由 `frontend/vite.config.ts` 配置并代理到 Runtime。
+独立 Runtime 默认监听 `127.0.0.1:24158`。项目配置 `.paicli/config.json` 的 `runtime.port` 可指定固定端口，`--port` 仅用于显式覆盖。端口被占用时启动会报错并退出。统一启动的工作台默认使用 `127.0.0.1:24157`，由启动命令配置前端代理到当次的 Runtime 端口。
 
 创建会话：
 
