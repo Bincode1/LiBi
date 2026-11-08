@@ -43,6 +43,7 @@ const toolLabels = new Map([
   ['interrupt_agent', '停止子 agent'],
   ['web_search', '搜索网页'],
   ['web_fetch', '读取网页'],
+  ['web_read', '查阅网页摘录'],
 ])
 
 export const toolLabel = (name: string, fallback = name) => toolLabels.get(name) ?? fallback

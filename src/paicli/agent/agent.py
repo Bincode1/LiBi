@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing, suppress
@@ -50,6 +51,7 @@ from paicli.session import (
     SessionStore,
     default_runtime_db_path,
 )
+from paicli.session.models import ContextView
 from paicli.skill import SkillContextBuffer, SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools.base import ToolContext, ToolResult
@@ -303,17 +305,7 @@ class Agent:
 
         events = self.session_store.events(session_id)
         view = self._context_projector.project_session(events, session_id=session_id)
-        policy = CompactionPolicy(
-            context_window=int(self.llm_client.max_context_window),
-            normal_max_output_tokens=int(self.config.llm.max_tokens),
-            threshold_ratio=float(self.config.memory.compression_threshold),
-            compression_target=float(self.config.memory.compression_target),
-            reserve_tokens=int(self.config.memory.compression_reserve_tokens),
-            min_recent_messages=int(self.config.memory.min_recent_messages),
-            max_tool_result_chars_in_input=int(
-                self.config.compaction.max_tool_result_chars_in_input
-            ),
-        )
+        policy = self._compaction_policy()
         planner = CompactionPlanner(policy)
         should_force = trigger == "manual" if force is None else force
         plan = planner.plan(
@@ -510,6 +502,11 @@ class Agent:
             audit_log_path=self.config.policy.audit_log_path,
         )
         subagent_config = self.config.subagents
+        llm_policy = self._compaction_policy()
+        try:
+            input_limit = llm_policy.normal_input_budget
+        except ValueError:
+            input_limit = 0
         context = ToolContext(
             cwd=self.cwd,
             config=self.config,
@@ -533,6 +530,8 @@ class Agent:
                     subagent_config.research_max_searches,
                     subagent_config.research_max_fetches,
                     subagent_config.research_max_chars,
+                    tokens_left=input_limit // 4,
+                    deadline=time.monotonic() + subagent_config.research_timeout,
                 )
                 if self.agent_id != "root"
                 else None
@@ -557,10 +556,9 @@ class Agent:
             self.tool_registry.get("web_search") or self.tool_registry.get("web_fetch")
         ):
             effective_system += (
-                f"\n\nWeb research per turn: at most {subagent_config.research_max_searches} "
-                f"searches, {subagent_config.research_max_fetches} page fetches and "
-                f"{subagent_config.research_max_chars} characters of evidence. "
-                "Use focused queries and summarize the available evidence when a limit is reached. "
+                "\n\nWeb research: start with 2–4 distinct queries when useful. "
+                "Use saved excerpts and read more of a page only when needed. "
+                "Summarize the available evidence when the context or time budget is reached. "
                 "Return concise findings with source links and note any gaps."
             )
         self._log(
@@ -591,6 +589,17 @@ class Agent:
         context_events: list[SessionEvent] = []
         context_cursor = 0
         context_secrets = store.redactor.sensitive_values
+        previous_usage = 0
+        previous_estimate = 0
+        previous_checkpoint: str | None = None
+
+        def estimate_input(view: ContextView) -> tuple[int, int]:
+            estimated = llm_policy.estimate_request(
+                view.messages, system_prompt=view.system_prompt, tools=view.tools
+            ).tokens
+            if previous_usage and previous_checkpoint == view.compaction_id:
+                return estimated, max(0, previous_usage + estimated - previous_estimate)
+            return estimated, estimated
 
         def refresh_context(step_id: str) -> list[SessionEvent]:
             nonlocal context_events, context_cursor, context_secrets
@@ -667,20 +676,6 @@ class Agent:
                 source="runtime-context",
             )
 
-            deliveries = run_controller.ready_deliveries()
-            if deliveries:
-                self._log(
-                    "user/message",
-                    {
-                        "content": run_controller.format_deliveries(deliveries),
-                        "delivery_ids": [item.delivery_id for item in deliveries],
-                    },
-                    turn_id=turn_id,
-                    step_id=step_id,
-                    source="subagent-delivery",
-                )
-                run_controller.acknowledge_deliveries(deliveries)
-            current_events = refresh_context(step_id)
             projection = {
                 "scope": "session",
                 "route": self.llm_client.provider_name,
@@ -690,68 +685,71 @@ class Agent:
                 },
                 "budget": self._budget_metadata(),
             }
-            current_view = self._context_projector.project(
-                current_events,
-                session_id=session_id,
-                turn_id=turn_id,
-                step_id=step_id,
-                **projection,
-            )
 
-            if self.config.memory.compression_mode == "llm" and callable(
-                getattr(self.compaction_client or self.llm_client, "complete", None)
+            def project_current(
+                step_id: str = step_id, projection: dict[str, Any] = projection
+            ) -> ContextView:
+                return self._context_projector.project(
+                    refresh_context(step_id),
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    step_id=step_id,
+                    **projection,
+                )
+
+            current_view = project_current()
+            raw_estimate, input_tokens = estimate_input(current_view)
+            pressure_limit = int(input_limit * llm_policy.threshold_ratio)
+            if (
+                pressure_limit
+                and input_tokens >= pressure_limit
+                and self.config.memory.compression_mode == "llm"
+                and callable(getattr(self.compaction_client or self.llm_client, "complete", None))
             ):
-                llm_policy = CompactionPolicy(
-                    context_window=int(self.llm_client.max_context_window),
-                    normal_max_output_tokens=int(self.config.llm.max_tokens),
-                    threshold_ratio=float(self.config.memory.compression_threshold),
-                    compression_target=float(self.config.memory.compression_target),
-                    reserve_tokens=int(self.config.memory.compression_reserve_tokens),
-                    min_recent_messages=int(self.config.memory.min_recent_messages),
-                    max_tool_result_chars_in_input=int(
-                        self.config.compaction.max_tool_result_chars_in_input
-                    ),
+                compression = await self.compact(
+                    trigger="pressure",
+                    force=True,
+                    allow_active_turn=True,
+                    input_context_hash=current_view.context_hash,
                 )
-                estimate = llm_policy.estimate_request(
-                    current_view.messages,
-                    system_prompt=current_view.system_prompt,
-                    tools=current_view.tools,
+                if compression.compaction_id:
+                    yield _annotate_event(
+                        {
+                            "type": "context_compressed",
+                            "before_tokens": compression.plan.estimated_tokens_before,
+                            "after_tokens": compression.plan.estimated_tokens_after,
+                            "summarized_messages": compression.plan.selected_message_count,
+                            "compaction_id": compression.compaction_id,
+                            "usage": compression.usage.to_dict() if compression.usage else None,
+                        },
+                        session_id,
+                        turn_id,
+                        step_id,
+                    )
+                current_view = project_current()
+                raw_estimate, input_tokens = estimate_input(current_view)
+
+            # Receive after any asynchronous compaction, before freezing this request.
+            deliveries = run_controller.ready_deliveries()
+            if deliveries:
+                report_budget = max(0, pressure_limit - input_tokens)
+                self._log(
+                    "user/message",
+                    {
+                        "content": run_controller.format_deliveries(
+                            deliveries, report_budget, pending=run_controller.pending_children()
+                        ),
+                        "delivery_ids": [item.delivery_id for item in deliveries],
+                    },
+                    turn_id=turn_id,
+                    step_id=step_id,
+                    source="subagent-delivery",
                 )
-                try:
-                    pressure_limit = llm_policy.pressure_limit
-                except ValueError:
-                    pressure_limit = 0
-                if pressure_limit and estimate.tokens >= pressure_limit:
-                    compression = await self.compact(
-                        trigger="pressure",
-                        force=True,
-                        allow_active_turn=True,
-                        input_context_hash=current_view.context_hash,
-                    )
-                    if compression.compaction_id:
-                        yield _annotate_event(
-                            {
-                                "type": "context_compressed",
-                                "before_tokens": compression.plan.estimated_tokens_before,
-                                "after_tokens": compression.plan.estimated_tokens_after,
-                                "summarized_messages": compression.plan.selected_message_count,
-                                "compaction_id": compression.compaction_id,
-                                "usage": (
-                                    compression.usage.to_dict() if compression.usage else None
-                                ),
-                            },
-                            session_id,
-                            turn_id,
-                            step_id,
-                        )
-                    current_events = refresh_context(step_id)
-                    current_view = self._context_projector.project(
-                        current_events,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        step_id=step_id,
-                        **projection,
-                    )
+                run_controller.acknowledge_deliveries(deliveries)
+                current_view = project_current()
+                raw_estimate, input_tokens = estimate_input(current_view)
+            if context.research_budget is not None:
+                context.research_budget.request_tokens_left = max(0, input_limit - input_tokens)
 
             # Budget pressure uses raw messages. Resolve image references only after compaction.
             if any(
@@ -761,7 +759,7 @@ class Agent:
                 for item in current_view.messages
             ):
                 current_view = self._context_projector.project(
-                    current_events,
+                    refresh_context(step_id),
                     session_id=session_id,
                     turn_id=turn_id,
                     step_id=step_id,
@@ -933,6 +931,9 @@ class Agent:
                 raise
 
             total_usage = total_usage + turn_usage
+            previous_usage = max(turn_usage.input_tokens, turn_usage.cache_context_tokens)
+            previous_estimate = raw_estimate
+            previous_checkpoint = current_view.compaction_id
             truncated = stop_reason == "max_tokens"
             tool_calls = [] if truncated else finalize_tool_calls(tool_states)
             for call in tool_calls:
@@ -1219,6 +1220,19 @@ class Agent:
             step_id=step_id,
             tool_call_id=tool_call_id,
             source=source or "agent",
+        )
+
+    def _compaction_policy(self) -> CompactionPolicy:
+        return CompactionPolicy(
+            context_window=int(self.llm_client.max_context_window),
+            normal_max_output_tokens=int(self.config.llm.max_tokens),
+            threshold_ratio=float(self.config.memory.compression_threshold),
+            compression_target=float(self.config.memory.compression_target),
+            reserve_tokens=int(self.config.memory.compression_reserve_tokens),
+            min_recent_messages=int(self.config.memory.min_recent_messages),
+            max_tool_result_chars_in_input=int(
+                self.config.compaction.max_tool_result_chars_in_input
+            ),
         )
 
     def _budget_metadata(self) -> dict[str, int]:

@@ -813,7 +813,7 @@ class SubagentManager:
                         sources[call.get("id")] = tool_input(call).get("url", "")
             elif (
                 event.event_type == "tool/result"
-                and event.payload.get("name") in {"web_fetch", "web_search"}
+                and event.payload.get("name") in {"web_fetch", "web_search", "web_read"}
                 and not event.payload.get("is_error")
             ):
                 content = str(event.payload.get("content") or "").strip()

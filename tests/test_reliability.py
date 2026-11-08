@@ -8,9 +8,10 @@ import pytest
 
 from paicli.agent import Agent, QueryEngine
 from paicli.agent.run_controller import RunController
-from paicli.agent.subagents import ActivationState, SubagentManager
+from paicli.agent.subagents import ActivationState, PersistedDelivery, SubagentManager
 from paicli.config import PaiCliConfig
 from paicli.context import CompactionResponse
+from paicli.context.tokens import estimate_text_tokens
 from paicli.policy.redaction import Redactor
 from paicli.session import ContextProjector, SessionStore
 from paicli.tools import ToolRegistry, get_builtin_tools
@@ -183,6 +184,18 @@ def test_child_delivery_reaches_next_request_after_tool_batch(tmp_path):
     asyncio.run(run())
 
 
+def test_delivery_excerpt_respects_utf8_bytes_and_batch_context():
+    content = "调研证据" * 20_000
+    delivery = PersistedDelivery("delivery", "root", "session", "child", "completed", content)
+    rendered = RunController.format_deliveries([delivery], 120_000)
+    report = rendered.split("Subagent child completed: ", 1)[1]
+    assert len(report.encode("utf-8")) <= 50 * 1024
+    assert "Full report saved" in report and delivery.result == content
+    limited = RunController.format_deliveries([delivery, delivery], 250)
+    assert estimate_text_tokens(limited) <= 250
+    assert limited.count("Subagent child completed:") == 2
+
+
 @pytest.mark.parametrize("failure", ["output", "compaction"])
 def test_parent_receives_partial_child_results(tmp_path, monkeypatch, failure):
     ctx = context(tmp_path)
@@ -214,6 +227,7 @@ def test_parent_receives_partial_child_results(tmp_path, monkeypatch, failure):
                 yield {"type": "message_end", "stop_reason": "max_tokens"}
                 return
             assert len(messages) == 1, "Compaction should intercept the next model request"
+            yield {"type": "usage", "usage": {"input_tokens": 3500}}
             yield {
                 "type": "tool_call_delta",
                 "tool_call": {

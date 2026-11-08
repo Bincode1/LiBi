@@ -436,11 +436,18 @@ Runtime 接收新会话的第一条用户消息后，在后台只尝试生成一
 `subagent` 接受单个任务，也可通过 `tasks` 一次提交 1–8 个独立任务。
 同一批最多运行 4 个，剩余任务排队，到实际启动时才开始计时。
 `subagents.max_active` 默认也为 4，可调整整个运行实例的并发上限。
+子报告按主模型剩余的上下文预算分配空间，每份回传最多 50 KiB，完整报告保存在子会话中。
+自动压缩会预留模型输出空间，使用最近的模型输入用量和上下文增量估算剩余 token。
 
-本地子 Agent 的每轮网页调研默认最多搜索 6 次、抓取 8 次并接收 32,000 字符的网页内容。
-可通过 `subagents.research_max_searches`、`subagents.research_max_fetches` 和
-`subagents.research_max_chars` 配置。
-主模型收到的报告正文每份最多 8,000 字符、每批最多 24,000 字符，完整报告保存在子会话中。
+网页搜索每次默认返回 5 条、最多 20 条。会话中的 `web_fetch` 默认返回 4,000 字符以内的摘录和
+`response_id`，单次内联上限为 30,000 字符。同一轮重复抓取同一 URL 会复用已保存的页面。
+`web_read` 可用 `offset` / `limit` 分页，也可用 `query` 查找相关段落。每页保存最多
+200,000 字符的可读文本，句柄限所属会话使用。配置子 Agent 工具白名单时，按需加入 `web_read`。
+
+本地子 Agent 的网页证据预算按模型输入窗口和本轮剩余空间计算，默认留出四分之一输入预算作为
+整轮证据上限。`subagents.research_timeout` 默认允许 240 秒内发起网络请求。
+`subagents.research_max_searches`、`subagents.research_max_fetches` 和
+`subagents.research_max_chars` 可选，用于设置额外上限。
 工作台在主对话显示委派入口，在右侧显示子 agent 的状态和独立执行记录。打开子会话时订阅
 `GET /v1/sessions/<parent_id>/subagents/<child_session_id>/events/stream?cursor=<sequence>`。
 子会话流沿用独立游标，并校验子会话属于当前工作区与指定父会话。子 agent 的审批由主会话提交。

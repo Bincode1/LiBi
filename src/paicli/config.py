@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from contextlib import suppress
 from copy import deepcopy
@@ -48,15 +49,22 @@ class SubagentConfig:
     default_deadline: float | None = None
     drain_timeout: float = 15.0
     observation_queue_size: int = 512
-    research_max_searches: int = 6
-    research_max_fetches: int = 8
-    research_max_chars: int = 32_000
+    research_max_searches: int | None = None
+    research_max_fetches: int | None = None
+    research_max_chars: int | None = None
+    research_timeout: float = 240.0
 
     def __post_init__(self) -> None:
         for name in ("research_max_searches", "research_max_fetches", "research_max_chars"):
             value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"subagents.{name} must be a positive integer")
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"subagents.{name} must be a positive integer or null")
+        if (
+            type(self.research_timeout) not in (int, float)
+            or not math.isfinite(self.research_timeout)
+            or self.research_timeout <= 0
+        ):
+            raise ValueError("subagents.research_timeout must be a finite positive number")
 
 
 @dataclass(slots=True)

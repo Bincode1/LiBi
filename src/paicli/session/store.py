@@ -19,6 +19,7 @@ from paicli.session.models import (
     SessionEvent,
     SessionState,
     SessionSummary,
+    WebDocument,
 )
 
 
@@ -847,6 +848,59 @@ class SessionStore:
                     source="runtime",
                 )
 
+    def get_web_document(
+        self,
+        session_id: str,
+        key: str,
+        *,
+        by_cache_key: bool = False,
+    ) -> WebDocument | None:
+        column = "cache_key" if by_cache_key else "response_id"
+        with closing(self._connect()) as conn:
+            self._session_row(conn, session_id)
+            row = conn.execute(
+                f"select response_id, url, content, truncated from web_documents "
+                f"where session_id = ? and {column} = ?",
+                (session_id, key),
+            ).fetchone()
+        if row is None:
+            return None
+        response_id, url, content, truncated = row
+        return WebDocument(
+            response_id, self.redactor.clean(url), self.redactor.clean(content), bool(truncated)
+        )
+
+    def save_web_document(
+        self,
+        session_id: str,
+        cache_key: str,
+        url: str,
+        content: str,
+        *,
+        max_chars: int,
+        truncated: bool,
+    ) -> WebDocument:
+        url = self.redactor.clean(url)
+        content = self.redactor.clean(content)
+        with closing(self._connect()) as conn, conn:
+            conn.execute("begin immediate")
+            self._session_row(conn, session_id)
+            conn.execute(
+                "insert into web_documents values (?, ?, ?, ?, ?, ?) "
+                "on conflict(session_id, cache_key) do nothing",
+                (
+                    f"web_{uuid.uuid4().hex}",
+                    session_id,
+                    cache_key,
+                    url,
+                    content[:max_chars],
+                    truncated or len(content) > max_chars,
+                ),
+            )
+        document = self.get_web_document(session_id, cache_key, by_cache_key=True)
+        assert document is not None
+        return document
+
     def events(
         self,
         session_id: str,
@@ -1098,6 +1152,19 @@ class SessionStore:
             for column, column_type in session_additions.items():
                 if column not in session_columns:
                     conn.execute(f"alter table sessions add column {column} {column_type}")
+            conn.execute(
+                """
+                create table if not exists web_documents (
+                    response_id text primary key,
+                    session_id text not null references sessions(id) on delete cascade,
+                    cache_key text not null,
+                    url text not null,
+                    content text not null,
+                    truncated integer not null,
+                    unique(session_id, cache_key)
+                )
+                """
+            )
             conn.execute(
                 """
                 create table if not exists events (

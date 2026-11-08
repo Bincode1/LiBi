@@ -9,6 +9,9 @@ from urllib.parse import urlparse
 
 import httpx
 
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+TRUNCATION_MARKER = "\n... [truncated]"
+
 
 class NetworkPolicyError(ValueError):
     pass
@@ -50,21 +53,30 @@ class PublicNetworkTransport(httpx.AsyncBaseTransport):
 
 
 async def fetch_url(url: str, max_length: int = 10_000, timeout: float = 15.0) -> str:
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        follow_redirects=True,
-        max_redirects=10,
-        transport=PublicNetworkTransport(),
-        trust_env=False,
-    ) as client:
-        response = await client.get(url, headers={"user-agent": "PaiCLI-Python/0.1.0"})
+    async with (
+        httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            max_redirects=10,
+            transport=PublicNetworkTransport(),
+            trust_env=False,
+        ) as client,
+        client.stream("GET", url, headers={"user-agent": "PaiCLI-Python/0.1.0"}) as response,
+    ):
         response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        text = response.text
-        if "html" in content_type:
+        body = bytearray()
+        truncated = False
+        async for chunk in response.aiter_bytes():
+            room = _MAX_RESPONSE_BYTES - len(body)
+            body.extend(chunk[:room])
+            if len(chunk) > room:
+                truncated = True
+                break
+        text = body.decode(response.encoding or "utf-8", errors="replace")
+        if "html" in response.headers.get("content-type", ""):
             text = extract_text_from_html(text)
-        if len(text) > max_length:
-            text = text[:max_length] + "\n... [truncated]"
+        if truncated or len(text) > max_length:
+            text = text[:max_length] + TRUNCATION_MARKER
         return text or "(empty page)"
 
 
