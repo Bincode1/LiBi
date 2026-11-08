@@ -1,4 +1,5 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { matchPath, useLocation, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { AnimatePresence, useReducedMotion } from 'motion/react'
@@ -43,7 +44,7 @@ import { useEventFeed } from '@/hooks/use-event-feed'
 import { useTabDrafts } from '@/hooks/use-tab-drafts'
 import { ApiError, liveClient, request } from '@/lib/api'
 import { projectTurns, resolveActiveRun, type PendingTurn, type ToolView } from '@/lib/events'
-import { useSurfaceMotion } from '@/lib/motion'
+import { easeOut, useSurfaceMotion } from '@/lib/motion'
 import { errorMessage } from '@/lib/utils'
 import type { Mode, PermissionMode, Session, Subagent } from '@/lib/types'
 
@@ -258,7 +259,7 @@ export default function App() {
     ? (turns.flatMap((t) => t.tools).find((t) => t.id === tool.id) ?? tool)
     : null
   const notify = (message: string) => setNotice(message)
-  useEffect(() => {
+  useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme
     const themeColor = getComputedStyle(document.documentElement).getPropertyValue('--background')
     document.querySelector('meta[name="theme-color"]')?.setAttribute('content', themeColor.trim())
@@ -339,6 +340,15 @@ export default function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [navigate, inMcpSettings])
+  const toggleTheme = () => {
+    const updateTheme = () => setTheme((current) => (current === 'light' ? 'dark' : 'light'))
+    if (!document.startViewTransition || matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      updateTheme()
+      return
+    }
+    // Commit the theme and its controls before the browser takes the new snapshot.
+    document.startViewTransition(() => flushSync(updateTheme))
+  }
   const selectSession = (sessionId: string) => {
     navigate(`/sessions/${encodeURIComponent(sessionId)}`)
     setSidebar(false)
@@ -526,7 +536,10 @@ export default function App() {
           />
         </Suspense>
       }
-      onClose={() => setDetails(false)}
+      onClose={() => {
+        setDetails(false)
+        if (!detailsOverlay) detailsTrigger.current?.focus({ preventScroll: true })
+      }}
       onClearTool={() => setTool(null)}
       onInspect={setTool}
     />
@@ -631,7 +644,7 @@ export default function App() {
           variant="ghost"
           size="icon"
           aria-label={theme === 'light' ? '切换深色主题' : '切换浅色主题'}
-          onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+          onClick={toggleTheme}
         >
           {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
         </Button>
@@ -639,10 +652,7 @@ export default function App() {
     </aside>
   )
   const workspace = (
-    <div
-      className={`workspace ${details && !detailsOverlay ? 'with-details' : ''}`}
-      style={inMcpSettings ? { display: 'none' } : undefined}
-    >
+    <div className="workspace" style={inMcpSettings ? { display: 'none' } : undefined}>
       {mobile ? (
         <Dialog
           open={sidebar}
@@ -880,7 +890,24 @@ export default function App() {
           {detailPanel}
         </Dialog>
       ) : (
-        detailPanel
+        <div className="details-slot" inert={!details}>
+          <AnimatePresence>
+            {details && (
+              <m.div
+                className="details-slide"
+                initial={reducedMotion ? false : { width: 0 }}
+                animate={{ width: 'var(--details-track)' }}
+                exit={{
+                  width: 0,
+                  transition: { duration: reducedMotion ? 0 : 0.2, ease: easeOut },
+                }}
+                transition={{ duration: reducedMotion ? 0 : 0.26, ease: easeOut }}
+              >
+                {detailPanel}
+              </m.div>
+            )}
+          </AnimatePresence>
+        </div>
       )}
       <AnimatePresence>
         {notice && (

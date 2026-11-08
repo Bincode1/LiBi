@@ -4,7 +4,7 @@ export const easeOut = [0.2, 0.8, 0.25, 1] as const
 const easeIn = [0.45, 0, 0.85, 1] as const
 
 export function useSurfaceMotion(
-  offset: { x?: number; y?: number; scale?: number } = {},
+  offset: { x?: number | string; y?: number; scale?: number } = {},
   duration = 0.2,
 ) {
   const reduced = useReducedMotion()

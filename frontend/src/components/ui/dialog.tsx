@@ -28,8 +28,8 @@ export function Dialog({
   const opener = useRef<HTMLElement | null>(null)
   const backdrop = useSurfaceMotion({}, 0.18)
   const panel = useSurfaceMotion(
-    side ? { x: side === 'left' ? -22 : 22 } : { y: 8, scale: 0.975 },
-    side ? 0.24 : 0.22,
+    side ? { x: side === 'left' ? '-100%' : '100%' } : { y: 8, scale: 0.975 },
+    side ? 0.28 : 0.22,
   )
 
   return (
