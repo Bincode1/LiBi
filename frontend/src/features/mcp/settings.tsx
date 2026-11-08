@@ -109,7 +109,6 @@ function ServiceRow({
   const title = serviceTitle(server)
   const canTest = !server.blocked && !server.overridden && !!server.config.type
   const canToggle = canWrite && canTest
-  const toggleLabel = server.config.enabled ? '关闭' : '启动'
   return (
     <div className="mcp-service">
       <div className="mcp-service-row">
@@ -134,15 +133,18 @@ function ServiceRow({
         </div>
         <div className="mcp-service-actions">
           {canToggle && (
-            <Button
-              variant="outline"
-              size="sm"
+            <button
+              type="button"
+              className="mcp-switch"
+              role="switch"
+              aria-checked={server.config.enabled}
+              aria-label={`启用 ${title}`}
               disabled={pending || (!autoStart && !server.config.enabled)}
-              aria-label={`${toggleLabel} ${title}`}
+              title={server.config.enabled ? '关闭服务' : '启动服务'}
               onClick={onToggle}
             >
-              {toggleLabel}
-            </Button>
+              <span className="mcp-switch-track" aria-hidden="true" />
+            </button>
           )}
           {!server.blocked && (canWrite || canTest) && (
             <Dropdown.Root>
