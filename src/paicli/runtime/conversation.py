@@ -5,6 +5,7 @@ from typing import Any
 
 from paicli.agent.subagent_events import subagent_role
 from paicli.session import SessionEvent, SessionState, SessionStore
+from paicli.web.citations import ResearchSource, source_list
 
 SUBAGENT_STATE_EVENTS = (
     "agent/child_started",
@@ -91,6 +92,15 @@ class SubagentCatalog:
                         payload.get("content"), str
                     ):
                         child.report = payload["content"]
+                    sources = tuple(
+                        source
+                        for record in payload.get("sources", [])
+                        if (source := ResearchSource.from_record(record)) is not None
+                    )
+                    if sources:
+                        report = payload.get("content")
+                        body = report if isinstance(report, str) else ""
+                        child.report = f"{body}\n\n## 查阅来源\n\n{source_list(sources)}".lstrip()
                     if child.last_delivery == "completed":
                         child.result_count += 1
                         child.delivered_at = event.created_at

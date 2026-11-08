@@ -20,7 +20,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing, suppress
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -69,6 +69,7 @@ from paicli.tools.executor import ToolExecutor
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, QueryResult, Usage
 from paicli.web.budget import ResearchBudget
+from paicli.web.citations import SUBMIT_RESEARCH_REPORT, CitationBook, report_output_definition
 
 AgentMode = Literal["react", "plan"]
 
@@ -516,6 +517,20 @@ class Agent:
             input_limit = llm_policy.normal_input_budget
         except ValueError:
             input_limit = 0
+        citations = CitationBook()
+
+        def tool_result_payload(result: ToolResult, name: str, content: str) -> dict:
+            payload = {"name": name, "content": content, "is_error": result.is_error}
+            if result.sources:
+                sources = []
+                for source in result.sources:
+                    record = asdict(source)
+                    if name in SUBAGENT_REPORT_TOOLS and (source_id := citations.id_for(source)):
+                        record["source_id"] = source_id
+                    sources.append(record)
+                payload["sources"] = sources
+            return payload
+
         context = ToolContext(
             cwd=self.cwd,
             config=self.config,
@@ -534,6 +549,7 @@ class Agent:
             turn_id=turn_id,
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
+            citations=citations,
             research_budget=(
                 ResearchBudget(
                     subagent_config.research_max_searches,
@@ -652,6 +668,7 @@ class Agent:
             turn_usage = Usage()
             tool_states: dict[int, dict[str, Any]] = {}
             step_id = f"step_{uuid.uuid4().hex}"
+            citing = bool(citations.available)
             self._log(
                 "step/started",
                 {"mode": "react"},
@@ -660,7 +677,14 @@ class Agent:
             )
             self._log(
                 "tool/schema_snapshot",
-                {"tools": tool_defs},
+                {
+                    "tools": sorted(
+                        [*tool_defs, report_output_definition()],
+                        key=lambda tool: tool["function"]["name"],
+                    )
+                    if citing
+                    else tool_defs
+                },
                 turn_id=turn_id,
                 step_id=step_id,
                 source="tool-registry",
@@ -828,9 +852,10 @@ class Agent:
                     if event_type == "text_delta":
                         delta = str(event.get("text") or "")
                         text += delta
-                        yield _annotate_event(
-                            {"type": "text_delta", "text": delta}, session_id, turn_id, step_id
-                        )
+                        if not citing:
+                            yield _annotate_event(
+                                {"type": "text_delta", "text": delta}, session_id, turn_id, step_id
+                            )
                     elif event_type == "thinking_delta":
                         delta = str(event.get("thinking") or "")
                         thinking += delta
@@ -926,6 +951,23 @@ class Agent:
             previous_checkpoint = current_view.compaction_id
             truncated = stop_reason == "max_tokens"
             tool_calls = [] if truncated else finalize_tool_calls(tool_states)
+            if citing and not truncated:
+                # The final output declaration is a response format. Only normal tools
+                # reach the executor, and there is no follow-up request for a report.
+                ordinary = [
+                    call
+                    for call in tool_calls
+                    if call.get("function", {}).get("name") != SUBMIT_RESEARCH_REPORT
+                ]
+                if not ordinary:
+                    submission = tool_input(tool_calls[0]) if tool_calls else {}
+                    text = citations.render(submission, text)
+                    stop_reason = "end_turn"
+                tool_calls = ordinary
+                if text:
+                    yield _annotate_event(
+                        {"type": "text_delta", "text": text}, session_id, turn_id, step_id
+                    )
             for call in tool_calls:
                 if store.redactor.clean(call["id"]) != call["id"]:
                     # Use one opaque ID for the call and its result before either is persisted.
@@ -1073,11 +1115,11 @@ class Agent:
                 for result in completed_results:
                     self._log(
                         "tool/result",
-                        {
-                            "name": tool_name_by_id(tool_calls, result.tool_use_id or ""),
-                            "content": result.content,
-                            "is_error": result.is_error,
-                        },
+                        tool_result_payload(
+                            result,
+                            tool_name_by_id(tool_calls, result.tool_use_id or ""),
+                            result.content,
+                        ),
                         turn_id=turn_id,
                         step_id=step_id,
                         tool_call_id=result.tool_use_id,
@@ -1101,7 +1143,7 @@ class Agent:
                     injected = True
                 self._log(
                     "tool/result",
-                    {"name": tool_name, "content": model_content, "is_error": result.is_error},
+                    tool_result_payload(result, tool_name, model_content),
                     turn_id=turn_id,
                     step_id=step_id,
                     tool_call_id=result.tool_use_id,

@@ -22,6 +22,7 @@ from paicli.tools import file_ops as fops
 from paicli.tools.base import Tool, ToolContext, ToolResult, object_schema
 from paicli.tools.file_ops import FileOpResult
 from paicli.web import fetch_url, search_web
+from paicli.web.citations import ResearchSource
 from paicli.web.fetch import TRUNCATION_MARKER
 
 
@@ -627,16 +628,28 @@ async def _web_search(payload: dict[str, Any], context: ToolContext) -> ToolResu
         return ToolResult(f"Search error: {exc}", is_error=True)
     if not results:
         return ToolResult(f'No search results found for "{payload["query"]}".')
-    content = "\n\n".join(
+    blocks = [
         f"{index}. {result.title[:256]}\n{result.url}\n{result.snippet[:500]}"
         for index, result in enumerate(results, start=1)
+    ]
+    content = "\n\n".join(blocks)
+    visible = budget.take_text(content) if budget is not None else content
+    sources = []
+    offset = 0
+    for result, block in zip(results, blocks, strict=True):
+        if offset + len(block) > len(visible):
+            break
+        source = ResearchSource.from_record(
+            {"title": result.title, "url": result.url, "excerpt": result.snippet}
+        )
+        if source is not None:
+            sources.append(source)
+        offset += len(block) + 2
+    if len(visible) < len(content):
+        visible += "\n[Research evidence budget reached. Summarize the available evidence.]"
+    return ToolResult(
+        visible, display_summary=f"Search: {len(results)} results", sources=tuple(sources)
     )
-    if budget is not None:
-        excerpt = budget.take_text(content)
-        if len(excerpt) < len(content):
-            excerpt += "\n[Research evidence budget reached. Summarize the available evidence.]"
-        content = excerpt
-    return ToolResult(content, display_summary=f"Search: {len(results)} results")
 
 
 _WEB_INLINE_LIMIT = 30_000
@@ -726,9 +739,19 @@ def _web_excerpt(
         header += f"Next offset: {end}\n"
     if document.truncated:
         header += "The stored page is limited to its fetched prefix.\n"
+    title = re.search(r"(?m)^# (.+)$", document.text[:1024])
+    source = ResearchSource.from_record(
+        {
+            "url": document.url,
+            "title": title[1] if title else None,
+            "excerpt": text,
+            "response_id": document.response_id,
+        }
+    )
     return ToolResult(
         header + f"Excerpt {start}–{end}:\n\n" + text,
         display_summary=f"Web excerpt: {document.url}",
+        sources=(source,) if source is not None else (),
     )
 
 

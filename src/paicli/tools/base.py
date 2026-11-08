@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from paicli.config import PaiCliConfig
 from paicli.web.budget import ResearchBudget
+from paicli.web.citations import CitationBook, ResearchSource
 
 DangerLevel = Literal["safe", "medium", "high"]
 ToolDecision = Literal["approve", "deny", "skip"]
@@ -18,6 +19,7 @@ class ToolResult:
     is_error: bool = False
     display_summary: str | None = None
     tool_use_id: str | None = None
+    sources: tuple[ResearchSource, ...] = ()
 
 
 @dataclass(slots=True)
@@ -41,6 +43,7 @@ class ToolContext:
     step_id: str | None = None
     tool_call_id: str | None = None
     subagent_report_tokens: int = 8_000
+    citations: CitationBook | None = None
     research_budget: ResearchBudget | None = None
     web_fetch_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
