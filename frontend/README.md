@@ -11,9 +11,15 @@ pnpm --dir frontend install --frozen-lockfile
 uv run libi workbench --cwd .
 ```
 
-默认地址为 [http://127.0.0.1:24157](http://127.0.0.1:24157)。启动器为 Runtime 分配本机端口，自动给 Vite 配置代理与临时凭据。模型凭据沿用项目配置。看到 `LiBi workbench ready` 或通过工作台访问 `/v1/health` 得到 HTTP 200，表示代理已连通。
+默认地址为 [http://127.0.0.1:24157](http://127.0.0.1:24157)。启动器为 Runtime 分配本机端口，自动给 Vite 配置代理与临时凭据。看到 `LiBi workbench ready` 或通过工作台访问 `/v1/health` 得到 HTTP 200，表示代理已连通。
 
 在启动终端按 Ctrl+C 停止前端和 Runtime。重启时按原工作目录和端口再运行同一命令。可用 `--port` 更换工作台端口，用 `--no-browser` 跳过打开浏览器。
+
+## 配置对话模型
+
+打开「设置 → 模型」，填写 OpenAI 兼容服务的 API 根地址（例如 `https://api.example.com/v1`）和 API Key，然后点击「测试并获取模型」。测试只请求该地址下的 `/models`。如果服务未提供列表，仍可手动填写模型 ID。
+
+点击「保存模型配置」后，工作台的下一轮对话会使用该设置。当前用户的工作台配置保存在 `~/.libi/workbench-model.json`，其中包括 API Key。页面只显示是否已配置，地址相同时留空可保留原密钥。首次保存前，工作台沿用启动时加载的配置。终端和独立 Runtime 使用各自原有的配置来源。
 
 ## 管理 MCP 服务
 

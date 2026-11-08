@@ -15,6 +15,7 @@ import httpx
 
 from libi.config import load_config
 from libi.runtime.api import RuntimeApiServer
+from libi.runtime.model_settings import WorkbenchModelSettings
 
 _FRONTEND = Path(__file__).resolve().parents[3] / "frontend"
 
@@ -46,7 +47,11 @@ def run_workbench(cwd: Path, *, port: int, open_browser: bool) -> None:
     origin = f"http://127.0.0.1:{port}"
     key = secrets.token_urlsafe(32)
     runtime = RuntimeApiServer(
-        cwd=str(cwd), config=load_config(project_root=cwd), api_key=key, port=0
+        cwd=str(cwd),
+        config=load_config(project_root=cwd),
+        api_key=key,
+        port=0,
+        model_settings=WorkbenchModelSettings(),
     )
     with runtime.listen() as server:
         runtime_origin = f"http://127.0.0.1:{server.server_port}"

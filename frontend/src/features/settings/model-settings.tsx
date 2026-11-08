@@ -1,0 +1,240 @@
+import { useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { Check, CircleAlert, FlaskConical, LoaderCircle } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { request } from '@/lib/api'
+import { errorMessage } from '@/lib/utils'
+import './model-settings.css'
+
+interface ModelConnection {
+  base_url: string
+  model: string
+  has_api_key: boolean
+}
+
+const endpoint = '/v1/settings/model'
+const queryKey = ['model-settings'] as const
+const normalizeUrl = (value: string) => value.trim().replace(/\/+$/, '')
+
+export function ModelSettings() {
+  const cache = useQueryClient()
+  const settings = useQuery({
+    queryKey,
+    queryFn: ({ signal }) => request<ModelConnection>(endpoint, { signal }),
+    retry: false,
+  })
+
+  return (
+    <main className="mcp-panel">
+      <div className="mcp-page">
+        <header className="mcp-heading">
+          <div>
+            <h1>模型</h1>
+            <p>配置 LiBi 在工作台里使用的 OpenAI 兼容对话服务。</p>
+          </div>
+        </header>
+        {settings.isPending && (
+          <p className="model-feedback" role="status">
+            正在读取模型配置…
+          </p>
+        )}
+        {settings.isError && (
+          <div className="model-feedback">
+            <p role="alert">{errorMessage(settings.error)}</p>
+            <Button variant="outline" onClick={() => void settings.refetch()}>
+              重试
+            </Button>
+          </div>
+        )}
+        {settings.data && (
+          <ModelForm
+            current={settings.data}
+            onSaved={(saved) => cache.setQueryData(queryKey, saved)}
+          />
+        )}
+      </div>
+    </main>
+  )
+}
+
+function ModelForm({
+  current,
+  onSaved,
+}: {
+  current: ModelConnection
+  onSaved: (saved: ModelConnection) => void
+}) {
+  const [urlDraft, setUrlDraft] = useState<string>()
+  const [key, setKey] = useState('')
+  const [modelDraft, setModelDraft] = useState<string>()
+  const [models, setModels] = useState<string[]>([])
+  const [busy, setBusy] = useState<'test' | 'save'>()
+  const [feedback, setFeedback] = useState<{
+    action: 'test' | 'save'
+    error?: boolean
+    message: string
+  }>()
+  const baseUrl = urlDraft ?? current.base_url
+  const model = modelDraft ?? current.model
+  const reuseKey = current.has_api_key && normalizeUrl(baseUrl) === current.base_url
+  const canTest = Boolean(baseUrl.trim() && (key.trim() || reuseKey))
+
+  async function submit(action: 'test' | 'save') {
+    if (busy || !canTest || (action === 'save' && !model.trim())) return
+    setBusy(action)
+    setFeedback(undefined)
+    const data = {
+      method: 'POST',
+      body: JSON.stringify({ base_url: baseUrl, api_key: key, model }),
+    }
+    try {
+      if (action === 'test') {
+        setModels([])
+        const result = await request<{ models: string[] }>(endpoint + '/test', data)
+        setModels(result.models)
+        setFeedback({
+          action,
+          message: result.models.length
+            ? `连接成功，服务返回 ${result.models.length} 个模型。`
+            : '连接成功，服务返回了空列表。可以手动填写模型 ID。',
+        })
+      } else {
+        const saved = await request<ModelConnection>(endpoint, data)
+        onSaved(saved)
+        setUrlDraft(undefined)
+        setModelDraft(undefined)
+        setKey('')
+        setFeedback({ action, message: '已保存。下一轮对话将使用此配置。' })
+      }
+    } catch (exception) {
+      setFeedback({ action, error: true, message: errorMessage(exception) })
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const message = feedback && (
+    <p
+      className={`model-feedback ${feedback.error ? 'model-feedback-error' : ''}`}
+      role={feedback.error ? 'alert' : 'status'}
+    >
+      {feedback.error ? (
+        <CircleAlert size={16} aria-hidden="true" />
+      ) : (
+        <Check size={16} aria-hidden="true" />
+      )}
+      {feedback.message}
+    </p>
+  )
+
+  return (
+    <form
+      className="model-form"
+      onSubmit={(event) => {
+        event.preventDefault()
+        void submit('save')
+      }}
+      aria-busy={Boolean(busy)}
+    >
+      <fieldset disabled={Boolean(busy)}>
+        <legend>服务连接</legend>
+        <label htmlFor="model-base-url">Base URL</label>
+        <input
+          id="model-base-url"
+          type="url"
+          required
+          value={baseUrl}
+          placeholder="https://api.example.com/v1"
+          autoCapitalize="none"
+          spellCheck={false}
+          aria-describedby="model-base-url-hint"
+          onChange={(event) => {
+            const next = event.target.value
+            setUrlDraft(next)
+            setModelDraft(normalizeUrl(next) === current.base_url ? undefined : '')
+            setKey('')
+            setModels([])
+            setFeedback(undefined)
+          }}
+        />
+        <p id="model-base-url-hint">填写服务的 API 根地址，例如包含 /v1 的地址。</p>
+        <label htmlFor="model-api-key">API Key</label>
+        <input
+          id="model-api-key"
+          type="password"
+          autoComplete="new-password"
+          required={!reuseKey}
+          value={key}
+          placeholder={reuseKey ? '已配置，留空可保留' : '输入此服务的 API Key'}
+          aria-describedby="model-api-key-hint"
+          onChange={(event) => {
+            setKey(event.target.value)
+            setModels([])
+            setFeedback(undefined)
+          }}
+        />
+        <p id="model-api-key-hint">
+          {reuseKey ? '更换密钥时输入新值。' : '每个服务地址使用自己的密钥。'}
+        </p>
+        <div className="model-test">
+          <Button
+            type="button"
+            variant="outline"
+            disabled={!canTest}
+            onClick={() => void submit('test')}
+          >
+            {busy === 'test' ? (
+              <LoaderCircle size={15} className="spin" aria-hidden="true" />
+            ) : (
+              <FlaskConical size={15} aria-hidden="true" />
+            )}
+            {busy === 'test' ? '正在获取模型…' : '测试并获取模型'}
+          </Button>
+          {feedback?.action === 'test' && message}
+        </div>
+      </fieldset>
+      <fieldset disabled={Boolean(busy)}>
+        <legend>对话模型</legend>
+        {models.length > 0 && (
+          <>
+            <label htmlFor="available-models">可用模型</label>
+            <select
+              id="available-models"
+              value={models.includes(model) ? model : ''}
+              onChange={(event) => setModelDraft(event.target.value)}
+            >
+              <option value="" disabled>
+                从服务返回的模型中选择
+              </option>
+              {models.map((id) => (
+                <option key={id} value={id}>
+                  {id}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+        <label htmlFor="model-id">模型 ID</label>
+        <input
+          id="model-id"
+          value={model}
+          required
+          maxLength={256}
+          placeholder="例如 provider/model"
+          autoCapitalize="none"
+          spellCheck={false}
+          onChange={(event) => setModelDraft(event.target.value)}
+          aria-describedby="model-id-hint"
+        />
+        <p id="model-id-hint">也可以手动填写。返回列表中的模型能否用于对话，以服务商支持为准。</p>
+      </fieldset>
+      <div className="model-footer">
+        <p>保存到本机，供工作台后续对话使用。</p>
+        <Button type="submit" disabled={Boolean(busy) || !canTest || !model.trim()}>
+          {busy === 'save' ? '正在保存…' : '保存模型配置'}
+        </Button>
+      </div>
+      {feedback?.action === 'save' && message}
+    </form>
+  )
+}

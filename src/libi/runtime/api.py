@@ -26,10 +26,17 @@ from libi.agent import QueryEngine
 from libi.bootstrap import build_tool_registry
 from libi.config import LiBiConfig
 from libi.llm import create_llm_client
+from libi.llm.base import ProviderRequestError
 from libi.mcp.config import McpConfigConflict
 from libi.mcp.management import McpManagement
 from libi.policy.permission_mode import PermissionMode, PermissionModeController
 from libi.runtime.conversation import SUBAGENT_STATE_EVENTS, SubagentCatalog, conversation_event
+from libi.runtime.model_settings import (
+    ModelSettingsBusy,
+    WorkbenchModelSettings,
+    contains_credential,
+    model_discovery_error,
+)
 from libi.runtime.tasks import TASK_MODES, DurableTaskManager, TaskRecord
 from libi.runtime.titles import generate_session_title
 from libi.runtime.workspaces import WorkspaceError, browse_directory, resolve_directory
@@ -130,9 +137,12 @@ class RuntimeApiServer:
         api_key: str,
         port: int | None = None,
         workers: int = 2,
+        model_settings: WorkbenchModelSettings | None = None,
     ):
         self.cwd = str(Path(cwd).resolve())
         self.config = config
+        self._model_settings = model_settings
+        self._model_settings_lock = threading.Lock()
         self.api_key = api_key
         self.mcp = McpManagement(self.cwd, sensitive_values=(api_key, config.llm.api_key))
         self.port = config.runtime.port if port is None else port
@@ -268,6 +278,12 @@ class RuntimeApiServer:
             _send_json(request, 400, {"error": str(exc)})
             return
         try:
+            if self._model_settings is not None and path in {
+                "/v1/settings/model",
+                "/v1/settings/model/test",
+            }:
+                self._handle_model_settings(request, path, body, self._model_settings)
+                return
             if path == "/v1/mcp/servers" or path.startswith("/v1/mcp/servers/"):
                 self._handle_mcp(request, path, body)
                 return
@@ -330,7 +346,7 @@ class RuntimeApiServer:
                 interactive_approval = body.get("interactive_approval", False)
                 if not isinstance(interactive_approval, bool):
                     raise ValueError("interactive_approval must be a boolean")
-                self._ensure_llm_key()
+                self._ensure_llm_key(self._config_snapshot())
                 run_id, after_sequence = self._start_background_turn(
                     session_id, message, mode=mode, interactive_approval=interactive_approval
                 )
@@ -412,6 +428,49 @@ class RuntimeApiServer:
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": str(exc)})
 
+    def _handle_model_settings(
+        self,
+        request: BaseHTTPRequestHandler,
+        path: str,
+        body: dict,
+        settings: WorkbenchModelSettings,
+    ) -> None:
+        try:
+            if request.command == "GET" and path == "/v1/settings/model":
+                current = settings.load(self.config.llm)
+                _send_json(request, 200, settings.public(current))
+            elif request.command == "POST" and path == "/v1/settings/model":
+                saved = settings.save(body, self.config.llm)
+                _send_json(request, 200, settings.public(saved))
+            elif request.command == "POST" and path == "/v1/settings/model/test":
+                current = settings.load(self.config.llm)
+                draft = settings.candidate(body, current)
+                client = create_llm_client(draft)
+                models = asyncio.run(client.list_models(strict=True, timeout=10.0))
+                secrets = (draft.api_key, current.api_key, *self.mcp.sensitive_values)
+                models = [
+                    model
+                    for model in models
+                    if len(model) <= 256
+                    and not any(contains_credential(model, secret) for secret in secrets)
+                ]
+                _send_json(request, 200, {"models": models})
+            else:
+                _send_json(request, 404, {"error": "not found"})
+        except ModelSettingsBusy as exc:
+            _send_json(request, 409, {"model_error": str(exc)})
+        except ValueError as exc:
+            _send_json(request, 400, {"model_error": str(exc)})
+        except ProviderRequestError as exc:
+            _send_json(request, 422, {"model_error": model_discovery_error(exc)})
+        except OSError:
+            _send_json(request, 500, {"model_error": "无法访问本地模型配置文件，请检查文件权限。"})
+        except Exception as exc:  # noqa: BLE001 - keep provider diagnostics private
+            logging.getLogger(__name__).warning(
+                "Workbench model settings request failed: %s", type(exc).__name__
+            )
+            _send_json(request, 500, {"model_error": "处理模型配置时出错。"})
+
     def _handle_mcp(self, request: BaseHTTPRequestHandler, path: str, body: dict) -> None:
         base = "/v1/mcp/servers"
         try:
@@ -455,10 +514,10 @@ class RuntimeApiServer:
         config: LiBiConfig | None = None,
         turn_id: str | None = None,
     ) -> dict[str, Any]:
-        self._ensure_llm_key()
         mode = _validate_mode(mode)
         if config is None:
-            config = deepcopy(self.config)
+            config = self._config_snapshot()
+        self._ensure_llm_key(config)
         owns_turn = turn_id is None
         if turn_id is None:
             turn_id = f"turn_{uuid.uuid4().hex}"
@@ -686,7 +745,7 @@ class RuntimeApiServer:
                 raise RuntimeStoppingError
             if session_id in self._active_turn_sessions:
                 raise TurnInProgressError
-            config = deepcopy(self.config)
+            config = self._config_snapshot()
             PermissionModeController(config, self._session_permissions.get(session_id, "default"))
             self._active_turn_sessions[session_id] = run_id
             return config
@@ -1141,13 +1200,14 @@ class RuntimeApiServer:
             raise ValueError(
                 f"task mode {task.mode!r} is no longer supported; recreate it as react or plan"
             )
-        self._ensure_llm_key()
-        registry, manager = await build_tool_registry(config=self.config, cwd=self.cwd)
+        config = self._config_snapshot()
+        self._ensure_llm_key(config)
+        registry, manager = await build_tool_registry(config=config, cwd=self.cwd)
         await self.mcp.remember_discovered(manager)
         engine = QueryEngine(
-            llm_client=create_llm_client(self.config.llm),
+            llm_client=create_llm_client(config.llm),
             tool_registry=registry,
-            config=self.config,
+            config=config,
             cwd=self.cwd,
         )
         text = ""
@@ -1167,8 +1227,20 @@ class RuntimeApiServer:
             await engine.aclose()
         return text
 
-    def _ensure_llm_key(self) -> None:
-        if not self.config.llm.api_key:
+    def _config_snapshot(self) -> LiBiConfig:
+        config = deepcopy(self.config)
+        if self._model_settings is not None:
+            config.llm = self._model_settings.load(config.llm)
+            key = config.llm.api_key
+            with self._model_settings_lock:
+                if key and key not in self.mcp.sensitive_values:
+                    self.mcp.sensitive_values += (key,)
+                    self.session_store.redactor.add_sensitive_values((key,))
+        return config
+
+    @staticmethod
+    def _ensure_llm_key(config: LiBiConfig) -> None:
+        if not config.llm.api_key:
             raise ValueError(
                 "LIBI_API_KEY is not configured. Runtime turns/tasks need a working LLM key."
             )

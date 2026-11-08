@@ -77,6 +77,10 @@ def _provider_profile(provider: str) -> dict:
     return _PROVIDER_PROFILES.get(provider, _FALLBACK_PROFILE)
 
 
+def llm_base_url(config: LlmConfig) -> str:
+    return config.base_url or _provider_profile(config.provider.lower())["base_url"]
+
+
 def create_llm_client(
     config: LlmConfig, *, on_usage: Callable[[Usage], None] | None = None
 ) -> OpenAICompatibleClient:
@@ -89,7 +93,7 @@ def create_llm_client(
         provider_name=provider,
         model=config.model,
         api_key=config.api_key,
-        base_url=config.base_url or profile["base_url"],
+        base_url=llm_base_url(config),
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         thinking_enabled=config.thinking_enabled,

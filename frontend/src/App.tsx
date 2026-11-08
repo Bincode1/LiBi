@@ -21,6 +21,7 @@ import {
   Plug,
   Plus,
   Search,
+  Settings2,
   ShieldCheck,
   Sparkles,
   Sun,
@@ -34,6 +35,8 @@ import { Composer } from '@/features/conversation/composer'
 import { ModePicker } from '@/features/conversation/mode-picker'
 import { TurnUsageSummary } from '@/features/conversation/turn-usage'
 import { McpSettings } from '@/features/mcp/settings'
+import { SettingsLayout } from '@/features/settings/layout'
+import { ModelSettings } from '@/features/settings/model-settings'
 import { Details, type DetailsTab } from '@/features/workspace/details'
 import {
   WorkspaceSplit,
@@ -92,10 +95,16 @@ export default function App() {
   const navigate = useNavigate(),
     queryClient = useQueryClient()
   const route = useLocation()
-  const inMcpSettings = route.pathname === '/settings/mcp'
+  const settingsPage =
+    route.pathname === '/settings/mcp'
+      ? 'mcp'
+      : route.pathname === '/settings/models' || route.pathname === '/settings'
+        ? 'models'
+        : null
+  const inSettings = settingsPage !== null
   const from: unknown = route.state?.returnTo
   const returnTo = typeof from === 'string' && matchPath('/sessions/:id', from) ? from : '/new'
-  const id = matchPath('/sessions/:id', inMcpSettings ? returnTo : route.pathname)?.params.id
+  const id = matchPath('/sessions/:id', inSettings ? returnTo : route.pathname)?.params.id
   const reducedMotion = useReducedMotion()
   const toastMotion = useSurfaceMotion({ y: 8 }, 0.18)
   const detailsMotion = useSurfaceMotion({ x: 6 }, 0.18)
@@ -347,7 +356,7 @@ export default function App() {
   }, [notice])
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (inMcpSettings) return
+      if (inSettings) return
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
         setSearch((value) => !value)
@@ -360,7 +369,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [navigate, inMcpSettings])
+  }, [navigate, inSettings])
   const toggleTheme = () => {
     const updateTheme = () => setTheme((current) => (current === 'light' ? 'dark' : 'light'))
     if (!document.startViewTransition || matchMedia('(prefers-reduced-motion: reduce)').matches) {
@@ -664,6 +673,18 @@ export default function App() {
         <Button
           variant="ghost"
           size="icon"
+          aria-label="设置"
+          title="设置"
+          onClick={() => {
+            setSidebar(false)
+            navigate('/settings/models', { state: { returnTo: route.pathname } })
+          }}
+        >
+          <Settings2 size={16} aria-hidden="true" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
           aria-label={theme === 'light' ? '切换深色主题' : '切换浅色主题'}
           onClick={toggleTheme}
         >
@@ -882,7 +903,7 @@ export default function App() {
   )
   const dockedDetails = !detailsOverlay && details
   const workspace = (
-    <div className="workspace" style={inMcpSettings ? { display: 'none' } : undefined}>
+    <div className="workspace" style={inSettings ? { display: 'none' } : undefined}>
       <WorkspaceSplit
         side="navigation"
         panel={mobile ? undefined : navigation}
@@ -1146,8 +1167,14 @@ export default function App() {
   )
   return (
     <>
-      {inMcpSettings && (
-        <McpSettings onBack={() => navigate(returnTo)} onConnection={() => setSettings(true)} />
+      {settingsPage && (
+        <SettingsLayout
+          page={settingsPage}
+          returnTo={returnTo}
+          onConnection={() => setSettings(true)}
+        >
+          {settingsPage === 'models' ? <ModelSettings /> : <McpSettings />}
+        </SettingsLayout>
       )}
       {workspace}
     </>

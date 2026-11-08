@@ -1,17 +1,7 @@
 import { useState } from 'react'
 import * as Dropdown from '@radix-ui/react-dropdown-menu'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import {
-  ArrowLeft,
-  ChevronDown,
-  CircleAlert,
-  Ellipsis,
-  Plug,
-  Plus,
-  RefreshCw,
-  Search,
-  Settings2,
-} from 'lucide-react'
+import { ChevronDown, CircleAlert, Ellipsis, Plug, Plus, RefreshCw, Search } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
 import { ApiError } from '@/lib/api'
@@ -19,7 +9,6 @@ import { errorMessage } from '@/lib/utils'
 import { mcpApi, type McpServer } from './api'
 import amapIcon from './amap.svg'
 import { McpEditor, transportLabel } from './editor'
-import './settings.css'
 
 const brands = { amap: { name: '高德地图', icon: amapIcon } }
 
@@ -200,13 +189,7 @@ function ServiceRow({
   )
 }
 
-export function McpSettings({
-  onBack,
-  onConnection,
-}: {
-  onBack: () => void
-  onConnection: () => void
-}) {
+export function McpSettings() {
   const list = useQuery({
     queryKey: ['mcp-servers'],
     queryFn: ({ signal }) => mcpApi.list(signal),
@@ -269,24 +252,7 @@ export function McpSettings({
     ),
   )
   return (
-    <div className="mcp-settings">
-      <aside className="mcp-nav" aria-label="设置导航">
-        <button type="button" className="mcp-nav-back" onClick={onBack}>
-          <ArrowLeft size={16} /> 返回工作台
-        </button>
-        <div className="mcp-nav-group">
-          <span>工作台</span>
-          <button type="button" onClick={onConnection}>
-            <Settings2 size={16} /> 本地连接
-          </button>
-        </div>
-        <div className="mcp-nav-group">
-          <span>集成</span>
-          <button type="button" aria-current="page">
-            <Plug size={16} /> MCP 服务
-          </button>
-        </div>
-      </aside>
+    <>
       <main className="mcp-panel">
         <div className="mcp-page">
           <header className="mcp-heading">
@@ -465,6 +431,6 @@ export function McpSettings({
           </div>
         </Dialog>
       )}
-    </div>
+    </>
   )
 }

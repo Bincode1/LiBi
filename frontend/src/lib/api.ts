@@ -29,14 +29,17 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
           : response.status === 502
             ? '无法连接 Runtime，请确认本地服务已启动。'
             : `Runtime 请求失败（${response.status}）。`
-    const errorField = path.startsWith('/v1/mcp/servers/')
-      ? 'mcp_error'
-      : response.status === 400 &&
-          (path.startsWith('/v1/workspaces?') ||
-            path === '/v1/sessions' ||
-            /^\/v1\/sessions\/[^/]+\/turns\/async$/.test(path))
-        ? 'workspace_error'
-        : undefined
+    const errorField =
+      path === '/v1/settings/model' || path === '/v1/settings/model/test'
+        ? 'model_error'
+        : path.startsWith('/v1/mcp/servers/')
+          ? 'mcp_error'
+          : response.status === 400 &&
+              (path.startsWith('/v1/workspaces?') ||
+                path === '/v1/sessions' ||
+                /^\/v1\/sessions\/[^/]+\/turns\/async$/.test(path))
+            ? 'workspace_error'
+            : undefined
     const payload: Record<string, unknown> | null = errorField
       ? await response.json().catch(() => null)
       : null
@@ -49,7 +52,7 @@ const post = <T>(path: string, body: unknown = {}) =>
   request<T>(path, { method: 'POST', body: JSON.stringify(body) })
 const sid = (id: string) => `/v1/sessions/${encodeURIComponent(id)}`
 export const liveClient: RuntimeClient = {
-  capabilities: { cancelTurn: true, approvals: true, changes: false, modelSelection: false },
+  capabilities: { cancelTurn: true, approvals: true, changes: false, modelSelection: true },
   health: (signal) => request('/v1/health', { signal }),
   sessions: async (signal) =>
     (await request<{ sessions: Session[] }>('/v1/sessions', { signal })).sessions,

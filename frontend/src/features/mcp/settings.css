@@ -11,7 +11,7 @@
   padding: 10px 13px;
 }
 
-.mcp-nav button {
+.mcp-nav :is(button, a) {
   display: flex;
   align-items: center;
   gap: 9px;
@@ -22,8 +22,8 @@
   color: var(--secondary);
 }
 
-.mcp-nav button:hover,
-.mcp-nav button[aria-current] {
+.mcp-nav :is(button, a):hover,
+.mcp-nav a[aria-current] {
   background: var(--hover);
   color: var(--foreground);
 }
@@ -532,17 +532,20 @@
   .mcp-nav {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 2px;
     padding: 7px 10px;
   }
-  .mcp-nav button {
+  .mcp-nav :is(button, a) {
     width: auto;
+    gap: 5px;
+    padding-inline: 6px;
   }
   .mcp-nav-group {
+    display: flex;
     margin: 0;
   }
-  .mcp-nav-group > span,
-  .mcp-nav-group:has([aria-current]) {
+  .mcp-nav-group > span {
     display: none;
   }
   .mcp-panel {

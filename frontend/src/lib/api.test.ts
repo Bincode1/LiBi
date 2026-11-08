@@ -14,6 +14,20 @@ it('never sends unsupported operations to a guessed endpoint', async () => {
   await expect(liveClient.changes('s')).rejects.toBeInstanceOf(CapabilityError)
   expect(fetchMock).not.toHaveBeenCalled()
 })
+it('shows safe model discovery failures without displaying provider diagnostics', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi
+      .fn()
+      .mockResolvedValue(
+        Response.json(
+          { model_error: '模型服务拒绝访问（HTTP 401）。', error: 'private-provider-diagnostic' },
+          { status: 422 },
+        ),
+      ),
+  )
+  await expect(request('/v1/settings/model/test')).rejects.toThrow('模型服务拒绝访问（HTTP 401）。')
+})
 it('requests cancellation of the active run in its own session', async () => {
   const fetchMock = vi
     .fn()

@@ -342,26 +342,47 @@ class OpenAICompatibleClient:
                 text_parts.append(f"[Image omitted: {source}, {width}x{height}]")
         return "\n".join(text_parts)
 
-    async def list_models(self) -> list[str]:
+    async def list_models(self, *, strict: bool = False, timeout: float = 15.0) -> list[str]:
         """Fetch available model IDs from the API's /v1/models endpoint.
 
-        Returns an empty list if the API key is missing or the request fails.
+        In strict mode, report provider failures separately from an empty catalog.
         """
         if not self.api_key:
+            if strict:
+                raise ValueError("An API key is required to list models.")
             return []
         headers = {
             "authorization": f"Bearer {self.api_key}",
             "user-agent": "LiBi/0.1.0",
         }
         url = self.base_url.rstrip("/") + "/models"
-        async with httpx.AsyncClient(timeout=15.0, http2=False) as client:
-            try:
+        try:
+            async with (
+                asyncio.timeout(timeout),
+                httpx.AsyncClient(timeout=timeout, http2=False, follow_redirects=False) as client,
+            ):
                 response = await client.get(url, headers=headers)
                 response.raise_for_status()
                 data = response.json()
-                return sorted(item["id"] for item in data.get("data", []))
-            except Exception:
-                return []
+                models = data.get("data") if isinstance(data, dict) else None
+                if not isinstance(models, list):
+                    raise ValueError("Invalid model catalog.")
+                return sorted(
+                    {
+                        model_id
+                        for item in models
+                        if isinstance(item, dict)
+                        and isinstance(model_id := item.get("id"), str)
+                        and model_id.strip()
+                    }
+                )
+        except (httpx.HTTPError, TimeoutError) as exc:
+            if strict:
+                raise self._classify_failure(exc) from None
+        except (ValueError, httpx.InvalidURL):
+            if strict:
+                raise ProviderRequestError("Invalid model catalog.", kind="protocol") from None
+        return []
 
     async def _parse_chunk(self, chunk: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         choices = chunk.get("choices") or []

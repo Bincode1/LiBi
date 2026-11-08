@@ -20,6 +20,7 @@ from mcp.types import ServerCapabilities
 from libi.bootstrap import build_tool_registry
 from libi.mcp.client import McpClientManager
 from libi.runtime.api import RuntimeApiServer
+from libi.runtime.model_settings import WorkbenchModelSettings
 from libi.session import SessionStore, TurnInProgressError
 
 pytestmark = pytest.mark.integration
@@ -76,6 +77,77 @@ def test_http_authentication_precedes_request_parsing(runtime_http, header):
     response = client.post("/v1/sessions", content=b"invalid", headers=headers)
     assert response.status_code == (400 if header in {"bearer", "x-api-key"} else 401)
     assert runtime.session_store.list_sessions() == []
+
+
+def test_workbench_model_settings_discover_save_and_use_new_connection(
+    runtime_http, tmp_path, monkeypatch
+):
+    runtime, client = runtime_http
+    root = "/v1/settings/model"
+    assert client.get(root).status_code == 404
+    settings_path = tmp_path / "workbench-model.json"
+    runtime._model_settings = WorkbenchModelSettings(settings_path)
+    assert client.get(root, headers={"x-api-key": ""}).status_code == 401
+    initial = client.get(root).json()
+    assert initial == {
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-flash",
+        "has_api_key": True,
+    }
+
+    sent = []
+    key = "synthetic-discovery-credential"
+    base_url = "https://models.test/gateway/v1"
+
+    async def provider(_transport, request):
+        sent.append(request)
+        if request.url.path.endswith("/models"):
+            if request.headers["authorization"] != f"Bearer {key}":
+                return httpx.Response(401, json={"error": request.headers["authorization"]})
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "catalog-chat"}, {"id": "catalog-chat"}, {"id": key}]},
+            )
+        chunk = {"choices": [{"delta": {"content": "Saved model works."}, "finish_reason": "stop"}]}
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        )
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", provider)
+    assert client.post(root + "/test", json={"base_url": base_url}).status_code == 400
+    assert not sent
+
+    invalid_key = "synthetic-invalid-credential"
+    failed = client.post(root + "/test", json={"base_url": base_url, "api_key": invalid_key})
+    assert failed.status_code == 422
+    assert "HTTP 401" in failed.json()["model_error"]
+    assert invalid_key not in failed.text
+
+    draft = {"base_url": base_url + "/", "api_key": key}
+    discovery = client.post(root + "/test", json=draft)
+    assert discovery.json() == {"models": ["catalog-chat"]}
+    assert sent[-1].url == f"{base_url}/models"
+    assert not settings_path.exists()
+    assert client.get(root).json() == initial
+
+    saved = client.post(root, json={**draft, "model": "catalog-chat"})
+    assert saved.json() == {"base_url": base_url, "model": "catalog-chat", "has_api_key": True}
+    assert key not in saved.text
+    runtime._model_settings = WorkbenchModelSettings(settings_path)
+    assert client.get(root).json() == saved.json()
+    assert client.post(root + "/test", json={"base_url": base_url}).json() == discovery.json()
+    assert client.post(root, json={"base_url": base_url, "model": "manual-chat"}).is_success
+
+    session = client.post("/v1/sessions").json()["id"]
+    result = client.post(f"/v1/sessions/{session}/turns", json={"message": "Hello"})
+    assert result.is_success, result.text
+    assert result.json()["text"] == "Saved model works."
+    assert sent[-1].url == f"{base_url}/chat/completions"
+    assert sent[-1].headers["authorization"] == f"Bearer {key}"
+    assert json.loads(sent[-1].content)["model"] == "manual-chat"
+    assert runtime.config.llm.model == initial["model"]
 
 
 def test_mcp_config_import_preserves_legacy_entries_and_credentials(runtime_http):
