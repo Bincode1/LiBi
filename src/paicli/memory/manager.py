@@ -6,6 +6,7 @@ import re
 import sqlite3
 import unicodedata
 from collections.abc import Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,7 +76,7 @@ class MemoryManager:
         now = _now_iso()
         content_hash = _hash_content(cleaned)
 
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute("begin immediate")
             self._purge_expired(conn)
             row = conn.execute(
@@ -143,7 +144,7 @@ class MemoryManager:
             kind_clause = " and kind = ?"
             params.append(_validate_metadata(kind, "kind"))
         params.append(normalized_limit)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             self._purge_expired(conn)
             rows = conn.execute(
                 f"""
@@ -193,7 +194,7 @@ class MemoryManager:
             kinds_clause = f" and kind in ({placeholders})"
             params.extend(sorted(normalized_kinds))
 
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             self._purge_expired(conn)
             rows = conn.execute(
                 f"""
@@ -237,7 +238,7 @@ class MemoryManager:
             return 0
 
         changed = 0
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             for start in range(0, len(normalized_ids), 500):
                 chunk = normalized_ids[start : start + 500]
                 placeholders = ", ".join("?" for _ in chunk)
@@ -253,7 +254,7 @@ class MemoryManager:
         return changed
 
     def stats(self) -> dict[str, Any]:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             self._purge_expired(conn)
             row = conn.execute(
                 """
@@ -291,7 +292,7 @@ class MemoryManager:
         }
 
     def delete(self, memory_id: int) -> bool:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 "delete from memories where scope = ? and id = ?",
                 (self.scope, int(memory_id)),
@@ -299,12 +300,17 @@ class MemoryManager:
             return bool(cursor.rowcount)
 
     def clear(self) -> int:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute("delete from memories where scope = ?", (self.scope,))
             return int(cursor.rowcount)
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
+            if conn.execute("pragma user_version").fetchone()[0] >= 1:
+                return
+            conn.execute("begin immediate")
+            if conn.execute("pragma user_version").fetchone()[0] >= 1:
+                return
             conn.execute(
                 """
                 create table if not exists memories (
@@ -362,6 +368,7 @@ class MemoryManager:
                 """
             )
             self._enforce_quota(conn)
+            conn.execute("pragma user_version = 1")
 
     def _normalize_and_deduplicate(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(f"select {_ENTRY_COLUMNS} from memories order by id").fetchall()

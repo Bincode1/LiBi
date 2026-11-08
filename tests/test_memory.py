@@ -8,6 +8,17 @@ import pytest
 from paicli.memory import MemoryManager
 
 
+def test_reopening_memory_for_recall_does_not_repeat_schema_migration(tmp_path, monkeypatch):
+    db_path = tmp_path / "memory.db"
+    MemoryManager(db_path, scope="project").save("remember this setting")
+
+    def unexpected_migration(*_args):
+        pytest.fail("recall should use the current schema without migrating it again")
+
+    monkeypatch.setattr(MemoryManager, "_normalize_and_deduplicate", unexpected_migration)
+    assert MemoryManager(db_path, scope="project").recall("setting")
+
+
 def test_legacy_schema_is_migrated_and_normalized_duplicates_are_merged(tmp_path):
     db_path = tmp_path / "memory.db"
     with sqlite3.connect(db_path) as conn:
