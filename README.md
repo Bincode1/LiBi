@@ -446,6 +446,7 @@ Runtime JSON 请求体上限为 1 MiB。
 实时客户端可订阅 `GET /v1/sessions/<session_id>/events/stream?cursor=<sequence>`。
 SSE 的 `page` 消息沿用 `events.json` 的数据结构，先重放历史，再推送新事件和文本预览。
 断开后使用最后收到的 `next_cursor` 重连。
+工作台在后台重查期间保留 Runtime 连接错误，健康检查成功后恢复会话同步。
 工作台使用 `view=conversation` 只接收会话界面所需的事件。游标覆盖已读取的历史，包括被筛除的诊断事件。
 会话列表和事件状态包含 `title`。使用 `POST /v1/sessions/<session_id>/title` 和
 `{"title":"新名称"}` 手动改名，事件流会同步 `session/title_updated`。

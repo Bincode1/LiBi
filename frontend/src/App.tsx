@@ -141,6 +141,9 @@ export default function App() {
     refetchOnReconnect: true,
   })
   const changes = useQuery({
+    // A cached placeholder keeps a failed first check visible during refetches.
+    initialData: null,
+    initialDataUpdatedAt: 0,
     queryKey: ['changes', id],
     queryFn: () => client.changes(id!),
     enabled: Boolean(id) && client.capabilities.changes,
@@ -161,11 +164,12 @@ export default function App() {
   const feed = useEventFeed(client, id, retry)
   const { refetch: checkHealth, isError: runtimeOffline } = health
   const connectionError = runtimeOffline ? errorMessage(health.error) : feed.error
-  const connectionSyncing = health.isPending || feed.syncing
+  const connectionSyncing = !runtimeOffline && (!runtimeReady || feed.syncing)
   const connectionLabel = runtimeOffline
     ? '连接异常'
     : feed.error
       ? '会话未同步'
+  const runtimeReady = health.isSuccess && health.data !== null
       : connectionSyncing
         ? '连接中'
         : '本地连接'
@@ -173,7 +177,7 @@ export default function App() {
     void checkHealth()
     void sessions.refetch()
     if (settings) void bridge.refetch()
-    if (id && feed.error) setRetry((value) => value + 1)
+    if (id && !runtimeOffline && feed.error) setRetry((value) => value + 1)
   }
   const permissionMode = id ? (feed.permissionMode ?? 'default') : newPermissionMode
   const turns = useMemo(
@@ -272,10 +276,10 @@ export default function App() {
     if (feed.error) void checkHealth()
   }, [checkHealth, feed.error])
   useEffect(() => {
-    if (previousRuntimeError.current && !runtimeOffline && feed.error)
+    if (previousRuntimeError.current && runtimeReady && feed.error)
       setRetry((value) => value + 1)
     previousRuntimeError.current = runtimeOffline
-  }, [runtimeOffline, feed.error])
+  }, [runtimeOffline, runtimeReady, feed.error])
   useEffect(() => {
     if (location.pathname === '/') navigate('/new', { replace: true })
   }, [navigate])
@@ -458,7 +462,7 @@ export default function App() {
     else window.dispatchEvent(new Event('paicli:focus'))
   }
   const addTask = async () => {
-    if (!taskPrompt.trim() || submitting || runtimeOffline || health.isPending) return
+    if (!taskPrompt.trim() || submitting || !runtimeReady) return
     setSubmitting(true)
     try {
       await client.addTask(taskPrompt.trim(), taskMode)
@@ -568,7 +572,7 @@ export default function App() {
         <strong>{project}</strong>
       </div>
       <div className="session-navigation">
-        {sessions.isLoading && (
+        {!runtimeOffline && sessions.isLoading && (
           <div className="sidebar-loading">
             <LoaderCircle size={15} className="spin" />
             加载会话…
@@ -581,7 +585,7 @@ export default function App() {
             <button onClick={reconnect}>重试</button>
           </div>
         )}
-        {!sessions.isLoading && !sessions.error && !sessions.data?.length && (
+        {!runtimeOffline && !sessions.isLoading && !sessions.error && !sessions.data?.length && (
           <p className="sidebar-empty">暂无会话</p>
         )}
         {Object.entries(grouped).map(([label, items]) => (
@@ -748,13 +752,13 @@ export default function App() {
               </section>
             ) : (
               <>
-                {feed.loading && !pending && (
+                {!runtimeOffline && feed.loading && !pending && (
                   <div className="loading-state">
                     <LoaderCircle className="spin" size={18} />
                     正在恢复会话…
                   </div>
                 )}
-                {!feed.loading && !feed.error && !busy && turns.length === 0 && (
+                {!runtimeOffline && !feed.loading && !feed.error && !busy && turns.length === 0 && (
                   <div className="empty-conversation">
                     <AgentMark />
                     <h2>准备就绪</h2>
@@ -1019,7 +1023,7 @@ export default function App() {
           <Button
             type="submit"
             size="sm"
-            disabled={!taskPrompt.trim() || submitting || runtimeOffline || health.isPending}
+            disabled={!taskPrompt.trim() || submitting || !runtimeReady}
           >
             <Plus size={14} />
             添加
