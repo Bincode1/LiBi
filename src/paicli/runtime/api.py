@@ -510,7 +510,8 @@ class RuntimeApiServer:
         try:
             cwd = self._turn_cwd(session_id)
             # Session selection does not extend the Runtime's trust for MCP configuration.
-            registry, _manager = await build_tool_registry(config=config, cwd=self.cwd)
+            registry, manager = await build_tool_registry(config=config, cwd=self.cwd)
+            await self.mcp.remember_discovered(manager)
             engine = QueryEngine(
                 llm_client=create_llm_client(config.llm, on_usage=record_usage),
                 tool_registry=registry,
@@ -1136,7 +1137,8 @@ class RuntimeApiServer:
                 f"task mode {task.mode!r} is no longer supported; recreate it as react or plan"
             )
         self._ensure_llm_key()
-        registry, _manager = await build_tool_registry(config=self.config, cwd=self.cwd)
+        registry, manager = await build_tool_registry(config=self.config, cwd=self.cwd)
+        await self.mcp.remember_discovered(manager)
         engine = QueryEngine(
             llm_client=create_llm_client(self.config.llm),
             tool_registry=registry,

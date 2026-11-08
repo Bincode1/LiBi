@@ -351,6 +351,8 @@ stdio 服务只继承 MCP SDK 的基础环境及该服务 `env` 中显式配置�
 Web 工作台侧栏的「连接器」可以查看 MCP 服务，并添加、编辑、测试、启停或删除用户级服务。
 也可以预览并导入含 `mcpServers` 的 JSON 配置。支持 STDIO、Streamable HTTP 和 SSE，
 项目级服务仍由项目配置和信任开关管理。
+保存后，列表会用接入域名或包名识别已知品牌，其余服务显示名称头像和来源。
+Runtime 连接成功后会补充服务端提供的可用图标，用户无需单独填写图片地址。
 
 连接已有 remote-debugging Chrome：
 

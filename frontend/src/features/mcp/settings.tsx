@@ -17,8 +17,51 @@ import { Dialog } from '@/components/ui/dialog'
 import { ApiError } from '@/lib/api'
 import { errorMessage } from '@/lib/utils'
 import { mcpApi, type McpServer } from './api'
+import amapIcon from './amap.svg'
 import { McpEditor, transportLabel } from './editor'
 import './settings.css'
+
+const brands = { amap: { name: '高德地图', icon: amapIcon } }
+
+function serviceTitle(server: McpServer) {
+  const brand = server.identity?.brand
+  return (brand && brands[brand].name) || server.identity?.title || server.name
+}
+
+function ServiceAvatar({ server, title }: { server: McpServer; title: string }) {
+  const [failed, setFailed] = useState<string[]>([])
+  const { brand, icons } = server.identity ?? {}
+  const fallback = brand && brands[brand].icon
+  const glyph = title.match(/[\p{L}\p{N}]/u)?.[0].toUpperCase() ?? '·'
+  const tone = Array.from(server.name).reduce(
+    (value, char) => (value + char.codePointAt(0)!) % 4,
+    0,
+  )
+  return (
+    <span className="mcp-service-icon" data-tone={tone} aria-hidden="true">
+      {(['light', 'dark'] as const).map((theme) => {
+        const source = [icons?.[theme], icons?.default, fallback].find(
+          (icon): icon is string => !!icon && !failed.includes(icon),
+        )
+        return (
+          <span className={`mcp-icon-${theme}`} key={theme}>
+            {source ? (
+              <img
+                alt=""
+                src={source}
+                width={24}
+                height={24}
+                onError={() => setFailed((previous) => [...previous, source])}
+              />
+            ) : (
+              glyph
+            )}
+          </span>
+        )
+      })}
+    </span>
+  )
+}
 
 function status(server: McpServer, autoStart: boolean) {
   if (server.blocked) return { label: '未受信任', tone: 'warning' }
@@ -57,17 +100,15 @@ function ServiceRow({
     : server.overridden
       ? '当前工作区使用同名的项目级配置。'
       : server.problem || server.check?.error
-  const target = server.config.type === 'stdio' ? server.config.command : server.config.url
+  const title = serviceTitle(server)
   const canTest = !server.blocked && !server.overridden && !!server.config.type
   return (
     <div className="mcp-service">
       <div className="mcp-service-row">
-        <span className="mcp-service-icon">
-          <Plug size={17} aria-hidden="true" />
-        </span>
+        <ServiceAvatar server={server} title={title} />
         <div className="mcp-service-copy">
           <div className="mcp-service-title">
-            <span>{server.name}</span>
+            <span title={server.name === title ? undefined : server.name}>{title}</span>
             <span className="mcp-state" data-tone={state.tone}>
               {state.label}
             </span>
@@ -76,7 +117,7 @@ function ServiceRow({
             {detail ||
               [
                 transportLabel(server.config.type),
-                target,
+                server.identity?.source,
                 server.check && `发现 ${server.check.tool_count} 个工具`,
               ]
                 .filter(Boolean)
@@ -86,12 +127,7 @@ function ServiceRow({
         {!server.blocked && (canWrite || canTest) && (
           <Dropdown.Root>
             <Dropdown.Trigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                disabled={pending}
-                aria-label={`管理 ${server.name}`}
-              >
+              <Button variant="ghost" size="icon" disabled={pending} aria-label={`管理 ${title}`}>
                 <Ellipsis size={18} />
               </Button>
             </Dropdown.Trigger>
@@ -206,8 +242,11 @@ export function McpSettings({
 
   const revision = list.data?.revision
   const servers = list.data?.servers ?? []
+  const searchTerm = filter.trim().toLowerCase()
   const matches = servers.filter((server) =>
-    server.name.toLowerCase().includes(filter.trim().toLowerCase()),
+    [server.name, serviceTitle(server), server.identity?.source].some((value) =>
+      value?.toLowerCase().includes(searchTerm),
+    ),
   )
   return (
     <div className="mcp-settings">

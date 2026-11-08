@@ -162,6 +162,38 @@
   color: var(--muted);
 }
 
+.mcp-service-row .mcp-service-icon {
+  background: color-mix(in srgb, var(--icon-tint, #7788bc) 13%, var(--surface));
+  color: var(--foreground);
+  font-weight: 650;
+}
+
+.mcp-service-icon[data-tone='1'] {
+  --icon-tint: #4d9c83;
+}
+
+.mcp-service-icon[data-tone='2'] {
+  --icon-tint: #ae7a42;
+}
+
+.mcp-service-icon[data-tone='3'] {
+  --icon-tint: #a87ca5;
+}
+
+.mcp-service-icon img {
+  display: block;
+  object-fit: contain;
+}
+
+.mcp-icon-dark,
+[data-theme='dark'] .mcp-icon-light {
+  display: none;
+}
+
+[data-theme='dark'] .mcp-icon-dark {
+  display: block;
+}
+
 .mcp-service-copy {
   flex: 1;
   min-width: 0;

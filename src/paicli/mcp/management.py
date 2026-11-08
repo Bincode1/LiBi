@@ -6,15 +6,18 @@ import math
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from mcp.types import Implementation
 
 from paicli.mcp.client import McpClientManager
 from paicli.mcp.config import (
     McpConfigConflict,
     McpConfigFile,
+    McpServerSpec,
     lock_mcp_config,
     mcp_config_path,
     missing_mcp_variables,
@@ -22,6 +25,7 @@ from paicli.mcp.config import (
     spec_from_raw,
     transport_type,
 )
+from paicli.mcp.identity import connection_identity, identity_key, server_icons
 from paicli.policy.redaction import Redactor
 
 _NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -178,6 +182,32 @@ class McpManagement:
         self.project_path = mcp_config_path(cwd)
         self.sensitive_values = sensitive_values
         self.checks: dict[tuple[str, str], tuple[dict, dict]] = {}
+        self._identities: dict[str, dict] = {}
+        self._identity_lock = Lock()
+
+    async def remember_discovered(self, manager: McpClientManager | None) -> None:
+        if manager is not None:
+            await asyncio.gather(
+                *(
+                    self._remember_identity(manager.specs[name], info)
+                    for name, info in manager.server_info.items()
+                )
+            )
+
+    async def _remember_identity(
+        self, spec: McpServerSpec, info: Implementation, *, refresh: bool = False
+    ) -> None:
+        key = identity_key(spec)
+        if not refresh and key in self._identities:
+            return
+        redactor = _redactor({"headers": spec.headers, "env": spec.env})
+        redactor.add_sensitive_values(self.sensitive_values)
+        title = redactor.clean(info.title or "").strip()[:100]
+        identity = {"title": title or None, "icons": await server_icons(info, spec.url)}
+        with self._identity_lock:
+            self._identities[key] = identity
+            if len(self._identities) > 64:
+                del self._identities[next(iter(self._identities))]
 
     def list(self, *, auto_start: bool) -> dict:
         trusted = project_mcp_trusted()
@@ -209,12 +239,18 @@ class McpManagement:
                     "config": {"type": "", "enabled": False},
                     "problem": None,
                     "check": None,
+                    "identity": None,
                 }
                 if not blocked:
                     try:
                         _validate(raw)
                         item["config"] = _public_config(raw, self.sensitive_values)
                         missing = missing_mcp_variables(raw)
+                        spec = spec_from_raw(name, raw, self.cwd)
+                        item["identity"] = {
+                            **connection_identity(spec),
+                            **self._identities.get(identity_key(spec), {}),
+                        }
                         if missing:
                             item["problem"] = f"缺少环境变量 {', '.join(missing)}。"
                     except (ValueError, TypeError) as exc:
@@ -313,6 +349,8 @@ class McpManagement:
                 manager = McpClientManager(self.cwd, load_config=False)
                 async with asyncio.timeout(min(spec.timeout, 10)):
                     discovered, _ = await manager.discover(spec)
+                if info := manager.server_info.get(spec.name):
+                    await self._remember_identity(spec, info, refresh=True)
                 redactor = _redactor({"env": spec.env, "headers": spec.headers})
                 redactor.add_sensitive_values(self.sensitive_values)
                 tools = [

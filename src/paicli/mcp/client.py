@@ -13,7 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from mcp.types import JSONRPCMessage, PaginatedRequestParams
+from mcp.types import Implementation, JSONRPCMessage, PaginatedRequestParams
 from pydantic import AnyUrl, ValidationError
 
 from paicli.mcp.config import McpServerSpec, load_mcp_server_specs, project_mcp_trusted
@@ -29,6 +29,7 @@ class McpClientManager:
             else {}
         )
         self.last_errors: dict[str, str] = {}
+        self.server_info: dict[str, Implementation] = {}
 
     async def load_tools(self) -> list[Tool]:
         tools: list[Tool] = []
@@ -53,7 +54,7 @@ class McpClientManager:
         return tools
 
     async def discover(self, spec: McpServerSpec):
-        async with self._session(spec) as session:
+        async with self._session(spec, remember_identity=True) as session:
             capabilities = session.get_server_capabilities()
             tools = []
             if capabilities.tools is not None:
@@ -220,7 +221,7 @@ class McpClientManager:
         ]
 
     @asynccontextmanager
-    async def _session(self, spec: McpServerSpec):
+    async def _session(self, spec: McpServerSpec, *, remember_identity: bool = False):
         if spec.type in {"stdio", "local"}:
             if not spec.command:
                 raise ValueError(f"MCP server {spec.name} is missing command")
@@ -239,7 +240,9 @@ class McpClientManager:
                         read, write, read_timeout_seconds=timedelta(seconds=spec.timeout)
                     ) as session,
                 ):
-                    await session.initialize()
+                    initialized = await session.initialize()
+                    if remember_identity:
+                        self.server_info[spec.name] = initialized.serverInfo
                     yield session
             return
         if spec.type in {"http", "streamable_http", "streamable-http"}:
@@ -262,7 +265,9 @@ class McpClientManager:
                     read_timeout_seconds=timedelta(seconds=spec.timeout),
                 ) as session,
             ):
-                await session.initialize()
+                initialized = await session.initialize()
+                if remember_identity:
+                    self.server_info[spec.name] = initialized.serverInfo
                 yield session
             return
         if spec.type == "sse":
@@ -280,7 +285,9 @@ class McpClientManager:
                     read, write, read_timeout_seconds=timedelta(seconds=spec.timeout)
                 ) as session,
             ):
-                await session.initialize()
+                initialized = await session.initialize()
+                if remember_identity:
+                    self.server_info[spec.name] = initialized.serverInfo
                 yield session
             return
         raise ValueError(f"Unsupported MCP transport: {spec.type}")

@@ -30,6 +30,12 @@ export interface McpServer {
   overridden: boolean
   problem: string | null
   check: McpCheck | null
+  identity?: {
+    source: string | null
+    brand: 'amap' | null
+    title?: string | null
+    icons?: Partial<Record<'default' | 'light' | 'dark', string>>
+  } | null
 }
 
 export interface McpInventory {

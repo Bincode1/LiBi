@@ -130,7 +130,14 @@ def test_mcp_management_discovers_and_registers_enabled_tools(runtime_http, tmp_
     script = tmp_path / "echo_server.py"
     script.write_text(
         "from mcp.server.fastmcp import FastMCP\n"
-        "server = FastMCP('test')\n"
+        "from mcp.types import Icon\n"
+        "from PIL import Image\n"
+        "from io import BytesIO\n"
+        "from base64 import b64encode\n"
+        "image = BytesIO()\n"
+        "Image.new('RGB', (24, 24), 'blue').save(image, format='PNG')\n"
+        "icon = Icon(src='data:image/png;base64,' + b64encode(image.getvalue()).decode())\n"
+        "server = FastMCP('test', icons=[icon])\n"
         "@server.tool()\n"
         "def echo(text: str) -> str:\n"
         "    return text\n"
@@ -147,9 +154,14 @@ def test_mcp_management_discovers_and_registers_enabled_tools(runtime_http, tmp_
         },
     )
     assert saved.is_success, saved.text
+    entry = client.get(root).json()["servers"][0]
+    assert entry["identity"]["source"] == Path(sys.executable).name
+    assert "icons" not in entry["identity"]
     check = client.post(root + "/test", json={"name": "echo", "scope": "user"})
     assert check.json()["error"] is None
     assert [tool["name"] for tool in check.json()["tools"]] == ["echo"]
+    entry = client.get(root).json()["servers"][0]
+    assert entry["identity"]["icons"]["default"].startswith("data:image/png;base64,")
 
     for enabled in (True, False):
         revision = client.get(root).json()["revision"]
@@ -161,8 +173,17 @@ def test_mcp_management_discovers_and_registers_enabled_tools(runtime_http, tmp_
                 "enabled": enabled,
             },
         ).is_success
-        registry, _ = asyncio.run(build_tool_registry(config=runtime.config, cwd=runtime.cwd))
+
+        async def load():
+            registry, manager = await build_tool_registry(config=runtime.config, cwd=runtime.cwd)
+            await runtime.mcp.remember_discovered(manager)
+            return registry
+
+        runtime.mcp._identities.clear()
+        registry = asyncio.run(load())
         assert ("mcp__echo__echo" in registry.list_names()) is enabled
+        identity = client.get(root).json()["servers"][0]["identity"]
+        assert bool(identity.get("icons")) is enabled
 
 
 def test_truncated_model_reply_preserves_text_without_executing_tools(
