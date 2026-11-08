@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, Bot, ChevronDown, ShieldCheck, Terminal } from 'lucide-react'
+import { ArrowLeft, Bot, ShieldCheck, Terminal } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Disclosure } from '@/components/ui/disclosure'
 import { AgentAvatar } from '@/features/conversation/agent-avatar'
 import { ConversationMarkdown } from '@/features/conversation/markdown'
 import { SubagentRow } from '@/features/conversation/subagent-activity'
@@ -21,13 +22,9 @@ function elapsed(agent: Subagent, now: number) {
 function ChildAssignment({ label, text }: { label: string; text: string }) {
   if (text.length > 180) {
     return (
-      <details className="child-assignment">
-        <summary>
-          <strong>{label}</strong>
-          <ChevronDown size={13} aria-hidden="true" />
-        </summary>
+      <Disclosure className="child-assignment" label={<strong>{label}</strong>}>
         <ConversationMarkdown text={text} />
-      </details>
+      </Disclosure>
     )
   }
   return (
@@ -55,23 +52,26 @@ function ChildTurn({ turn, index, active }: { turn: TurnView; index: number; act
       key: tool.id,
       sequence: tool.sequence ?? Infinity,
       content: (
-        <details className="child-tool">
-          <summary>
-            <Terminal size={13} aria-hidden="true" />
-            <span>{toolLabel(tool.name)}</span>
-            <small>
-              {tool.status === 'running'
-                ? active
-                  ? '进行中'
-                  : '无后续记录'
-                : tool.status === 'failed'
-                  ? '失败'
-                  : '已完成'}
-            </small>
-            <ChevronDown size={12} aria-hidden="true" />
-          </summary>
+        <Disclosure
+          className="child-tool"
+          label={
+            <>
+              <Terminal size={13} aria-hidden="true" />
+              <span className="child-tool-label">{toolLabel(tool.name)}</span>
+              <small>
+                {tool.status === 'running'
+                  ? active
+                    ? '进行中'
+                    : '无后续记录'
+                  : tool.status === 'failed'
+                    ? '失败'
+                    : '已完成'}
+              </small>
+            </>
+          }
+        >
           <pre>{tool.content || '暂无工具输出。'}</pre>
-        </details>
+        </Disclosure>
       ),
     })),
     ...(turn.steering ?? []).map((message) => ({

@@ -1,7 +1,16 @@
 /// <reference types="vite/client" />
 
+import { Terminal } from 'lucide-react'
 import { avatarRole, avatarRoles } from '@/lib/activity'
 import type { Subagent } from '@/lib/types'
+
+export function AgentMark() {
+  return (
+    <span className="agent-mark" aria-hidden="true">
+      <Terminal size={19} strokeWidth={1.9} />
+    </span>
+  )
+}
 
 export function AgentAvatar({ agent }: { agent: Pick<Subagent, 'role' | 'label'> }) {
   const role = avatarRole(agent)

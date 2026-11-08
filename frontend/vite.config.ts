@@ -63,7 +63,6 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         output: {
           manualChunks: {
-            markdown: ['streamdown'],
             primitives: ['@radix-ui/react-dialog', '@radix-ui/react-dropdown-menu'],
             framework: ['react', 'react-dom', 'react-router-dom', '@tanstack/react-query'],
           },

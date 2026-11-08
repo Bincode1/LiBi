@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Check, ShieldCheck, X } from 'lucide-react'
+import { Disclosure } from '@/components/ui/disclosure'
 import {
   Confirmation,
   ConfirmationAccepted,
@@ -34,6 +35,13 @@ export function ApprovalCard({
   const accepted = approval.status === 'approved'
   const input = approval.input ?? {}
   const inputKeys = Object.keys(input)
+  const fileAction =
+    approval.toolName === 'write_file'
+      ? '写入文件'
+      : approval.toolName === 'edit_file'
+        ? '编辑文件'
+        : undefined
+  const filePath = fileAction && typeof input.path === 'string' ? input.path : undefined
   let detail = approval.command
   if (inputKeys.length > 0) {
     detail =
@@ -86,9 +94,21 @@ export function ApprovalCard({
                 : '审批已失效'}
           </ConfirmationRejected>
         </strong>
-        {approval.toolName && <code>{approval.toolName}</code>}
+        {approval.toolName && !filePath && <code>{approval.toolName}</code>}
       </div>
-      {detail && <pre>{detail}</pre>}
+      {filePath && (
+        <p className="approval-target">
+          {fileAction} <code>{filePath}</code>
+        </p>
+      )}
+      {detail &&
+        (filePath ? (
+          <Disclosure className="approval-parameters" label="查看操作参数">
+            <pre>{detail}</pre>
+          </Disclosure>
+        ) : (
+          <pre>{detail}</pre>
+        ))}
       {canApprove ? (
         <ConfirmationActions className="approval-actions" aria-busy={deciding}>
           <ConfirmationAction
@@ -105,7 +125,7 @@ export function ApprovalCard({
           </ConfirmationAction>
         </ConfirmationActions>
       ) : (
-        <ConfirmationRequest>请在支持审批的入口处理。</ConfirmationRequest>
+        <ConfirmationRequest>当前无法提交审批。</ConfirmationRequest>
       )}
     </Confirmation>
   )

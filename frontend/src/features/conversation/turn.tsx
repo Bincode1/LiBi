@@ -1,19 +1,13 @@
 import { useId, useState, type ReactNode } from 'react'
-import {
-  Check,
-  ChevronDown,
-  ChevronRight,
-  CircleAlert,
-  Clock3,
-  Copy,
-  FileCode2,
-  LoaderCircle,
-  Terminal,
-} from 'lucide-react'
+import { Check, ChevronRight, CircleAlert, Clock3, Copy, LoaderCircle } from 'lucide-react'
+import * as m from 'motion/react-m'
+import { Disclosure, DisclosureChevron, Reveal } from '@/components/ui/disclosure'
 import { subagentLaunchFailure, toolLabel } from '@/lib/activity'
 import type { ToolView, TurnView } from '@/lib/events'
 import type { Subagent } from '@/lib/types'
+import { useSurfaceMotion } from '@/lib/motion'
 import { errorMessage } from '@/lib/utils'
+import { AgentMark } from './agent-avatar'
 import { ApprovalCard } from './approval'
 import { ConversationMarkdown } from './markdown'
 import { Delegation } from './subagent-activity'
@@ -27,13 +21,6 @@ const replyProgress = {
   ready: '',
 }
 
-export function AgentMark({ small = false }: { small?: boolean }) {
-  return (
-    <span className={`agent-mark ${small ? 'small' : ''}`}>
-      <Terminal size={small ? 13 : 19} strokeWidth={2.2} />
-    </span>
-  )
-}
 function ToolRow({
   tool,
   unmanaged,
@@ -59,7 +46,6 @@ function ToolRow({
         )}
       </span>
       <span>{toolLabel(tool.name)}</span>
-      <code>{tool.name}</code>
       <ChevronRight size={13} />
     </button>
   )
@@ -86,12 +72,14 @@ export function Turn({
   agentLabel?: (id: string) => string | undefined
 }) {
   const [expanded, setExpanded] = useState(false)
-  const [historyExpanded, setHistoryExpanded] = useState(false)
   const processId = useId()
   const [copied, setCopied] = useState(false)
+  const approvalMotion = useSurfaceMotion({ y: 5 }, 0.17)
+  const statusMotion = useSurfaceMotion({}, 0.12)
   const pendingApprovals = turn.approvals.filter((approval) => approval.status === 'pending')
   const pending = pendingApprovals.length > 0
   const handledApprovals = turn.approvals.filter((approval) => approval.status !== 'pending')
+  const deniedCount = handledApprovals.filter((approval) => approval.status === 'rejected').length
   const failedDelegations = turn.tools.filter(
     (tool) => delegationTools.has(tool.name) && tool.status === 'failed',
   )
@@ -168,9 +156,8 @@ export function Turn({
     <article className="turn">
       {turn.user && (
         <div className="user-message">
-          <div className="user-avatar">Y</div>
           <div>
-            <div className="message-label">你</div>
+            <div className="sr-only">你</div>
             <p>{turn.user}</p>
           </div>
         </div>
@@ -178,12 +165,11 @@ export function Turn({
       <div className="agent-message">
         <AgentMark />
         <div className="agent-body">
-          <div className="message-label agent-label">
-            PaiCLI <span>Agent</span>
-          </div>
+          <div className="message-label">PaiCLI</div>
           {(tools.length > 0 || drafts.length > 0) && (
             <div className="process">
               <button
+                type="button"
                 className="process-toggle"
                 aria-expanded={expanded}
                 aria-controls={processId}
@@ -203,40 +189,38 @@ export function Turn({
                       ? `已发起 ${workTools.length} 个步骤`
                       : activeTool
                         ? `正在${toolLabel(activeTool.name, '执行工具')} · ${workTools.length} 个步骤`
-                        : workTools.length
-                          ? `已执行 ${workTools.length} 个步骤`
-                          : '查看执行过程'}
+                        : deniedCount > 0
+                          ? `已记录 ${workTools.length} 个步骤`
+                          : workTools.length
+                            ? `已执行 ${workTools.length} 个步骤`
+                            : '查看执行过程'}
                 </span>
-                <ChevronDown size={13} className={expanded ? 'rotated' : ''} />
-                <span className="process-preview">
-                  <FileCode2 size={12} /> {workTools.filter((t) => t.name.includes('file')).length}{' '}
-                  个文件操作
-                </span>
+                <DisclosureChevron expanded={expanded} />
               </button>
-              <div
-                className="tool-list"
-                id={processId}
-                role="region"
-                aria-label="执行步骤"
-                tabIndex={0}
-                hidden={!expanded}
-              >
-                {expanded &&
-                  tools.map((tool) => (
-                    <ToolRow
-                      key={tool.id}
-                      tool={tool}
-                      unmanaged={unmanaged}
-                      onInspect={onInspect}
-                    />
-                  ))}
-                {expanded &&
-                  drafts.map((message) => (
-                    <details className="superseded-reply" key={message.id}>
-                      <summary>汇总前的回答</summary>
-                      <ConversationMarkdown text={message.text} />
-                    </details>
-                  ))}
+              <div id={processId}>
+                <Reveal open={expanded}>
+                  {expanded && (
+                    <div className="tool-list" role="region" aria-label="执行步骤" tabIndex={0}>
+                      {tools.map((tool) => (
+                        <ToolRow
+                          key={tool.id}
+                          tool={tool}
+                          unmanaged={unmanaged}
+                          onInspect={onInspect}
+                        />
+                      ))}
+                      {drafts.map((message) => (
+                        <Disclosure
+                          className="superseded-reply"
+                          label="汇总前的回答"
+                          key={message.id}
+                        >
+                          <ConversationMarkdown text={message.text} />
+                        </Disclosure>
+                      ))}
+                    </div>
+                  )}
+                </Reveal>
               </div>
             </div>
           )}
@@ -244,7 +228,7 @@ export function Turn({
             <div key={item.key}>{item.content}</div>
           ))}
           {pendingApprovals.map((approval) => (
-            <div key={approval.id} id={approval.id} tabIndex={-1}>
+            <m.div key={approval.id} id={approval.id} tabIndex={-1} {...approvalMotion}>
               <ApprovalCard
                 approval={approval}
                 agentLabel={
@@ -256,56 +240,60 @@ export function Turn({
                 onApprove={onApprove}
                 notify={notify}
               />
-            </div>
+            </m.div>
           ))}
           {handledApprovals.length > 0 && (
-            <details
+            <Disclosure
               className="approval-history"
-              onToggle={(event) => setHistoryExpanded(event.currentTarget.open)}
+              label={
+                <>
+                  {deniedCount > 0 ? (
+                    <CircleAlert size={13} aria-hidden="true" />
+                  ) : (
+                    <Check size={13} aria-hidden="true" />
+                  )}
+                  <span>
+                    {`已处理 ${handledApprovals.length} 项审批`}
+                    {deniedCount > 0 && ` · 拒绝 ${deniedCount} 项`}
+                  </span>
+                </>
+              }
             >
-              <summary>
-                <Check size={13} aria-hidden="true" />
-                <span>{`已处理 ${handledApprovals.length} 项审批`}</span>
-                <ChevronDown size={13} aria-hidden="true" />
-              </summary>
-              {historyExpanded && (
-                <div className="approval-history-content">
-                  {handledApprovals.map((approval) => (
-                    <ApprovalCard
-                      key={approval.id}
-                      approval={approval}
-                      canApprove={canApprove}
-                      onApprove={onApprove}
-                      notify={notify}
-                    />
-                  ))}
-                </div>
-              )}
-            </details>
+              <div className="approval-history-content">
+                {handledApprovals.map((approval) => (
+                  <ApprovalCard
+                    key={approval.id}
+                    approval={approval}
+                    canApprove={canApprove}
+                    onApprove={onApprove}
+                    notify={notify}
+                  />
+                ))}
+              </div>
+            </Disclosure>
           )}
           {progress && (
             <div className="thinking" role="status">
               <span />
               <span />
               <span />
-              <span className="thinking-label">{progress}</span>
+              <m.span className="thinking-label" key={progress} {...statusMotion}>
+                {progress}
+              </m.span>
             </div>
           )}
           {turn.status === 'failed' && (
             <div className="inline-failure" role="alert">
               <CircleAlert size={15} aria-hidden="true" />
               {turn.failureMessage ??
-                (turn.tools.length ? '本轮执行失败，可展开执行步骤查看详情。' : '本轮执行失败。')}
+                (tools.length || drafts.length
+                  ? '本轮执行失败，可展开执行步骤查看详情。'
+                  : '本轮执行失败。')}
             </div>
           )}
           {turn.status === 'canceled' && <p className="muted text-small">本轮执行已停止</p>}
           {turn.status === 'completed' && answers.length > 0 && (
             <div className="message-footer">
-              <span>
-                <Check size={12} />
-                已完成
-              </span>
-              {turn.tokens > 0 && <span>{turn.tokens.toLocaleString()} tokens</span>}
               <button aria-label="复制回答" title="复制回答" onClick={() => void copy()}>
                 {copied ? <Check size={14} /> : <Copy size={14} />}
               </button>

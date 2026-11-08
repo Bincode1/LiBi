@@ -60,11 +60,11 @@ it('groups handled approvals behind one closed disclosure and leaves pending req
     />,
   )
   expect(html).toContain('已处理 2 项审批')
-  const history = html.slice(html.indexOf('<details'))
-  expect(history).not.toMatch(/^<details[^>]*\bopen(?:[\s=>])/)
-  expect(history).not.toContain('first-command')
-  expect(history).not.toContain('pending-command')
-  expect(html.indexOf('pending-command')).toBeLessThan(html.indexOf('<details'))
+  const historyStart = html.indexOf('class="approval-history"')
+  expect(html.slice(historyStart)).toContain('aria-expanded="false"')
+  expect(html).not.toContain('first-command')
+  expect(html).not.toContain('second-command')
+  expect(html.slice(0, historyStart)).toContain('pending-command')
   expect(html).not.toContain('等待模型响应')
 })
 

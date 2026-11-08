@@ -1,18 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import {
-  ArrowUp,
-  ChevronDown,
-  CornerDownLeft,
-  GitBranch,
-  ListChecks,
-  LoaderCircle,
-  ShieldCheck,
-  Square,
-  Zap,
-} from 'lucide-react'
+import { ArrowUp, CircleAlert, LoaderCircle, ShieldCheck, Square } from 'lucide-react'
+import { AnimatePresence } from 'motion/react'
+import * as m from 'motion/react-m'
 import { Button } from '@/components/ui/button'
-import { Dropdown } from '@/components/ui/dropdown-menu'
+import { ChoiceMenu } from '@/components/ui/dropdown-menu'
+import { useSurfaceMotion } from '@/lib/motion'
 import type { Mode, PermissionMode } from '@/lib/types'
+import { ModePicker } from './mode-picker'
 export function Composer({
   draft,
   setDraft,
@@ -25,6 +19,8 @@ export function Composer({
   unmanagedRun,
   submitting,
   syncing,
+  connectionError,
+  onReconnect,
   canStop,
   stopping,
   onSend,
@@ -42,6 +38,8 @@ export function Composer({
   unmanagedRun: boolean
   submitting: boolean
   syncing: boolean
+  connectionError?: string
+  onReconnect?: () => void
   canStop: boolean
   stopping: boolean
   onSend: () => void
@@ -50,7 +48,9 @@ export function Composer({
 }) {
   const ref = useRef<HTMLTextAreaElement>(null)
   const [composing, setComposing] = useState(false)
-  const sendBlocked = submitting || syncing || changingPermission
+  const sendBlocked = submitting || syncing || changingPermission || Boolean(connectionError)
+  const actionMotion = useSurfaceMotion({ scale: 0.82 }, 0.14)
+  const action = submitting || stopping ? 'pending' : busy ? 'stop' : 'send'
   const permissionTiming = busy ? ' · 下一轮生效' : ''
   const permissionDescription =
     permissionMode === 'auto' ? '自动执行工具，可访问项目外路径' : '按当前策略审批操作'
@@ -67,6 +67,15 @@ export function Composer({
   }, [])
   return (
     <div className="composer-area">
+      {connectionError && (
+        <div className="composer-notice connection-notice" role="status">
+          <CircleAlert size={16} aria-hidden="true" />
+          <span>{connectionError}</span>
+          <Button type="button" variant="ghost" size="sm" onClick={onReconnect}>
+            重试连接
+          </Button>
+        </div>
+      )}
       <form
         className="composer"
         onSubmit={(e) => {
@@ -85,7 +94,7 @@ export function Composer({
                 : '描述你的想法，剩下的交给 PaiCLI…'
           }
           value={draft}
-          rows={2}
+          rows={1}
           onChange={(e) => setDraft(e.target.value)}
           onCompositionStart={() => setComposing(true)}
           onCompositionEnd={() => setComposing(false)}
@@ -104,104 +113,83 @@ export function Composer({
         />
         <div className="composer-toolbar">
           <div className="composer-options">
-            <Dropdown
-              trigger={
-                <Button variant="ghost" size="sm" className="mode-button">
-                  {mode === 'react' ? <Zap size={14} /> : <ListChecks size={14} />}
-                  <span>{mode === 'react' ? '智能执行' : '规划并执行'}</span>
-                  <ChevronDown size={12} />
-                </Button>
-              }
-              items={[
-                { label: '智能执行 · ReAct', onSelect: () => setMode('react') },
-                { label: '规划并执行 · Plan', onSelect: () => setMode('plan') },
-              ]}
+            <ModePicker
+              label="执行模式"
+              value={mode}
+              onValueChange={setMode}
+              className="mode-button"
             />
-            <Dropdown
-              trigger={
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className={`mode-button permission-button ${permissionMode === 'auto' ? 'full-access' : ''}`}
-                  aria-label="审批模式"
-                  disabled={sendBlocked}
-                  title={permissionDescription + permissionTiming}
-                >
-                  {changingPermission ? (
-                    <LoaderCircle size={14} className="spin" />
-                  ) : (
-                    <ShieldCheck size={14} />
-                  )}
-                  <span>{permissionMode === 'auto' ? '完全访问' : '默认审批'}</span>
-                  <ChevronDown size={12} />
-                </Button>
+            <ChoiceMenu
+              label="审批模式"
+              value={permissionMode}
+              onValueChange={setPermissionMode}
+              className={`mode-button permission-button ${permissionMode === 'auto' ? 'full-access' : ''}`}
+              disabled={sendBlocked}
+              title={permissionDescription + permissionTiming}
+              icon={
+                changingPermission ? (
+                  <LoaderCircle size={14} className="spin" aria-hidden="true" />
+                ) : (
+                  <ShieldCheck size={14} aria-hidden="true" />
+                )
               }
-              items={[
+              options={[
                 {
-                  label: '默认审批' + permissionTiming,
-                  onSelect: () => setPermissionMode('default'),
+                  value: 'default',
+                  label: '默认审批',
+                  description: busy ? '下一轮生效' : undefined,
                 },
                 {
-                  label: '完全访问 · 自动执行' + permissionTiming,
-                  onSelect: () => setPermissionMode('auto'),
+                  value: 'auto',
+                  label: '完全访问',
+                  description: '无需审批，可访问项目外路径' + permissionTiming,
                 },
               ]}
             />
-            <span className="composer-divider" />
-            <span className="model-label">Runtime 默认模型</span>
           </div>
           {unmanagedRun ? (
             <Button type="button" size="sm" onClick={onNewConversation}>
               新建会话
             </Button>
-          ) : busy ? (
-            <Button
-              type="button"
-              size="icon"
-              className="send-button"
-              disabled={!canStop || submitting || stopping}
-              title={stopping ? '正在停止' : canStop ? '停止执行' : '当前没有可停止的回合'}
-              aria-label={stopping ? '正在停止' : '停止执行'}
-              onClick={onStop}
-            >
-              {stopping ? (
-                <LoaderCircle size={17} className="spin" />
-              ) : (
-                <Square size={13} fill="currentColor" />
-              )}
-            </Button>
           ) : (
             <Button
               size="icon"
               className="send-button"
-              type="submit"
-              disabled={!draft.trim() || sendBlocked}
-              aria-label="发送消息"
+              type={busy ? 'button' : 'submit'}
+              disabled={busy ? !canStop || submitting || stopping : !draft.trim() || sendBlocked}
+              aria-label={busy ? (stopping ? '正在停止' : '停止执行') : '发送消息'}
+              title={
+                busy
+                  ? stopping
+                    ? '正在停止'
+                    : canStop
+                      ? '停止执行'
+                      : '当前没有可停止的回合'
+                  : 'Enter 发送，Shift + Enter 换行'
+              }
+              onClick={busy ? onStop : undefined}
             >
-              {submitting ? <LoaderCircle size={17} className="spin" /> : <ArrowUp size={19} />}
+              <span className="composer-action-icon" aria-hidden="true">
+                <AnimatePresence initial={false}>
+                  <m.span key={action} {...actionMotion}>
+                    {action === 'pending' ? (
+                      <LoaderCircle size={17} className="spin" />
+                    ) : action === 'stop' ? (
+                      <Square size={13} fill="currentColor" />
+                    ) : (
+                      <ArrowUp size={19} />
+                    )}
+                  </m.span>
+                </AnimatePresence>
+              </span>
             </Button>
           )}
         </div>
       </form>
-      <div className="composer-caption">
-        <span>
-          <GitBranch size={11} /> 当前项目
-        </span>
-        <span>
-          {unmanagedRun
-            ? '当前 Runtime 无法管理本轮运行'
-            : busy
-              ? '权限切换下一轮生效'
-              : permissionMode === 'auto'
-                ? '完全访问 · 工具自动执行，可访问项目外路径'
-                : '操作将在本地项目中执行'}
-        </span>
-        <span>
-          <CornerDownLeft size={11} />
-          发送 <span className="caption-shift">· Shift + Enter 换行</span>
-        </span>
-      </div>
+      {unmanagedRun && <p className="composer-notice">当前 Runtime 无法管理本轮运行</p>}
+      {!unmanagedRun && permissionMode === 'auto' && (
+        <p className="composer-notice">完全访问 · 自动执行，可访问项目外路径</p>
+      )}
     </div>
   )
 }

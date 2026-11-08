@@ -1,21 +1,18 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { useMatch, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { AnimatePresence, useReducedMotion } from 'motion/react'
+import * as m from 'motion/react-m'
 import {
   ArrowDown,
   ArrowRight,
-  BookOpen,
   ChevronDown,
   CircleAlert,
-  CircleHelp,
-  Clock3,
   Code2,
   Folder,
-  GitBranch,
   Inbox,
   LoaderCircle,
   Menu,
-  MessageSquare,
   Moon,
   PanelLeftClose,
   PanelRight,
@@ -26,25 +23,34 @@ import {
   ShieldCheck,
   Sparkles,
   Sun,
-  Terminal,
   X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
+import { Disclosure } from '@/components/ui/disclosure'
+import { AgentMark } from '@/features/conversation/agent-avatar'
 import { Composer } from '@/features/conversation/composer'
-import { AgentMark, Turn } from '@/features/conversation/turn'
+import { ModePicker } from '@/features/conversation/mode-picker'
 import { Details, type DetailsTab } from '@/features/workspace/details'
-import { SubagentsPane } from '@/features/workspace/subagents'
 import { useEventFeed } from '@/hooks/use-event-feed'
+import { useTabDrafts } from '@/hooks/use-tab-drafts'
 import { ApiError, liveClient, request } from '@/lib/api'
 import { projectTurns, resolveActiveRun, type PendingTurn, type ToolView } from '@/lib/events'
+import { useSurfaceMotion } from '@/lib/motion'
 import { errorMessage } from '@/lib/utils'
 import type { Mode, PermissionMode, Session, Subagent } from '@/lib/types'
 
 const client = liveClient
+const Turn = lazy(() => import('@/features/conversation/turn').then((m) => ({ default: m.Turn })))
+const SubagentsPane = lazy(() =>
+  import('@/features/workspace/subagents').then((m) => ({ default: m.SubagentsPane })),
+)
+const ConversationMarkdown = lazy(() =>
+  import('@/features/conversation/markdown').then((m) => ({ default: m.ConversationMarkdown })),
+)
 
-const navigationDrawer = '(max-width: 950px)'
-const detailsDrawer = '(max-width: 1275px)'
+const navigationDrawer = '(max-width: 760px)'
+const detailsDrawer = '(max-width: 1080px)'
 const maxTitleLength = 60
 const sessionTitle = (session: Pick<Session, 'id' | 'title'>) =>
   session.title || `会话 ${session.id.replace('session_', '').slice(0, 8)}`
@@ -52,14 +58,28 @@ const statusLabel = (status: string) =>
   ({
     queued: '排队中',
     running: '运行中',
+    canceling: '取消中',
     completed: '已完成',
     failed: '失败',
     canceled: '已取消',
   })[status] ?? status
+
+function TaskResult({ text }: { text: string }) {
+  return (
+    <Disclosure className="task-result" label="查看结果">
+      <Suspense fallback={<p role="status">正在加载结果…</p>}>
+        <ConversationMarkdown text={text} />
+      </Suspense>
+    </Disclosure>
+  )
+}
+
 export default function App() {
   const navigate = useNavigate(),
     queryClient = useQueryClient()
   const id = useMatch('/sessions/:id')?.params.id
+  const reducedMotion = useReducedMotion()
+  const toastMotion = useSurfaceMotion({ y: 8 }, 0.18)
   const [theme, setTheme] = useState(() =>
     localStorage.getItem('paicli-theme') === 'dark' ? 'dark' : 'light',
   )
@@ -67,16 +87,17 @@ export default function App() {
     [search, setSearch] = useState(false),
     [tasksOpen, setTasksOpen] = useState(false)
   const [searchTerm, setSearchTerm] = useState(''),
-    [details, setDetails] = useState(() => !matchMedia(detailsDrawer).matches),
+    [details, setDetails] = useState(false),
     [sidebar, setSidebar] = useState(false)
   const [renameDraft, setRenameDraft] = useState<string | null>(null)
   const [renaming, setRenaming] = useState(false)
   const [renameError, setRenameError] = useState('')
   const [mobile, setMobile] = useState(() => matchMedia(navigationDrawer).matches)
+  const [detailsOverlay, setDetailsOverlay] = useState(() => matchMedia(detailsDrawer).matches)
   const [detailsTab, setDetailsTab] = useState<DetailsTab>('changes')
   const [agentSelection, setAgentSelection] = useState<{ key: string; path: Subagent[] }>()
-  const [drafts, setDrafts] = useState<Record<string, string>>({}),
-    [mode, setMode] = useState<Mode>('react')
+  const [drafts, setDrafts] = useTabDrafts()
+  const [mode, setMode] = useState<Mode>('react')
   const [submitting, setSubmitting] = useState(false),
     [retry, setRetry] = useState(0),
     [notice, setNotice] = useState('')
@@ -85,10 +106,18 @@ export default function App() {
   const [cancelRequested, setCancelRequested] = useState<string>(),
     [tool, setTool] = useState<ToolView | null>(null),
     [taskPrompt, setTaskPrompt] = useState('')
+  const [taskMode, setTaskMode] = useState<Mode>('react')
   const [pendingTurns, setPendingTurns] = useState<Record<string, PendingTurn>>({})
   const [nearBottom, setNearBottom] = useState(true)
   const scrollRef = useRef<HTMLDivElement>(null),
     sendLock = useRef(false)
+  const searchInput = useRef<HTMLInputElement>(null)
+  const searchResults = useRef<HTMLDivElement>(null)
+  const navigationTrigger = useRef<HTMLButtonElement>(null)
+  const focusComposerAfterNavigation = useRef(false)
+  const detailsTrigger = useRef<HTMLButtonElement>(null)
+  const approvalFocus = useRef<string | null>(null)
+  const previousRuntimeError = useRef(false)
   const draftKey = id ?? 'new',
     draft = drafts[draftKey] ?? ''
   const setDraft = (value: string) => setDrafts((previous) => ({ ...previous, [draftKey]: value }))
@@ -101,6 +130,9 @@ export default function App() {
     queryKey: ['health'],
     queryFn: ({ signal }) => client.health(signal),
     retry: false,
+    refetchInterval: 4000,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
   })
   const changes = useQuery({
     queryKey: ['changes', id],
@@ -121,6 +153,22 @@ export default function App() {
   })
   const pending = pendingTurns[draftKey]
   const feed = useEventFeed(client, id, retry)
+  const { refetch: checkHealth, isError: runtimeOffline } = health
+  const connectionError = runtimeOffline ? errorMessage(health.error) : feed.error
+  const connectionSyncing = health.isPending || feed.syncing
+  const connectionLabel = runtimeOffline
+    ? '连接异常'
+    : feed.error
+      ? '会话未同步'
+      : connectionSyncing
+        ? '连接中'
+        : '本地连接'
+  const reconnect = () => {
+    void checkHealth()
+    void sessions.refetch()
+    if (settings) void bridge.refetch()
+    if (id && feed.error) setRetry((value) => value + 1)
+  }
   const permissionMode = id ? (feed.permissionMode ?? 'default') : newPermissionMode
   const turns = useMemo(
     () => projectTurns(feed.events, feed.preview, pending),
@@ -147,13 +195,16 @@ export default function App() {
     setDetailsTab('subagents')
     setDetails(true)
   }
+  const focusApproval = (approvalId: string) => {
+    const card = document.getElementById(approvalId)
+    card?.focus({ preventScroll: true })
+    card?.scrollIntoView({ block: 'nearest' })
+  }
   const showApproval = (approvalId: string) => {
-    if (matchMedia(detailsDrawer).matches) setDetails(false)
-    requestAnimationFrame(() => {
-      const card = document.getElementById(approvalId)
-      card?.focus({ preventScroll: true })
-      card?.scrollIntoView({ block: 'nearest' })
-    })
+    if (detailsOverlay) {
+      approvalFocus.current = approvalId
+      setDetails(false)
+    } else focusApproval(approvalId)
   }
   const optimistic = turns.find((turn) => turn.optimistic)
   const activeRun = resolveActiveRun(feed, pending)
@@ -165,13 +216,19 @@ export default function App() {
   const visibleSessions = useMemo(
     () =>
       (sessions.data ?? []).map((session) =>
-        session.id === id && feed.title && feed.cursor >= session.last_sequence
-          ? { ...session, title: feed.title }
+        session.id === id && feed.connectedAt !== undefined && feed.cursor >= session.last_sequence
+          ? { ...session, title: feed.title ?? session.title, status: feed.status }
           : session,
       ),
-    [sessions.data, id, feed.title, feed.cursor],
+    [sessions.data, id, feed.title, feed.status, feed.cursor, feed.connectedAt],
   )
   const current = visibleSessions.find((session) => session.id === id)
+  const searchQuery = searchTerm.trim().toLowerCase()
+  const searchMatches = search
+    ? visibleSessions.filter((session) =>
+        `${sessionTitle(session)} ${session.id}`.toLowerCase().includes(searchQuery),
+      )
+    : []
   const title = id ? sessionTitle(current ?? { id, title: feed.title }) : '新会话'
   const editedTitle = renameDraft?.trim().replace(/\s+/g, ' ') ?? ''
   const titleTooLong = [...editedTitle].length > maxTitleLength
@@ -181,16 +238,33 @@ export default function App() {
   const notify = (message: string) => setNotice(message)
   useEffect(() => {
     document.documentElement.dataset.theme = theme
+    const themeColor = getComputedStyle(document.documentElement).getPropertyValue('--background')
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', themeColor.trim())
     localStorage.setItem('paicli-theme', theme)
   }, [theme])
   useEffect(() => {
-    const resize = () => {
-      setMobile(matchMedia(navigationDrawer).matches)
-      if (matchMedia(detailsDrawer).matches) setDetails(false)
+    const navigationQuery = matchMedia(navigationDrawer)
+    const detailsQuery = matchMedia(detailsDrawer)
+    const updateNavigation = (event: MediaQueryListEvent) => {
+      setMobile(event.matches)
+      if (!event.matches) setSidebar(false)
     }
-    window.addEventListener('resize', resize)
-    return () => window.removeEventListener('resize', resize)
+    const updateDetails = (event: MediaQueryListEvent) => setDetailsOverlay(event.matches)
+    navigationQuery.addEventListener('change', updateNavigation)
+    detailsQuery.addEventListener('change', updateDetails)
+    return () => {
+      navigationQuery.removeEventListener('change', updateNavigation)
+      detailsQuery.removeEventListener('change', updateDetails)
+    }
   }, [])
+  useEffect(() => {
+    if (feed.error) void checkHealth()
+  }, [checkHealth, feed.error])
+  useEffect(() => {
+    if (previousRuntimeError.current && !runtimeOffline && feed.error)
+      setRetry((value) => value + 1)
+    previousRuntimeError.current = runtimeOffline
+  }, [runtimeOffline, feed.error])
   useEffect(() => {
     if (location.pathname === '/') navigate('/new', { replace: true })
   }, [navigate])
@@ -198,6 +272,7 @@ export default function App() {
     setTool(null)
     setAgentSelection(undefined)
     setRenameDraft(null)
+    if (!id) setDetails(false)
     setNearBottom(true)
     scrollRef.current?.scrollTo({ top: 0 })
   }, [id])
@@ -213,7 +288,7 @@ export default function App() {
       delete next[draftKey]
       return next
     })
-  }, [draftKey, pending, pendingFinished, optimistic?.status, optimistic?.id])
+  }, [draftKey, pending, pendingFinished, optimistic?.status, optimistic?.id, setDrafts])
   useEffect(() => {
     const viewport = scrollRef.current
     if (!nearBottom || !viewport) return
@@ -237,7 +312,6 @@ export default function App() {
         navigate('/new')
         window.dispatchEvent(new Event('paicli:focus'))
       }
-      if (event.key === 'Escape') setSidebar(false)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -246,6 +320,7 @@ export default function App() {
     navigate(`/sessions/${encodeURIComponent(sessionId)}`)
     setSidebar(false)
     setSearch(false)
+    setSearchTerm('')
   }
   const renameSession = async () => {
     if (!id || !editedTitle || titleTooLong || renaming) return
@@ -278,17 +353,25 @@ export default function App() {
     }
   }
   const send = async () => {
-    if (!draft.trim() || busy || feed.syncing || changingPermission || sendLock.current) return
+    if (
+      !draft.trim() ||
+      busy ||
+      connectionSyncing ||
+      connectionError ||
+      changingPermission ||
+      sendLock.current
+    )
+      return
     sendLock.current = true
     setSubmitting(true)
     const message = draft.trim(),
       key = draftKey
     const queued = { message, afterSequence: feed.cursor }
     setPendingTurns((previous) => ({ ...previous, [key]: queued }))
-    setDrafts((previous) => ({ ...previous, [key]: '' }))
     setNearBottom(true)
     let sessionId = id
     let submittedKey = key
+    let submittedDraftKey = key
     try {
       if (!sessionId) {
         const session = await client.createSession()
@@ -302,7 +385,15 @@ export default function App() {
           return next
         })
         void queryClient.invalidateQueries({ queryKey: ['sessions'] })
-        if (location.pathname === '/new') navigate(`/sessions/${encodeURIComponent(sessionId)}`)
+        if (location.pathname === '/new') {
+          submittedDraftKey = sessionId
+          setDrafts((previous) => ({
+            ...previous,
+            [session.id]: previous[key] ?? draft,
+            [key]: '',
+          }))
+          navigate(`/sessions/${encodeURIComponent(sessionId)}`)
+        }
       }
       const result = await client.send(sessionId, message, mode)
       const accepted = {
@@ -313,7 +404,10 @@ export default function App() {
       setPendingTurns((previous) =>
         previous[submittedKey] === queued ? { ...previous, [submittedKey]: accepted } : previous,
       )
-      if (feed.error) setRetry((value) => value + 1)
+      const acceptedDraftKey = submittedDraftKey
+      setDrafts((previous) =>
+        previous[acceptedDraftKey] === draft ? { ...previous, [acceptedDraftKey]: '' } : previous,
+      )
       void queryClient.invalidateQueries({ queryKey: ['sessions'] })
     } catch (error) {
       setPendingTurns((previous) => {
@@ -321,10 +415,7 @@ export default function App() {
         delete next[submittedKey]
         return next
       })
-      setDrafts((previous) => ({
-        ...previous,
-        [submittedKey]: previous[submittedKey] || message,
-      }))
+      void checkHealth()
       notify(errorMessage(error))
     } finally {
       sendLock.current = false
@@ -352,13 +443,14 @@ export default function App() {
   const openNewConversation = () => {
     navigate('/new')
     setSidebar(false)
-    window.dispatchEvent(new Event('paicli:focus'))
+    if (mobile && sidebar) focusComposerAfterNavigation.current = true
+    else window.dispatchEvent(new Event('paicli:focus'))
   }
   const addTask = async () => {
-    if (!taskPrompt.trim() || submitting) return
+    if (!taskPrompt.trim() || submitting || runtimeOffline || health.isPending) return
     setSubmitting(true)
     try {
-      await client.addTask(taskPrompt.trim(), mode)
+      await client.addTask(taskPrompt.trim(), taskMode)
       setTaskPrompt('')
       await tasks.refetch()
     } catch (error) {
@@ -376,125 +468,167 @@ export default function App() {
     return groups
   }, {})
   const project = health.data?.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? 'PaiCLI-Python'
-  return (
-    <div className={`workspace ${details ? 'with-details' : ''}`}>
-      {sidebar && (
-        <button className="sidebar-scrim" aria-label="关闭导航" onClick={() => setSidebar(false)} />
-      )}
-      <aside
-        className={`sidebar ${sidebar ? 'is-open' : ''}`}
-        aria-label="主导航"
-        inert={mobile && !sidebar}
-      >
-        <div className="brand-row">
-          <a
-            className="brand"
-            href="/new"
-            onClick={(e) => {
-              e.preventDefault()
-              navigate('/new')
-              setSidebar(false)
+  const SessionHeading = id ? 'h1' : 'span'
+  const detailPanel = details && (
+    <Details
+      changes={changes.data ?? []}
+      fileTools={turns.flatMap((turn) => turn.tools)}
+      tool={visibleTool}
+      tab={detailsTab}
+      onTab={setDetailsTab}
+      subagentCount={feed.subagents?.length ?? 0}
+      subagents={
+        <Suspense
+          fallback={
+            <div className="loading-state" role="status">
+              正在加载…
+            </div>
+          }
+        >
+          <SubagentsPane
+            key={draftKey}
+            agents={feed.subagents}
+            agent={visibleAgent}
+            rootId={id}
+            client={client}
+            approvals={approvals}
+            syncing={feed.syncing}
+            supported={feed.subagents !== undefined}
+            onApproval={showApproval}
+            onOpen={(agent) => {
+              if (visibleAgent) setAgentSelection({ key: draftKey, path: [...agentPath, agent] })
+              else openAgent(agent)
             }}
-          >
-            <AgentMark />
-            <span>
-              PaiCLI<span className="brand-period">.</span>
-            </span>
-          </a>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="sidebar-close"
-            aria-label="收起导航"
-            onClick={() => setSidebar(false)}
-          >
-            <PanelLeftClose size={16} />
-          </Button>
-        </div>
-        <Button variant="outline" className="new-chat" onClick={openNewConversation}>
-          <Plus size={17} />
-          新建会话<kbd>Ctrl ⇧ O</kbd>
+            onBack={() => setAgentSelection({ key: draftKey, path: agentPath.slice(0, -1) })}
+          />
+        </Suspense>
+      }
+      onClose={() => setDetails(false)}
+      onClearTool={() => setTool(null)}
+      onInspect={setTool}
+    />
+  )
+  const navigation = (
+    <aside className="sidebar" aria-label="主导航">
+      <div className="brand-row">
+        <a
+          className="brand"
+          href="/new"
+          onClick={(e) => {
+            e.preventDefault()
+            navigate('/new')
+            setSidebar(false)
+          }}
+        >
+          <AgentMark />
+          <span>PaiCLI</span>
+        </a>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="sidebar-close"
+          aria-label="收起导航"
+          onClick={() => setSidebar(false)}
+        >
+          <PanelLeftClose size={16} />
         </Button>
-        <nav className="primary-nav">
-          <button onClick={() => setSearch(true)}>
-            <Search size={16} />
-            搜索会话<kbd>Ctrl K</kbd>
-          </button>
-          <button onClick={() => setTasksOpen(true)}>
-            <Inbox size={16} />
-            后台任务
-          </button>
-        </nav>
-        <div className="project-heading">
-          <span>项目空间</span>
-        </div>
-        <div className="project-selector">
-          <div className="project-icon">
-            <Code2 size={16} />
+      </div>
+      <Button
+        variant="accent"
+        className="new-chat"
+        onClick={openNewConversation}
+        aria-keyshortcuts="Control+Shift+O"
+      >
+        <Plus size={17} />
+        新建会话
+      </Button>
+      <nav className="primary-nav">
+        <button onClick={() => setSearch(true)} aria-keyshortcuts="Control+K">
+          <Search size={16} />
+          搜索会话
+        </button>
+        <button onClick={() => setTasksOpen(true)}>
+          <Inbox size={16} />
+          后台任务
+        </button>
+      </nav>
+      <div className="project-selector" title={health.data?.cwd ?? project}>
+        <Folder size={15} aria-hidden="true" />
+        <strong>{project}</strong>
+      </div>
+      <div className="session-navigation">
+        {sessions.isLoading && (
+          <div className="sidebar-loading">
+            <LoaderCircle size={15} className="spin" />
+            加载会话…
           </div>
-          <div>
-            <strong>{project}</strong>
-            <span>本地项目</span>
+        )}
+        {sessions.error && !runtimeOffline && (
+          <div className="sidebar-error">
+            <CircleAlert size={15} />
+            <p>{errorMessage(sessions.error)}</p>
+            <button onClick={reconnect}>重试</button>
           </div>
-        </div>
-        <div className="session-navigation">
-          {sessions.isLoading && (
-            <div className="sidebar-loading">
-              <LoaderCircle size={15} className="spin" />
-              加载会话…
-            </div>
-          )}
-          {sessions.error && (
-            <div className="sidebar-error">
-              <CircleAlert size={15} />
-              <p>{errorMessage(sessions.error)}</p>
-              <button onClick={() => void sessions.refetch()}>重试连接</button>
-            </div>
-          )}
-          {!sessions.isLoading && !sessions.error && !sessions.data?.length && (
-            <p className="sidebar-empty">还没有会话，从一个想法开始。</p>
-          )}
-          {Object.entries(grouped).map(([label, items]) => (
-            <section className="session-group" key={label}>
-              <h3>{label}</h3>
-              {items.map((session) => (
-                <button
-                  className={`session-item ${session.id === id ? 'selected' : ''}`}
-                  aria-current={session.id === id ? 'page' : undefined}
-                  key={session.id}
-                  onClick={() => selectSession(session.id)}
-                >
-                  <MessageSquare size={14} />
-                  <span>{sessionTitle(session)}</span>
-                  {session.status === 'running' && <span className="status-dot pulse" />}
-                </button>
-              ))}
-            </section>
-          ))}
-        </div>
-        <div className="sidebar-bottom">
-          <button className="settings-nav" onClick={() => setSettings(true)}>
-            <Settings2 size={16} />
-            设置与连接
-            <span className={`connection-dot ${health.isError ? 'offline' : ''}`} />
-          </button>
-          <div className="profile-row">
-            <span className="profile-avatar">Y</span>
-            <div>
-              <strong>个人工作空间</strong>
-              <span>本地 Runtime</span>
-            </div>
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label={theme === 'light' ? '切换深色主题' : '切换浅色主题'}
-              onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-            >
-              {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
-            </Button>
-          </div>
-        </div>
-      </aside>
+        )}
+        {!sessions.isLoading && !sessions.error && !sessions.data?.length && (
+          <p className="sidebar-empty">暂无会话</p>
+        )}
+        {Object.entries(grouped).map(([label, items]) => (
+          <section className="session-group" key={label}>
+            <h3>{label}</h3>
+            {items.map((session) => (
+              <button
+                className={`session-item ${session.id === id ? 'selected' : ''}`}
+                aria-current={session.id === id ? 'page' : undefined}
+                title={sessionTitle(session)}
+                key={session.id}
+                onClick={() => selectSession(session.id)}
+              >
+                <span>{sessionTitle(session)}</span>
+                {session.status === 'running' && (
+                  <span className="status-dot pulse" aria-label="运行中" />
+                )}
+              </button>
+            ))}
+          </section>
+        ))}
+      </div>
+      <div className="sidebar-bottom">
+        <button className="settings-nav" onClick={() => setSettings(true)}>
+          <Settings2 size={16} />
+          设置与连接
+        </button>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={theme === 'light' ? '切换深色主题' : '切换浅色主题'}
+          onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+        >
+          {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
+        </Button>
+      </div>
+    </aside>
+  )
+  return (
+    <div className={`workspace ${details && !detailsOverlay ? 'with-details' : ''}`}>
+      {mobile ? (
+        <Dialog
+          open={sidebar}
+          onOpenChange={setSidebar}
+          title="主导航"
+          side="left"
+          restoreFocus={() => {
+            if (focusComposerAfterNavigation.current) {
+              focusComposerAfterNavigation.current = false
+              window.dispatchEvent(new Event('paicli:focus'))
+            } else navigationTrigger.current?.focus()
+          }}
+        >
+          {navigation}
+        </Dialog>
+      ) : (
+        navigation
+      )}
       <main className="main-panel">
         <header className="topbar">
           <div className="topbar-leading">
@@ -502,16 +636,16 @@ export default function App() {
               variant="ghost"
               size="icon"
               className="mobile-menu"
+              ref={navigationTrigger}
               aria-label="打开导航"
+              aria-haspopup="dialog"
               onClick={() => setSidebar(true)}
             >
               <Menu size={18} />
             </Button>
-            <span className="breadcrumb-project">{project}</span>
-            <span className="breadcrumb-slash">/</span>
-            <span className="breadcrumb-title" title={title}>
+            <SessionHeading className="breadcrumb-title" title={title}>
               {title}
-            </span>
+            </SessionHeading>
             {id && (
               <Button
                 variant="ghost"
@@ -531,17 +665,17 @@ export default function App() {
           <div className="topbar-actions">
             <button
               className="source-pill"
-              data-offline={health.isError ? true : undefined}
+              data-state={connectionError ? 'offline' : connectionSyncing ? 'pending' : 'ready'}
               onClick={() => setSettings(true)}
             >
-              <span />
-              {health.isError ? '连接异常' : health.isPending ? '连接中' : '本地连接'}
-              <ChevronDown size={11} />
+              <span aria-hidden="true" />
+              {connectionLabel}
+              <ChevronDown size={12} aria-hidden="true" />
             </button>
-            <span className="topbar-separator" />
             <Button
               variant="ghost"
               size="icon"
+              ref={detailsTrigger}
               aria-label={details ? '隐藏详情面板' : '显示详情面板'}
               aria-pressed={details}
               onClick={() => setDetails(!details)}
@@ -550,10 +684,6 @@ export default function App() {
             </Button>
           </div>
         </header>
-        <div className="live-info">
-          <span className="status-dot" data-offline={health.isError ? true : undefined} />
-          {health.isError ? 'Runtime 未连接，请检查设置' : '通过现有事件 API 同步执行状态'}
-        </div>
         <div
           className="conversation-scroll"
           ref={scrollRef}
@@ -565,13 +695,7 @@ export default function App() {
           <div className={`conversation-content ${!id && !pending ? 'welcome-content' : ''}`}>
             {!id && !pending ? (
               <section className="welcome">
-                <div className="welcome-symbol">
-                  <Terminal size={25} />
-                </div>
-                <h1>
-                  让想法，在项目里发生<span>。</span>
-                </h1>
-                <p>从一个问题、一段代码，或一个还没成形的想法开始。</p>
+                <h1>今天想做什么？</h1>
                 <div className="suggestions">
                   {[
                     {
@@ -593,74 +717,65 @@ export default function App() {
                     <button
                       key={item.title}
                       onClick={() => {
-                        setDraft(item.prompt)
+                        setDrafts((previous) => {
+                          const currentDraft = previous[draftKey]
+                          return {
+                            ...previous,
+                            [draftKey]: currentDraft?.trim()
+                              ? `${currentDraft.trimEnd()}\n\n${item.prompt}`
+                              : item.prompt,
+                          }
+                        })
                         window.dispatchEvent(new Event('paicli:focus'))
                       }}
                     >
-                      <item.icon size={19} />
+                      <item.icon size={16} aria-hidden="true" />
                       <span>{item.title}</span>
-                      <ArrowRight size={14} />
                     </button>
                   ))}
-                </div>
-                <div className="welcome-hint">
-                  <BookOpen size={13} />
-                  Agent 会使用当前 Runtime 配置的模型与工具
                 </div>
               </section>
             ) : (
               <>
-                <div className="conversation-heading">
-                  <h1>{title}</h1>
-                  <div>
-                    <Folder size={12} />
-                    {project}
-                    <span>·</span>
-                    <GitBranch size={12} />
-                    本地工作区
-                  </div>
-                </div>
                 {feed.loading && !pending && (
                   <div className="loading-state">
                     <LoaderCircle className="spin" size={18} />
                     正在恢复会话…
                   </div>
                 )}
-                {feed.error && (
-                  <div className="feed-error" role="alert">
-                    <CircleAlert size={16} />
-                    <span>{feed.error}</span>
-                    <Button variant="outline" size="sm" onClick={() => setRetry((v) => v + 1)}>
-                      重试
-                    </Button>
-                  </div>
-                )}
                 {!feed.loading && !feed.error && !busy && turns.length === 0 && (
                   <div className="empty-conversation">
                     <AgentMark />
                     <h2>准备就绪</h2>
-                    <p>向 PaiCLI 描述这个项目的下一步。</p>
                   </div>
                 )}
-                {turns.map((turn) => (
-                  <Turn
-                    key={turn.id}
-                    turn={turn}
-                    unmanaged={unmanagedRun || !busy}
-                    canApprove={client.capabilities.approvals}
-                    onApprove={approval}
-                    agents={agentsByTurn.get(turn.id)}
-                    onOpenAgent={openAgent}
-                    agentLabel={(agentId) =>
-                      feed.subagents?.find((agent) => agent.id === agentId)?.label
-                    }
-                    onInspect={(selected) => {
-                      setTool(selected)
-                      setDetails(true)
-                    }}
-                    notify={notify}
-                  />
-                ))}
+                <Suspense
+                  fallback={
+                    <div className="loading-state" role="status">
+                      正在加载对话…
+                    </div>
+                  }
+                >
+                  {turns.map((turn) => (
+                    <Turn
+                      key={turn.id}
+                      turn={turn}
+                      unmanaged={unmanagedRun || !busy}
+                      canApprove={client.capabilities.approvals && !runtimeOffline}
+                      onApprove={approval}
+                      agents={agentsByTurn.get(turn.id)}
+                      onOpenAgent={openAgent}
+                      agentLabel={(agentId) =>
+                        feed.subagents?.find((agent) => agent.id === agentId)?.label
+                      }
+                      onInspect={(selected) => {
+                        setTool(selected)
+                        setDetails(true)
+                      }}
+                      notify={notify}
+                    />
+                  ))}
+                </Suspense>
               </>
             )}
           </div>
@@ -674,7 +789,7 @@ export default function App() {
               setNearBottom(true)
               scrollRef.current?.scrollTo({
                 top: scrollRef.current.scrollHeight,
-                behavior: 'smooth',
+                behavior: reducedMotion ? 'instant' : 'smooth',
               })
             }}
           >
@@ -693,7 +808,9 @@ export default function App() {
           busy={busy}
           unmanagedRun={unmanagedRun}
           submitting={submitting}
-          syncing={feed.syncing}
+          syncing={connectionSyncing}
+          connectionError={connectionError}
+          onReconnect={reconnect}
           canStop={client.capabilities.cancelTurn && Boolean(id && runId)}
           stopping={stopping}
           onSend={() => void send()}
@@ -701,51 +818,41 @@ export default function App() {
           onNewConversation={openNewConversation}
         />
       </main>
-      {details && (
-        <Details
-          changes={changes.data ?? []}
-          tool={visibleTool}
-          tab={detailsTab}
-          onTab={setDetailsTab}
-          subagentCount={feed.subagents?.length ?? 0}
-          subagents={
-            <SubagentsPane
-              key={draftKey}
-              agents={feed.subagents}
-              agent={visibleAgent}
-              rootId={id}
-              client={client}
-              approvals={approvals}
-              syncing={feed.syncing}
-              supported={feed.subagents !== undefined}
-              onApproval={showApproval}
-              onOpen={(agent) => {
-                if (visibleAgent) setAgentSelection({ key: draftKey, path: [...agentPath, agent] })
-                else openAgent(agent)
-              }}
-              onBack={() => setAgentSelection({ key: draftKey, path: agentPath.slice(0, -1) })}
-            />
-          }
-          onClose={() => setDetails(false)}
-          onClearTool={() => setTool(null)}
-        />
+      {detailsOverlay ? (
+        <Dialog
+          open={details}
+          onOpenChange={setDetails}
+          title="工作详情"
+          side="right"
+          restoreFocus={() => {
+            const target = approvalFocus.current
+            approvalFocus.current = null
+            if (target) focusApproval(target)
+            else detailsTrigger.current?.focus()
+          }}
+        >
+          {detailPanel}
+        </Dialog>
+      ) : (
+        detailPanel
       )}
-      {notice && (
-        <div className="toast" role="status">
-          <CircleAlert size={16} />
-          <span>{notice}</span>
-          <button aria-label="关闭提示" onClick={() => setNotice('')}>
-            <X size={15} />
-          </button>
-        </div>
-      )}
+      <AnimatePresence>
+        {notice && (
+          <m.div className="toast" role="status" key="notice" {...toastMotion}>
+            <CircleAlert size={16} />
+            <span>{notice}</span>
+            <button aria-label="关闭提示" onClick={() => setNotice('')}>
+              <X size={15} />
+            </button>
+          </m.div>
+        )}
+      </AnimatePresence>
       <Dialog
         open={renameDraft !== null}
         onOpenChange={(open) => {
           if (!open && !renaming) setRenameDraft(null)
         }}
         title="重命名会话"
-        description="顶部、侧栏和搜索结果会显示这个名称。"
       >
         <form
           className="session-title-form"
@@ -781,52 +888,35 @@ export default function App() {
           </p>
         )}
       </Dialog>
-      <Dialog
-        open={settings}
-        onOpenChange={setSettings}
-        title="本地 Runtime 连接"
-        description="查看工作台连接状态和配置。"
-      >
+      <Dialog open={settings} onOpenChange={setSettings} title="本地 Runtime 连接">
         <div className="settings-section">
-          <h3>本地连接</h3>
           <div className="settings-status">
-            <span className={`connection-dot ${bridge.data?.configured ? '' : 'offline'}`} />
-            {bridge.isError
-              ? '无法读取桥接状态，请使用 pnpm dev 启动本地前端'
-              : bridge.isPending
-                ? '正在检查本地连接配置…'
-                : bridge.data?.configured
-                  ? '服务端访问凭据已配置'
-                  : '尚未配置本地服务端访问凭据'}
+            <span
+              className={`connection-dot ${connectionError ? 'offline' : ''}`}
+              aria-hidden="true"
+            />
+            {connectionLabel}
           </div>
-          <p>
-            在 <code>frontend/.env.local</code> 中设置 <code>PAICLI_WEB_RUNTIME_KEY</code>
-            ，然后重启前端。默认连接本机 24158 端口。
-          </p>
-          <p className="muted">密钥由本地代理注入，浏览器不接收或保存密钥。</p>
-        </div>
-        <div className="settings-section">
-          <h3>接口接入状态</h3>
-          <div className="capability-row">
-            <span>会话 / 历史 / 异步运行与停止 / 后台任务 / 文字增量 / 网页审批</span>
-            <span className="cap-ready">已接入</span>
-          </div>
-          <div className="capability-row">
-            <span>Diff</span>
-            <span className="cap-pending">待后端补齐</span>
-          </div>
+          {connectionError && <p>{connectionError}</p>}
+          {runtimeOffline && (
+            <ol className="connection-steps">
+              <li>
+                设置 <code>PAICLI_RUNTIME_API_KEY</code>，在项目根目录运行
+                <code className="command">uv run paicli serve --cwd .</code>
+              </li>
+              <li>
+                在 <code>frontend/.env.local</code> 中把 <code>PAICLI_WEB_RUNTIME_KEY</code>{' '}
+                设为同一凭据，再从前端目录运行
+                <code className="command">pnpm dev</code>
+              </li>
+            </ol>
+          )}
+          {runtimeOffline && bridge.isError && <p>请通过开发服务打开工作台，以启用本地桥接。</p>}
+          {!runtimeOffline && health.data && <p className="workspace-path">{health.data.cwd}</p>}
         </div>
         <div className="settings-footer">
-          <span>
-            <CircleHelp size={13} />
-            详细配置见 frontend/README.md
-          </span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-          >
-            {theme === 'light' ? <Moon size={14} /> : <Sun size={14} />}切换主题
+          <Button size="sm" onClick={reconnect} disabled={health.isFetching}>
+            {health.isFetching ? '检测中…' : '重新检测'}
           </Button>
         </div>
       </Dialog>
@@ -837,42 +927,51 @@ export default function App() {
           if (!open) setSearchTerm('')
         }}
         title="搜索会话"
-        description="按标题或会话 ID 查找最近的工作。"
+        description="按标题或 ID 查找最近 100 条会话。"
       >
         <div className="search-input">
           <Search size={18} />
           <input
-            autoFocus
+            ref={searchInput}
             placeholder="搜索你的会话…"
             aria-label="搜索会话"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || !searchMatches.length) return
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                selectSession(searchMatches[0].id)
+              } else if (e.key === 'ArrowDown') {
+                e.preventDefault()
+                searchResults.current?.querySelector('button')?.focus()
+              }
+            }}
           />
-          <kbd>ESC</kbd>
         </div>
-        <div className="search-results">
-          {visibleSessions
-            .filter((s) =>
-              `${sessionTitle(s)} ${s.id}`.toLowerCase().includes(searchTerm.toLowerCase()),
-            )
-            .map((session) => (
-              <button key={session.id} onClick={() => selectSession(session.id)}>
-                <MessageSquare size={16} />
-                <span>{sessionTitle(session)}</span>
-                <ArrowRight size={14} />
-              </button>
-            ))}
-          {!visibleSessions.some((s) =>
-            `${sessionTitle(s)} ${s.id}`.toLowerCase().includes(searchTerm.toLowerCase()),
-          ) && <p>没有找到匹配的会话。</p>}
+        <div className="search-results" ref={searchResults}>
+          {searchMatches.map((session) => (
+            <button
+              key={session.id}
+              onClick={() => selectSession(session.id)}
+              onKeyDown={(event) => {
+                if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+                event.preventDefault()
+                const row = event.currentTarget
+                const next =
+                  event.key === 'ArrowDown' ? row.nextElementSibling : row.previousElementSibling
+                if (next instanceof HTMLButtonElement) next.focus()
+                else if (event.key === 'ArrowUp') searchInput.current?.focus()
+              }}
+            >
+              <span>{sessionTitle(session)}</span>
+              <ArrowRight size={14} />
+            </button>
+          ))}
+          {searchMatches.length === 0 && <p>没有找到匹配的会话。</p>}
         </div>
       </Dialog>
-      <Dialog
-        open={tasksOpen}
-        onOpenChange={setTasksOpen}
-        title="后台任务"
-        description="提交任务，由本地 Runtime Worker 执行。"
-      >
+      <Dialog open={tasksOpen} onOpenChange={setTasksOpen} title="后台任务">
         <form
           className="task-form"
           onSubmit={(e) => {
@@ -886,7 +985,17 @@ export default function App() {
             aria-label="后台任务描述"
             placeholder="添加一个后台任务…"
           />
-          <Button size="sm" disabled={!taskPrompt.trim() || submitting}>
+          <ModePicker
+            label="后台任务执行模式"
+            value={taskMode}
+            onValueChange={setTaskMode}
+            className="task-mode"
+          />
+          <Button
+            type="submit"
+            size="sm"
+            disabled={!taskPrompt.trim() || submitting || runtimeOffline || health.isPending}
+          >
             <Plus size={14} />
             添加
           </Button>
@@ -910,11 +1019,10 @@ export default function App() {
           {tasks.data?.map((task) => (
             <div className="task-item" key={task.id}>
               <div>
-                <Clock3 size={15} />
                 <strong>{task.prompt}</strong>
                 <span className={`task-status ${task.status}`}>{statusLabel(task.status)}</span>
               </div>
-              {task.result && <p>{task.result}</p>}
+              {task.result && <TaskResult text={task.result} />}
               {task.error && (
                 <p className="inline-failure">任务执行失败，请检查本地 Runtime 日志。</p>
               )}
