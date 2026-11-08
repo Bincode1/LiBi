@@ -46,15 +46,21 @@ class Planner:
             raise ValueError("planner did not produce an execution plan")
         return plan
 
-    async def stream_plan(self, goal: str) -> AsyncIterator[dict[str, Any]]:
+    async def stream_plan(
+        self, goal: str, *, attachment_parts: list[dict[str, Any]] | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
         """Create a plan while preserving provider reasoning and usage events."""
         self.last_usage = Usage()
-        if _is_simple_goal(goal):
+        if not attachment_parts and _is_simple_goal(goal):
             yield {"type": "plan_created", "plan": _minimal_plan(goal)}
             return
 
         text = ""
-        messages = [Message(role="user", content=f"请为以下目标创建执行计划：\n{goal}")]
+        prompt = f"请为以下目标创建执行计划：\n{goal}"
+        content = (
+            [{"type": "text", "text": prompt}, *attachment_parts] if attachment_parts else prompt
+        )
+        messages = [Message(role="user", content=content)]
         async for event in self.llm_client.chat(messages, [], system_prompt=PLANNER_PROMPT):
             event_type = event.get("type")
             if event_type == "text_delta":

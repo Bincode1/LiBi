@@ -1,0 +1,77 @@
+.attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.composer > .attachment-list {
+  padding: 8px 10px 0;
+}
+
+.user-message .attachment-list {
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+.attachment-chip,
+.attachment-chip > :is(a, div) {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+}
+
+.attachment-chip {
+  max-width: min(220px, 100%);
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--secondary);
+  font-size: 12px;
+}
+
+.attachment-chip > a:hover,
+.attachment-chip > button:hover {
+  color: var(--primary);
+}
+
+.attachment-chip img {
+  width: 27px;
+  height: 27px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
+.attachment-chip svg {
+  flex-shrink: 0;
+}
+
+.attachment-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-chip button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  place-items: center;
+}
+
+.composer-attachment-notice {
+  margin: 8px 10px 0;
+  font-size: 12px;
+  color: var(--warning);
+}
+
+.composer-attachment-notice button {
+  color: var(--primary);
+  text-decoration: underline;
+}

@@ -392,6 +392,8 @@ class CompactionSerializer:
                     metadata = item.get("metadata") or {}
                     source = metadata.get("source", "image")
                     parts.append(f"[image omitted from compaction input: {source}]")
+                elif item.get("type") == "attachment":
+                    parts.append(f"[attachment: {item.get('name')}; id: {item.get('id')}]")
                 elif item.get("type") == "text":
                     parts.append(str(item.get("text") or ""))
                 else:

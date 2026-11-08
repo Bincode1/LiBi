@@ -34,6 +34,7 @@ class OpenAICompatibleClient:
     prompt_cache: bool = False
     price_profile: ModelPriceProfile | None = None
     on_usage: Callable[[Usage], None] | None = field(default=None, repr=False)
+    image_input: bool | None = None
 
     @property
     def model_name(self) -> str:
@@ -41,6 +42,8 @@ class OpenAICompatibleClient:
 
     @property
     def supports_images(self) -> bool:
+        if self.image_input is not None:
+            return self.image_input
         model = self.model.lower()
         provider = self.provider_name.lower()
         return any(marker in model for marker in ("vision", "image", "5v", "vl")) or (

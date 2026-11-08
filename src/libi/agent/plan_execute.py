@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from libi.attachments import AttachmentStore
 from libi.config import LiBiConfig
 from libi.llm.base import LlmClient, ProviderRequestError
 from libi.llm.pricing import calculate_costs
@@ -57,6 +58,7 @@ class PlanExecuteAgent:
         self.max_task_turns = max_task_turns
         self.session_store = session_store
         self.session_id = session_id
+        self._attachments: list[dict[str, Any]] = []
 
     async def run(
         self, message: str, *, turn_id: str | None = None
@@ -82,6 +84,14 @@ class PlanExecuteAgent:
         plan_request_id = f"req_{uuid.uuid4().hex}"
         answer: list[str] = []
         try:
+            self._attachments = next(
+                (
+                    event.payload["attachments"]
+                    for event in reversed(store.events(session_id, event_types=("user/message",)))
+                    if event.payload.get("attachments")
+                ),
+                [],
+            )
             store.append(
                 session_id, "step/started", {"mode": "plan"}, turn_id=turn_id, step_id=step_id
             )
@@ -184,6 +194,7 @@ class PlanExecuteAgent:
             store.append(session_id, status, failure, turn_id=turn_id)
             raise
         finally:
+            self._attachments = []
             if owns_turn:
                 store.release_turn(session_id, turn_id)
 
@@ -193,10 +204,23 @@ class PlanExecuteAgent:
         total_turns = 0
         final_text = ""
         try:
-            yield {"type": "text_delta", "text": f"正在规划任务：{message}\n\n"}
+            goal = message or "请分析本轮附件。"
+            yield {"type": "text_delta", "text": f"正在规划任务：{goal}\n\n"}
             yield {"type": "plan_status", "phase": "planning"}
             plan: ExecutionPlan | None = None
-            async for event in self.planner.stream_plan(message):
+            if self._attachments:
+                assert self.session_store is not None
+                store = AttachmentStore(self.session_store.db_path)
+                parts = store.prompt_parts(
+                    self._attachments,
+                    selected={(ref["session_id"], ref["id"]) for ref in self._attachments},
+                    supports_images=bool(getattr(self.llm_client, "supports_images", False)),
+                    clean_text=self.session_store.redactor.clean,
+                )
+                planning = self.planner.stream_plan(goal, attachment_parts=parts)
+            else:
+                planning = self.planner.stream_plan(goal)
+            async for event in planning:
                 if event.get("type") == "plan_created":
                     plan = event["plan"]
                     continue
@@ -399,7 +423,9 @@ class PlanExecuteAgent:
         turns = 0
         canceled = False
         try:
-            async with aclosing(worker.run(_task_context(plan, task))) as events:
+            async with aclosing(
+                worker.run(_task_context(plan, task), attachments=self._attachments)
+            ) as events:
                 async for event in events:
                     if event.get("type") == "text_delta":
                         text += str(event.get("text") or "")

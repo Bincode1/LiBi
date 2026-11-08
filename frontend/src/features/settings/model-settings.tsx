@@ -6,21 +6,23 @@ import { request } from '@/lib/api'
 import { errorMessage } from '@/lib/utils'
 import './model-settings.css'
 
-interface ModelConnection {
+export interface ModelConnection {
   base_url: string
   model: string
   has_api_key: boolean
+  image_input: boolean | null
+  supports_images: boolean
 }
 
-const endpoint = '/v1/settings/model'
-const queryKey = ['model-settings'] as const
+export const modelSettingsEndpoint = '/v1/settings/model'
+export const modelSettingsKey = ['model-settings'] as const
 const normalizeUrl = (value: string) => value.trim().replace(/\/+$/, '')
 
 export function ModelSettings() {
   const cache = useQueryClient()
   const settings = useQuery({
-    queryKey,
-    queryFn: ({ signal }) => request<ModelConnection>(endpoint, { signal }),
+    queryKey: modelSettingsKey,
+    queryFn: ({ signal }) => request<ModelConnection>(modelSettingsEndpoint, { signal }),
     retry: false,
   })
 
@@ -49,7 +51,7 @@ export function ModelSettings() {
         {settings.data && (
           <ModelForm
             current={settings.data}
-            onSaved={(saved) => cache.setQueryData(queryKey, saved)}
+            onSaved={(saved) => cache.setQueryData(modelSettingsKey, saved)}
           />
         )}
       </div>
@@ -67,6 +69,7 @@ function ModelForm({
   const [urlDraft, setUrlDraft] = useState<string>()
   const [key, setKey] = useState('')
   const [modelDraft, setModelDraft] = useState<string>()
+  const [imageInput, setImageInput] = useState<boolean | null>()
   const [models, setModels] = useState<string[]>([])
   const [busy, setBusy] = useState<'test' | 'save'>()
   const [feedback, setFeedback] = useState<{
@@ -76,6 +79,12 @@ function ModelForm({
   }>()
   const baseUrl = urlDraft ?? current.base_url
   const model = modelDraft ?? current.model
+  const imageMode =
+    imageInput !== undefined
+      ? imageInput
+      : model === current.model && normalizeUrl(baseUrl) === current.base_url
+        ? current.image_input
+        : null
   const reuseKey = current.has_api_key && normalizeUrl(baseUrl) === current.base_url
   const canTest = Boolean(baseUrl.trim() && (key.trim() || reuseKey))
 
@@ -85,12 +94,12 @@ function ModelForm({
     setFeedback(undefined)
     const data = {
       method: 'POST',
-      body: JSON.stringify({ base_url: baseUrl, api_key: key, model }),
+      body: JSON.stringify({ base_url: baseUrl, api_key: key, model, image_input: imageMode }),
     }
     try {
       if (action === 'test') {
         setModels([])
-        const result = await request<{ models: string[] }>(endpoint + '/test', data)
+        const result = await request<{ models: string[] }>(modelSettingsEndpoint + '/test', data)
         setModels(result.models)
         setFeedback({
           action,
@@ -99,10 +108,11 @@ function ModelForm({
             : '连接成功，服务返回了空列表。可以手动填写模型 ID。',
         })
       } else {
-        const saved = await request<ModelConnection>(endpoint, data)
+        const saved = await request<ModelConnection>(modelSettingsEndpoint, data)
         onSaved(saved)
         setUrlDraft(undefined)
         setModelDraft(undefined)
+        setImageInput(undefined)
         setKey('')
         setFeedback({ action, message: '已保存。下一轮对话将使用此配置。' })
       }
@@ -152,6 +162,7 @@ function ModelForm({
             const next = event.target.value
             setUrlDraft(next)
             setModelDraft(normalizeUrl(next) === current.base_url ? undefined : '')
+            setImageInput(undefined)
             setKey('')
             setModels([])
             setFeedback(undefined)
@@ -201,7 +212,10 @@ function ModelForm({
             <select
               id="available-models"
               value={models.includes(model) ? model : ''}
-              onChange={(event) => setModelDraft(event.target.value)}
+              onChange={(event) => {
+                setModelDraft(event.target.value)
+                setImageInput(undefined)
+              }}
             >
               <option value="" disabled>
                 从服务返回的模型中选择
@@ -223,10 +237,27 @@ function ModelForm({
           placeholder="例如 provider/model"
           autoCapitalize="none"
           spellCheck={false}
-          onChange={(event) => setModelDraft(event.target.value)}
+          onChange={(event) => {
+            setModelDraft(event.target.value)
+            setImageInput(undefined)
+          }}
           aria-describedby="model-id-hint"
         />
         <p id="model-id-hint">也可以手动填写。返回列表中的模型能否用于对话，以服务商支持为准。</p>
+        <label htmlFor="model-image-input">图片输入</label>
+        <select
+          id="model-image-input"
+          aria-describedby="model-image-hint"
+          value={imageMode === true ? 'enabled' : imageMode === false ? 'disabled' : 'auto'}
+          onChange={(event) =>
+            setImageInput(event.target.value === 'auto' ? null : event.target.value === 'enabled')
+          }
+        >
+          <option value="auto">自动识别</option>
+          <option value="enabled">支持图片</option>
+          <option value="disabled">仅文本</option>
+        </select>
+        <p id="model-image-hint">自定义服务请按模型实际能力设置。获取模型列表不会测试视觉能力。</p>
       </fieldset>
       <div className="model-footer">
         <p>保存到本机，供工作台后续对话使用。</p>

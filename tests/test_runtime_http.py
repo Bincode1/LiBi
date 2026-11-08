@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import os
 import shlex
@@ -16,7 +18,9 @@ from queue import Queue
 import httpx
 import pytest
 from mcp.types import ServerCapabilities
+from PIL import Image
 
+from libi.attachments import AttachmentStore
 from libi.bootstrap import build_tool_registry
 from libi.mcp.client import McpClientManager
 from libi.runtime.api import RuntimeApiServer
@@ -93,6 +97,8 @@ def test_workbench_model_settings_discover_save_and_use_new_connection(
         "base_url": "https://api.deepseek.com/v1",
         "model": "deepseek-flash",
         "has_api_key": True,
+        "image_input": None,
+        "supports_images": False,
     }
 
     sent = []
@@ -132,8 +138,14 @@ def test_workbench_model_settings_discover_save_and_use_new_connection(
     assert not settings_path.exists()
     assert client.get(root).json() == initial
 
-    saved = client.post(root, json={**draft, "model": "catalog-chat"})
-    assert saved.json() == {"base_url": base_url, "model": "catalog-chat", "has_api_key": True}
+    saved = client.post(root, json={**draft, "model": "catalog-chat", "image_input": True})
+    assert saved.json() == {
+        "base_url": base_url,
+        "model": "catalog-chat",
+        "has_api_key": True,
+        "image_input": True,
+        "supports_images": True,
+    }
     assert key not in saved.text
     runtime._model_settings = WorkbenchModelSettings(settings_path)
     assert client.get(root).json() == saved.json()
@@ -148,6 +160,121 @@ def test_workbench_model_settings_discover_save_and_use_new_connection(
     assert sent[-1].headers["authorization"] == f"Bearer {key}"
     assert json.loads(sent[-1].content)["model"] == "manual-chat"
     assert runtime.config.llm.model == initial["model"]
+
+
+def test_attachment_storage_accepts_a_long_user_profile_path(tmp_path):
+    store = AttachmentStore(tmp_path / ("nested-profile-" * 6) / "runtime.db")
+    record = store.add("session_test", "evidence.log", b"readable")
+    _, path = store.get("session_test", record["id"])
+    assert path.read_bytes() == b"readable"
+
+
+@pytest.mark.parametrize("mode", ["react", "plan"])
+def test_uploaded_attachments_reach_model_without_binary_in_history(
+    runtime_http, monkeypatch, mode
+):
+    runtime, client = runtime_http
+    session_id = client.post("/v1/sessions").json()["id"]
+    url = f"/v1/sessions/{session_id}"
+    headers = {"content-type": "application/octet-stream"}
+    image = io.BytesIO()
+    Image.new("RGB", (14, 9), "red").save(image, format="PNG")
+    picture = client.post(
+        f"{url}/attachments", params={"name": "截图.png"}, headers=headers, content=image.getvalue()
+    )
+    log = client.post(
+        f"{url}/attachments",
+        params={"name": "worker.log"},
+        headers=headers,
+        content=("first line\n" + "\n".join(f"job {i}" for i in range(2, 100))).encode(),
+    )
+    assert picture.status_code == log.status_code == 201
+    assert (
+        client.post(
+            f"{url}/attachments", params={"name": "bad.png"}, headers=headers, content=b"bad"
+        ).status_code
+        == 400
+    )
+    picture_id, log_id = picture.json()["id"], log.json()["id"]
+    ids = [picture_id, log_id]
+    assert client.get(f"{url}/attachments/{picture_id}").content == image.getvalue()
+    other_id = client.post("/v1/sessions").json()["id"]
+    assert client.get(f"/v1/sessions/{other_id}/attachments/{picture_id}").status_code == 404
+    assert (
+        client.post(f"/v1/sessions/{other_id}/turns", json={"attachment_ids": ids}).status_code
+        == 400
+    )
+    blocked = client.post(f"{url}/turns", json={"attachment_ids": ids, "mode": mode})
+    assert blocked.status_code == 400 and "图片输入" in blocked.json()["attachment_error"]
+
+    runtime.config.llm.image_input = True
+    requests = []
+
+    async def provider(_transport, request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if "任务规划器" in payload["messages"][0]["content"]:
+            answer = json.dumps(
+                {
+                    "tasks": [
+                        {"id": "inspect", "description": "Inspect evidence", "type": "ANALYSIS"}
+                    ]
+                }
+            )
+            delta = {"content": answer}
+            reason = "stop"
+        elif any(msg["role"] == "tool" for msg in payload["messages"]):
+            assert any(
+                "90: job 90" in msg["content"]
+                for msg in payload["messages"]
+                if msg["role"] == "tool"
+            )
+            delta = {"content": "Evidence verified."}
+            reason = "stop"
+        else:
+            assert any(tool["function"]["name"] == "read_attachment" for tool in payload["tools"])
+            delta = {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_read_attachment",
+                        "type": "function",
+                        "function": {
+                            "name": "read_attachment",
+                            "arguments": json.dumps({"attachment_id": log_id, "start_line": 90}),
+                        },
+                    }
+                ]
+            }
+            reason = "tool_calls"
+        chunk = json.dumps({"choices": [{"delta": delta, "finish_reason": reason}]})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=f"data: {chunk}\n\ndata: [DONE]\n\n".encode(),
+        )
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", provider)
+    result = client.post(f"{url}/turns", json={"attachment_ids": ids, "mode": mode})
+    assert result.is_success, result.text
+    assert "Evidence verified." in result.json()["text"]
+    for request in requests:
+        parts = [
+            part
+            for msg in request["messages"]
+            if isinstance(msg["content"], list)
+            for part in msg["content"]
+        ]
+        image_url = next(part["image_url"]["url"] for part in parts if part["type"] == "image_url")
+        prefix, data = image_url.split(",", 1)
+        assert prefix == "data:image/jpeg;base64"
+        with Image.open(io.BytesIO(base64.b64decode(data))) as encoded:
+            assert encoded.size == (14, 9)
+        assert any("1: first line" in part.get("text", "") for part in parts)
+    history = client.get(f"{url}/events.json").json()["events"]
+    user = next(event for event in history if event["type"] == "user/message")
+    assert [item["id"] for item in user["payload"]["attachments"]] == ids
+    assert "data:image" not in json.dumps(history)
 
 
 def test_mcp_config_import_preserves_legacy_entries_and_credentials(runtime_http):

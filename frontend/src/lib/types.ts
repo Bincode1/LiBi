@@ -89,6 +89,13 @@ export interface ChangeFile {
   removed: number
   lines: { kind: 'context' | 'add' | 'remove'; text: string; number?: number }[]
 }
+export interface Attachment {
+  id: string
+  name: string
+  media_type: string
+  size: number
+  session_id: string
+}
 export interface RuntimeClient {
   capabilities: Capabilities
   health(signal?: AbortSignal): Promise<{ status: string; cwd: string }>
@@ -108,7 +115,9 @@ export interface RuntimeClient {
     id: string,
     message: string,
     mode: Mode,
+    attachmentIds?: string[],
   ): Promise<{ run_id: string; turn_id?: string; after_sequence?: number }>
+  uploadAttachment(id: string, file: File): Promise<Attachment>
   cancelTurn(id: string, runId: string): Promise<void>
   setPermissionMode(id: string, mode: PermissionMode): Promise<{ mode: PermissionMode }>
   decideApproval(id: string, approvalId: string, decision: 'approve' | 'deny'): Promise<void>

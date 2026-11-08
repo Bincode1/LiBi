@@ -1,4 +1,4 @@
-import type { RuntimeClient, EventPage, Session, Task } from './types'
+import type { Attachment, RuntimeClient, EventPage, Session, Task } from './types'
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -32,18 +32,23 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const errorField =
       path === '/v1/settings/model' || path === '/v1/settings/model/test'
         ? 'model_error'
-        : path.startsWith('/v1/mcp/servers/')
-          ? 'mcp_error'
-          : response.status === 400 &&
-              (path.startsWith('/v1/workspaces?') ||
-                path === '/v1/sessions' ||
-                /^\/v1\/sessions\/[^/]+\/turns\/async$/.test(path))
-            ? 'workspace_error'
-            : undefined
+        : /^\/v1\/sessions\/[^/]+\/attachments(?:\?|\/|$)/.test(path)
+          ? 'attachment_error'
+          : path.startsWith('/v1/mcp/servers/')
+            ? 'mcp_error'
+            : response.status === 400 &&
+                (path.startsWith('/v1/workspaces?') ||
+                  path === '/v1/sessions' ||
+                  /^\/v1\/sessions\/[^/]+\/turns\/async$/.test(path))
+              ? 'workspace_error'
+              : undefined
     const payload: Record<string, unknown> | null = errorField
       ? await response.json().catch(() => null)
       : null
-    const message = errorField && payload?.[errorField]
+    const message =
+      errorField &&
+      (payload?.[errorField] ??
+        (errorField === 'workspace_error' ? payload?.attachment_error : undefined))
     throw new ApiError(response.status, typeof message === 'string' ? message : fallback)
   }
   return response.json() as Promise<T>
@@ -51,6 +56,8 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 const post = <T>(path: string, body: unknown = {}) =>
   request<T>(path, { method: 'POST', body: JSON.stringify(body) })
 const sid = (id: string) => `/v1/sessions/${encodeURIComponent(id)}`
+export const attachmentUrl = (attachment: Attachment) =>
+  `${sid(attachment.session_id)}/attachments/${encodeURIComponent(attachment.id)}`
 export const liveClient: RuntimeClient = {
   capabilities: { cancelTurn: true, approvals: true, changes: false, modelSelection: true },
   health: (signal) => request('/v1/health', { signal }),
@@ -105,8 +112,20 @@ export const liveClient: RuntimeClient = {
         }
       })
     }),
-  send: (id, message, mode) =>
-    post(`${sid(id)}/turns/async`, { message, mode, interactive_approval: true }),
+  send: (id, message, mode, attachmentIds) =>
+    post(`${sid(id)}/turns/async`, {
+      message,
+      mode,
+      interactive_approval: true,
+      ...(attachmentIds?.length ? { attachment_ids: attachmentIds } : {}),
+    }),
+  uploadAttachment: async (id, file) => {
+    const record = await request<Omit<Attachment, 'session_id'>>(
+      `${sid(id)}/attachments?${new URLSearchParams({ name: file.name })}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file },
+    )
+    return { ...record, session_id: id }
+  },
   setPermissionMode: (id, mode) => post(`${sid(id)}/permissions`, { mode }),
   cancelTurn: async (id, runId) => {
     try {

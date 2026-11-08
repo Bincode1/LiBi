@@ -30,6 +30,7 @@ export function avatarRole(agent: Pick<Subagent, 'role' | 'label'>): AvatarRole 
 
 const toolLabels = new Map([
   ['read_file', '读取项目文件'],
+  ['read_attachment', '读取对话附件'],
   ['write_file', '更新相关文件'],
   ['edit_file', '编辑文件'],
   ['bash', '执行命令'],

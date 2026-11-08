@@ -1,4 +1,4 @@
-import type { ActiveRun, AssistantPreview, RuntimeEvent } from './types'
+import type { ActiveRun, AssistantPreview, Attachment, RuntimeEvent } from './types'
 export interface ToolView {
   id: string
   name: string
@@ -34,6 +34,7 @@ export interface TurnUsage {
 export interface TurnView {
   id: string
   user: string
+  attachments?: Attachment[]
   messages: MessageView[]
   steering?: { id: string; text: string; sequence: number }[]
   tools: ToolView[]
@@ -46,6 +47,8 @@ export interface TurnView {
 }
 export interface PendingTurn {
   message: string
+  attachments?: Attachment[]
+  files?: File[]
   afterSequence: number
   run?: { id: string; turnId?: string; acceptedAt: number }
 }
@@ -165,7 +168,10 @@ export function projectTurns(
           text: String(p.content ?? ''),
           sequence: event.sequence,
         })
-      } else if (!turn.user) turn.user = String(p.content ?? '')
+      } else if (!turn.user && !turn.attachments?.length) {
+        turn.user = String(p.content ?? '')
+        if (Array.isArray(p.attachments)) turn.attachments = p.attachments as Attachment[]
+      }
     }
     if (event.type === 'step/started') turn.replyPhase = 'waiting'
     if (event.type === 'assistant/message') {
@@ -299,13 +305,15 @@ export function projectTurns(
   if (pending) {
     const start = findPendingStart(events, pending)
     const turn = start?.turn_id ? turns.get(start.turn_id) : undefined
-    if (turn && !turn.user) {
+    if (turn && !turn.user && !turn.attachments?.length) {
       turn.user = pending.message
+      turn.attachments = pending.attachments
       turn.optimistic = true
     } else if (!turn) {
       turns.set('pending', {
         id: 'pending',
         user: pending.message,
+        attachments: pending.attachments,
         status: 'running',
         replyPhase: 'starting',
         messages: [],
@@ -317,7 +325,13 @@ export function projectTurns(
   }
   return [...turns.values()].filter(
     (t) =>
-      t.user || t.messages.length || t.tools.length || t.approvals.length || t.status === 'failed',
+      t.user ||
+      t.attachments?.length ||
+      t.messages.length ||
+      t.tools.length ||
+      t.approvals.length ||
+      t.status === 'failed' ||
+      t.optimistic,
   )
 }
 

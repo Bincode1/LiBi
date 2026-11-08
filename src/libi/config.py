@@ -39,6 +39,7 @@ class LlmConfig:
     temperature: float = 0.7
     thinking_enabled: bool = False
     timeout: float = 120.0
+    image_input: bool | None = None
 
 
 @dataclass(slots=True)

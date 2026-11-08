@@ -292,23 +292,29 @@ class ContextProjector:
                 message = self._message_from_event(event)
                 if event.event_type == "user/message":
                     submitted_at = event.payload.get("submitted_at_local")
-                    if isinstance(submitted_at, str) and isinstance(message.content, str):
+                    if isinstance(submitted_at, str):
                         # Keep each timestamp with its original message across model requests.
-                        message.content += (
+                        timestamp = (
                             '\n\n<runtime-context trust="generated">\n'
                             f"User message time: {submitted_at}\n"
                             "</runtime-context>"
                         )
+                        if isinstance(message.content, str):
+                            message.content += timestamp
+                        else:
+                            message.content.append({"type": "text", "text": timestamp})
                 if (
                     event.event_type == "user/message"
                     and event.turn_id == turn_id
                     and candidate_contexts
                 ):
-                    if not isinstance(message.content, str):
-                        raise ValueError("skill candidates require a text user message")
                     context = "\n\n".join(candidate_contexts)
                     message = _copy_message(message)
-                    message.content = f"{context}\n\n---\nUser request:\n{message.content}"
+                    prefix = f"{context}\n\n---\nUser request:\n"
+                    if isinstance(message.content, str):
+                        message.content = prefix + message.content
+                    else:
+                        message.content.insert(0, {"type": "text", "text": prefix})
                     candidate_contexts.clear()
                 messages.append(message)
                 message_sources.append(_event_source(event.sequence))
@@ -520,6 +526,12 @@ class ContextProjector:
             content = payload.get("content")
             if not isinstance(content, str | list):
                 raise ValueError(f"user message content is invalid at sequence {event.sequence}")
+            refs = payload.get("attachments", [])
+            if refs and isinstance(content, str):
+                content = [
+                    {"type": "text", "text": content or "请分析本轮附件。"},
+                    *({"type": "attachment", **ref} for ref in refs),
+                ]
             return Message(role="user", content=deepcopy(content))
         if event.event_type == "assistant/message":
             content = payload.get("content", "")

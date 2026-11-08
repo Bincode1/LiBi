@@ -1,8 +1,10 @@
 import { useId, useState, type ReactNode } from 'react'
 import { Check, ChevronRight, CircleAlert, Clock3, Copy, LoaderCircle, Wrench } from 'lucide-react'
 import * as m from 'motion/react-m'
+import { AttachmentChip } from '@/components/ai-elements/attachments'
 import { Disclosure, DisclosureChevron, Reveal } from '@/components/ui/disclosure'
 import { subagentLaunchFailure, toolLabel } from '@/lib/activity'
+import { attachmentUrl } from '@/lib/api'
 import type { ToolView, TurnView } from '@/lib/events'
 import type { Subagent } from '@/lib/types'
 import { useSurfaceMotion } from '@/lib/motion'
@@ -173,11 +175,23 @@ export function Turn({
   timeline.sort((a, b) => a.sequence - b.sequence)
   return (
     <article className="turn">
-      {turn.user && (
+      {(turn.user || Boolean(turn.attachments?.length)) && (
         <div className="user-message">
           <div>
             <div className="sr-only">你</div>
-            <p>{turn.user}</p>
+            {turn.attachments && (
+              <ul className="attachment-list" aria-label="已发送附件">
+                {turn.attachments.map((attachment) => (
+                  <AttachmentChip
+                    key={attachment.id}
+                    name={attachment.name}
+                    image={attachment.media_type.startsWith('image/')}
+                    url={attachmentUrl(attachment)}
+                  />
+                ))}
+              </ul>
+            )}
+            {turn.user && <p>{turn.user}</p>}
           </div>
         </div>
       )}

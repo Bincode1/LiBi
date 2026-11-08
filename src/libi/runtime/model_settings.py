@@ -11,7 +11,7 @@ import httpx
 
 from libi.config import LlmConfig
 from libi.llm.base import ProviderRequestError
-from libi.llm.factory import llm_base_url
+from libi.llm.factory import create_llm_client, llm_base_url
 from libi.policy.file_lock import try_file_lock
 
 
@@ -38,7 +38,10 @@ class WorkbenchModelSettings:
         model = _text(saved.get("model"), "模型 ID", 256)
         key = _api_key(saved.get("api_key"))
         provider = _text(saved.get("provider"), "服务类型", 64)
-        return _apply_connection(fallback, url, key, model, provider)
+        config = _apply_connection(fallback, url, key, model, provider)
+        return replace(
+            config, image_input=_image_input(saved.get("image_input", config.image_input))
+        )
 
     def save(self, body: dict[str, Any], fallback: LlmConfig) -> LlmConfig:
         lock = try_file_lock(self.path.with_suffix(".lock"))
@@ -51,6 +54,7 @@ class WorkbenchModelSettings:
                 "base_url": candidate.base_url,
                 "model": candidate.model,
                 "api_key": candidate.api_key,
+                "image_input": candidate.image_input,
             }
             fd, temp_name = tempfile.mkstemp(dir=self.path.parent, prefix="workbench-model-")
             temp_path = Path(temp_name)
@@ -79,14 +83,19 @@ class WorkbenchModelSettings:
         if contains_credential(url, key):
             raise ValueError("请将 API Key 填在专用字段中。")
         provider = current.provider if same_url else "openai-compatible"
-        return _apply_connection(current, url, key, model, provider)
+        config = _apply_connection(current, url, key, model, provider)
+        return replace(
+            config, image_input=_image_input(body.get("image_input", config.image_input))
+        )
 
     @staticmethod
-    def public(config: LlmConfig) -> dict[str, str | bool]:
+    def public(config: LlmConfig) -> dict[str, str | bool | None]:
         return {
             "base_url": _public_base_url(config),
             "model": "" if contains_credential(config.model, config.api_key) else config.model,
             "has_api_key": bool(config.api_key),
+            "image_input": config.image_input,
+            "supports_images": create_llm_client(config).supports_images,
         }
 
 
@@ -121,6 +130,7 @@ def _apply_connection(
         provider=provider,
         context_window=config.context_window if same_model else None,
         prices=config.prices if same_model else {},
+        image_input=config.image_input if same_model else None,
     )
 
 
@@ -155,6 +165,12 @@ def _api_key(value: object) -> str:
     if not all(32 <= ord(character) < 127 for character in key):
         raise ValueError("API Key 包含无效字符。")
     return key
+
+
+def _image_input(value: object) -> bool | None:
+    if value is not None and type(value) is not bool:
+        raise ValueError("图片输入必须为自动、支持或不支持。")
+    return value
 
 
 def _text(value: object, field: str, limit: int) -> str:

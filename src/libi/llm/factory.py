@@ -100,6 +100,7 @@ def create_llm_client(
         timeout=config.timeout,
         max_context_window=context,
         prompt_cache=profile["prompt_cache"],
+        image_input=config.image_input,
         on_usage=on_usage,
         price_profile=resolve_price_profile(
             config.model,

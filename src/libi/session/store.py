@@ -240,7 +240,15 @@ class SessionStore:
             raise ValueError(f"session not found in this workspace: {session_id}")
         return row[0]
 
-    def start_turn(self, session_id: str, turn_id: str, *, mode: str, message: str) -> int:
+    def start_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        mode: str,
+        message: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> int:
         """Claim a session and persist its input before an executor can run it."""
         owner = self._try_own_turn(session_id)
         if owner is None and os.name == "nt":
@@ -261,6 +269,8 @@ class SessionStore:
                 self._assert_write_allowed(conn, session_id, "user/message", None)
                 created_at = _now()
                 user_payload = {"content": message}
+                if attachments:
+                    user_payload["attachments"] = attachments
                 if mode == "react":
                     user_payload["submitted_at_local"] = (
                         datetime.fromisoformat(created_at)

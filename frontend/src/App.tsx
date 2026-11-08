@@ -31,12 +31,17 @@ import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
 import { Disclosure } from '@/components/ui/disclosure'
 import { AgentMark } from '@/features/conversation/agent-avatar'
-import { Composer } from '@/features/conversation/composer'
+import { Composer, isImageAttachment } from '@/features/conversation/composer'
 import { ModePicker } from '@/features/conversation/mode-picker'
 import { TurnUsageSummary } from '@/features/conversation/turn-usage'
 import { McpSettings } from '@/features/mcp/settings'
 import { SettingsLayout } from '@/features/settings/layout'
-import { ModelSettings } from '@/features/settings/model-settings'
+import {
+  ModelSettings,
+  modelSettingsEndpoint,
+  modelSettingsKey,
+  type ModelConnection,
+} from '@/features/settings/model-settings'
 import { Details, type DetailsTab } from '@/features/workspace/details'
 import {
   WorkspaceSplit,
@@ -55,7 +60,7 @@ import { ApiError, liveClient, request } from '@/lib/api'
 import { projectTurns, resolveActiveRun, type PendingTurn, type ToolView } from '@/lib/events'
 import { useSurfaceMotion } from '@/lib/motion'
 import { errorMessage } from '@/lib/utils'
-import type { Mode, PermissionMode, Session, Subagent } from '@/lib/types'
+import type { Attachment, Mode, PermissionMode, Session, Subagent } from '@/lib/types'
 
 const client = liveClient
 const Turn = lazy(() => import('@/features/conversation/turn').then((m) => ({ default: m.Turn })))
@@ -125,6 +130,7 @@ export default function App() {
   const [detailsTab, setDetailsTab] = useState<DetailsTab>('changes')
   const [agentSelection, setAgentSelection] = useState<{ key: string; path: Subagent[] }>()
   const [drafts, setDrafts] = useTabDrafts()
+  const [attachmentDrafts, setAttachmentDrafts] = useState<Record<string, File[]>>({})
   const { recent: recentWorkspaces, remember: rememberWorkspace } = useRecentWorkspaces()
   const [mode, setMode] = useState<Mode>('react')
   const [submitting, setSubmitting] = useState(false),
@@ -150,6 +156,15 @@ export default function App() {
   const previousRuntimeError = useRef(false)
   const draftKey = id ?? 'new',
     draft = drafts[draftKey] ?? ''
+  const files = attachmentDrafts[draftKey] ?? []
+  const hasImage = files.some(isImageAttachment)
+  const modelConnection = useQuery({
+    queryKey: modelSettingsKey,
+    queryFn: ({ signal }) => request<ModelConnection>(modelSettingsEndpoint, { signal }),
+    enabled: hasImage && !inSettings,
+    retry: false,
+  })
+  const imagesBlocked = hasImage && modelConnection.data?.supports_images === false
   const setDraft = (value: string) => setDrafts((previous) => ({ ...previous, [draftKey]: value }))
   const sessions = useQuery({
     queryKey: ['sessions'],
@@ -320,6 +335,12 @@ export default function App() {
     if (!pending || !pendingFinished) return
     if (optimistic?.status === 'failed' || optimistic?.id === 'pending') {
       setDrafts((previous) => ({ ...previous, [draftKey]: previous[draftKey] || pending.message }))
+      if (pending.files?.length) {
+        const restored = pending.files
+        setAttachmentDrafts((previous) =>
+          previous[draftKey]?.length ? previous : { ...previous, [draftKey]: restored },
+        )
+      }
       setNotice('Agent 未能启动，请查看本地 Runtime 后重试。')
     }
     setPendingTurns((previous) => {
@@ -417,7 +438,8 @@ export default function App() {
   }
   const send = async () => {
     if (
-      !draft.trim() ||
+      (!draft.trim() && !files.length) ||
+      imagesBlocked ||
       busy ||
       connectionSyncing ||
       connectionError ||
@@ -429,7 +451,7 @@ export default function App() {
     setSubmitting(true)
     const message = draft.trim(),
       key = draftKey
-    const queued = { message, afterSequence: feed.cursor }
+    const queued: PendingTurn = { message, afterSequence: feed.cursor, files }
     setPendingTurns((previous) => ({ ...previous, [key]: queued }))
     setNearBottom(true)
     let sessionId = id
@@ -455,12 +477,30 @@ export default function App() {
             [session.id]: previous[key] ?? draft,
             [key]: '',
           }))
+          if (files.length) {
+            setAttachmentDrafts((previous) => {
+              const next = { ...previous, [session.id]: files }
+              delete next[key]
+              return next
+            })
+          }
           navigate(`/sessions/${encodeURIComponent(sessionId)}`)
         }
       }
-      const result = await client.send(sessionId, message, mode)
+      const attachments: Attachment[] = []
+      for (const file of files) {
+        const uploaded = await client.uploadAttachment(sessionId, file)
+        if (!attachments.some((item) => item.id === uploaded.id)) attachments.push(uploaded)
+      }
+      const result = await client.send(
+        sessionId,
+        message,
+        mode,
+        attachments.map((item) => item.id),
+      )
       const accepted = {
         ...queued,
+        attachments,
         afterSequence: result.after_sequence ?? queued.afterSequence,
         run: { id: result.run_id, turnId: result.turn_id, acceptedAt: performance.now() },
       }
@@ -471,6 +511,14 @@ export default function App() {
       setDrafts((previous) =>
         previous[acceptedDraftKey] === draft ? { ...previous, [acceptedDraftKey]: '' } : previous,
       )
+      if (files.length) {
+        setAttachmentDrafts((previous) => {
+          if (previous[acceptedDraftKey] !== files) return previous
+          const next = { ...previous }
+          delete next[acceptedDraftKey]
+          return next
+        })
+      }
       void queryClient.invalidateQueries({ queryKey: ['sessions'] })
     } catch (error) {
       setPendingTurns((previous) => {
@@ -866,6 +914,14 @@ export default function App() {
         </Button>
       )}
       <Composer
+        attachments={files}
+        onAttachmentsChange={(next) =>
+          setAttachmentDrafts((previous) => ({ ...previous, [draftKey]: next }))
+        }
+        imagesBlocked={imagesBlocked}
+        onModelSettings={() =>
+          navigate('/settings/models', { state: { returnTo: route.pathname } })
+        }
         workspace={
           id ? (
             sessionCwd && <SessionWorkspace path={sessionCwd} />

@@ -32,6 +32,7 @@ from libi.agent.subagents import (
     make_subagent_control_tools,
     make_subagent_tool,
 )
+from libi.attachments import AttachmentStore, latest_attachments, message_attachments
 from libi.config import LiBiConfig
 from libi.context import (
     CompactionClient,
@@ -171,7 +172,11 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def run(
-        self, message: str, *, turn_id: str | None = None
+        self,
+        message: str,
+        *,
+        turn_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Execute *message* and yield streaming events.
 
@@ -203,7 +208,9 @@ class Agent:
         owns_turn = turn_id is None
         if turn_id is None:
             turn_id = f"turn_{uuid.uuid4().hex}"
-            self.session_store.start_turn(session_id, turn_id, mode=self.mode, message=message)
+            self.session_store.start_turn(
+                session_id, turn_id, mode=self.mode, message=message, attachments=attachments
+            )
         elif self.session_store.active_turn_step(session_id)[0] != turn_id:
             raise RuntimeError("The accepted turn is no longer active.")
         snapshot = None
@@ -456,6 +463,7 @@ class Agent:
         session_id = self.session_id
         store = self.session_store
         assert store is not None and session_id is not None
+        attachment_store = AttachmentStore(store.db_path)
         original = message
         candidate_message = _prepend_skill_candidates(message, self.cwd, self.config)
         candidate_prefix, separator, request_message = candidate_message.partition(
@@ -766,7 +774,8 @@ class Agent:
                 context.research_budget.request_tokens_left = max(0, input_limit - input_tokens)
 
             # Budget pressure uses raw messages. Resolve image references only after compaction.
-            if any(
+            attached = latest_attachments(current_view.messages)
+            if attached or any(
                 item.role == "user"
                 and isinstance(item.content, str)
                 and IMAGE_PATTERN.search(item.content)
@@ -777,7 +786,14 @@ class Agent:
                     session_id=session_id,
                     turn_id=turn_id,
                     step_id=step_id,
-                    message_transform=lambda item: _transform_message_images(item, self.cwd),
+                    message_transform=lambda item, selected=attached: _transform_message_input(
+                        item,
+                        self.cwd,
+                        attachment_store,
+                        selected,
+                        bool(getattr(self.llm_client, "supports_images", False)),
+                        store.redactor.clean,
+                    ),
                     **projection,
                 )
             request = self._request_builder.build(
@@ -1367,17 +1383,35 @@ class Agent:
 # ------------------------------------------------------------------
 
 
-def _transform_message_images(message: Message, cwd: str) -> Message:
+def _transform_message_input(
+    message: Message,
+    cwd: str,
+    store: AttachmentStore,
+    selected: set[tuple[str, str]],
+    supports_images: bool,
+    clean_text: Callable[[str], str],
+) -> Message:
     content = message.content
     if message.role == "user" and isinstance(content, str):
         content = parse_image_references(content, cwd)
-    return Message(
-        role=message.role,
-        content=content,
-        name=message.name,
-        tool_call_id=message.tool_call_id,
-        tool_calls=[dict(call) for call in message.tool_calls],
-    )
+    elif isinstance(content, list) and (refs := message_attachments(message)):
+        parts = []
+        for part in content:
+            if part["type"] == "attachment":
+                continue
+            if part["type"] == "text":
+                parsed = parse_image_references(part["text"], cwd)
+                if isinstance(parsed, list):
+                    parts.extend(parsed)
+                    continue
+            parts.append(part)
+        content = [
+            *parts,
+            *store.prompt_parts(
+                refs, selected=selected, supports_images=supports_images, clean_text=clean_text
+            ),
+        ]
+    return replace(message, content=content)
 
 
 def _annotate_event(

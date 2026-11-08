@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 IMAGE_PATTERN = re.compile(r"@image:([^\s]+)")
 
@@ -35,7 +35,7 @@ def _image_part(reference: str, cwd: str) -> dict:
     if reference.startswith(("http://", "https://")):
         return {"type": "image_url", "image_url": {"url": reference}}
     path = _resolve_image_path(reference, cwd)
-    data_url, width, height = _encode_image(path)
+    data_url, width, height = encode_image(path)
     return {
         "type": "image_url",
         "image_url": {"url": data_url},
@@ -58,8 +58,9 @@ def _resolve_image_path(reference: str, cwd: str) -> Path:
     return path
 
 
-def _encode_image(path: Path, max_side: int = 1568) -> tuple[str, int, int]:
-    with Image.open(path) as image:
+def encode_image(path: Path, max_side: int = 1568) -> tuple[str, int, int]:
+    with Image.open(path) as original:
+        image = ImageOps.exif_transpose(original)
         image.thumbnail((max_side, max_side))
         if image.mode in {"RGBA", "LA"}:
             background = Image.new("RGB", image.size, "white")

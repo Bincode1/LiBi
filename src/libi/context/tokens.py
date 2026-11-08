@@ -8,14 +8,17 @@ from libi.types import Message
 
 
 def estimate_message_tokens(message: Message) -> int:
-    content = _message_text(message)
+    if isinstance(message.content, str):
+        content_tokens = estimate_text_tokens(message.content)
+    else:
+        content_tokens = sum(_estimate_part(part) for part in message.content)
     tool_calls = (
         json.dumps(message.tool_calls, ensure_ascii=False, separators=(",", ":"))
         if message.tool_calls
         else ""
     )
     # A small per-message allowance covers role markers and provider serialization.
-    return 4 + estimate_text_tokens(content) + estimate_text_tokens(tool_calls)
+    return 4 + content_tokens + estimate_text_tokens(tool_calls)
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -46,7 +49,13 @@ def fit_text(text: str, max_tokens: int, *, max_bytes: int | None = None) -> str
     return text[:low]
 
 
-def _message_text(message: Message) -> str:
-    if isinstance(message.content, str):
-        return message.content
-    return json.dumps(message.content, ensure_ascii=False, separators=(",", ":"))
+def _estimate_part(part: dict) -> int:
+    if part.get("type") == "image_url":
+        return 2048
+    if part.get("type") == "attachment":
+        return (
+            2048
+            if str(part.get("media_type", "")).startswith("image/")
+            else min(3600, int(part.get("size", 0)))
+        )
+    return estimate_text_tokens(json.dumps(part, ensure_ascii=False, separators=(",", ":")))

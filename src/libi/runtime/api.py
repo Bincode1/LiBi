@@ -20,9 +20,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import monotonic
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 from libi.agent import QueryEngine
+from libi.attachments import (
+    MAX_ATTACHMENT_BYTES,
+    MAX_TURN_ATTACHMENT_BYTES,
+    MAX_TURN_ATTACHMENTS,
+    AttachmentError,
+    AttachmentStore,
+)
 from libi.bootstrap import build_tool_registry
 from libi.config import LiBiConfig
 from libi.llm import create_llm_client
@@ -47,7 +54,7 @@ from libi.session import (
     TurnInProgressError,
     default_runtime_db_path,
 )
-from libi.tools.base import ToolDecision
+from libi.tools.base import Tool, ToolContext, ToolDecision, ToolResult
 from libi.types import Usage
 
 _APPROVAL_TIMEOUT = 300.0
@@ -61,6 +68,7 @@ _FINISHED_RUN_TTL = 600.0
 _APPROVAL_ROUTE = re.compile(r"/v1/sessions/([^/]+)/approvals/([^/]+)/decision")
 _CANCEL_RUN_ROUTE = re.compile(r"/v1/sessions/([^/]+)/runs/([^/]+)/cancel")
 _CHILD_STREAM_ROUTE = re.compile(r"/v1/sessions/([^/]+)/subagents/([^/]+)/events/stream")
+_ATTACHMENT_ROUTE = re.compile(r"/v1/sessions/([^/]+)/attachments(?:/([^/]+))?")
 _CHILD_PREVIEW_LIMIT = 65536
 _STREAM_FRAME_INTERVAL = 0.03
 _STREAM_HISTORY_INTERVAL = 1.0
@@ -147,6 +155,7 @@ class RuntimeApiServer:
         self.mcp = McpManagement(self.cwd, sensitive_values=(api_key, config.llm.api_key))
         self.port = config.runtime.port if port is None else port
         self.db_path = default_runtime_db_path()
+        self.attachments = AttachmentStore(self.db_path)
         self.task_manager = DurableTaskManager(
             Path.home() / ".libi" / "tasks" / "tasks.db", scope=self.cwd
         )
@@ -263,6 +272,9 @@ class RuntimeApiServer:
         if not self._authorized(request):
             _send_json(request, 401, {"error": "unauthorized"})
             return
+        if attachment_route := _ATTACHMENT_ROUTE.fullmatch(path):
+            self._handle_attachment(request, *attachment_route.groups())
+            return
         try:
             body = _read_json(request)
         except RequestBodyTooLarge as exc:
@@ -323,14 +335,22 @@ class RuntimeApiServer:
             elif request.command == "POST" and _matches_session_route(path, "/turns"):
                 session_id = _session_id_from_path(path)
                 message = str(body.get("message") or body.get("prompt") or "")
-                if not message.strip():
+                ids = _attachment_ids(body)
+                if not message.strip() and not ids:
                     _send_json(request, 400, {"error": "message is required"})
                     return
                 mode = _mode_from_body(body)
                 config = self._reserve_turn(session_id)
                 try:
+                    attachments = self._turn_attachments(session_id, ids, config)
                     result = asyncio.run(
-                        self._run_turn(session_id, message, mode=mode, config=config)
+                        self._run_turn(
+                            session_id,
+                            message,
+                            mode=mode,
+                            config=config,
+                            **({"attachments": attachments} if attachments else {}),
+                        )
                     )
                 finally:
                     with self._background_turns_lock:
@@ -339,7 +359,8 @@ class RuntimeApiServer:
             elif request.command == "POST" and _matches_session_route(path, "/turns/async"):
                 session_id = _session_id_from_path(path)
                 message = str(body.get("message") or body.get("prompt") or "")
-                if not message.strip():
+                ids = _attachment_ids(body)
+                if not message.strip() and not ids:
                     _send_json(request, 400, {"error": "message is required"})
                     return
                 mode = _mode_from_body(body)
@@ -348,7 +369,11 @@ class RuntimeApiServer:
                     raise ValueError("interactive_approval must be a boolean")
                 self._ensure_llm_key(self._config_snapshot())
                 run_id, after_sequence = self._start_background_turn(
-                    session_id, message, mode=mode, interactive_approval=interactive_approval
+                    session_id,
+                    message,
+                    mode=mode,
+                    interactive_approval=interactive_approval,
+                    **({"attachment_ids": ids} if ids else {}),
                 )
                 _send_json(
                     request,
@@ -423,10 +448,127 @@ class RuntimeApiServer:
             _send_json(request, 503, {"error": "Runtime is stopping"})
         except WorkspaceError as exc:
             _send_json(request, 400, {"workspace_error": str(exc)})
+        except AttachmentError as exc:
+            _send_json(request, 400, {"attachment_error": str(exc)})
         except ValueError as exc:
             _send_json(request, 400, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 - API boundary
             _send_json(request, 500, {"error": str(exc)})
+
+    def _handle_attachment(
+        self, request: BaseHTTPRequestHandler, session_id: str, attachment_id: str | None
+    ) -> None:
+        if not self.session_store.session_exists(session_id, root_only=True):
+            _send_json(request, 404, {"attachment_error": "找不到该会话。"})
+            return
+        try:
+            if request.command == "POST" and attachment_id is None:
+                if request.headers.get_content_type() != "application/octet-stream":
+                    raise AttachmentError("请使用二进制请求上传附件。")
+                name = parse_qs(request.path.partition("?")[2]).get("name", [""])[0]
+                data = _read_body(request, MAX_ATTACHMENT_BYTES)
+                record = self.attachments.add(session_id, name, data)
+                record["name"] = self.session_store.redactor.clean(record["name"])
+                _send_json(request, 201, record)
+            elif request.command == "GET" and attachment_id:
+                record, path = self.attachments.get(session_id, attachment_id)
+                name = self.session_store.redactor.clean(record["name"])
+                media_type = record["media_type"]
+                download = "inline" if media_type.startswith("image/") else "attachment"
+                with path.open("rb") as source:
+                    request.send_response(200)
+                    request.send_header("content-type", media_type)
+                    request.send_header("content-length", str(record["size"]))
+                    request.send_header("x-content-type-options", "nosniff")
+                    request.send_header("cache-control", "private, no-store")
+                    request.send_header(
+                        "content-disposition",
+                        f"{download}; filename*=UTF-8''{quote(name, safe='')}",
+                    )
+                    request.end_headers()
+                    while chunk := source.read(65536):
+                        request.wfile.write(chunk)
+            else:
+                _send_json(request, 404, {"attachment_error": "找不到该附件入口。"})
+        except RequestBodyTooLarge:
+            request.close_connection = True
+            _send_json(request, 413, {"attachment_error": "单个附件不能超过 10 MiB。"})
+            _drain_rejected_request(request.connection)
+        except TimeoutError:
+            request.close_connection = True
+            _send_json(request, 408, {"attachment_error": "附件上传超时。"})
+        except ValueError as exc:
+            _send_json(
+                request, 404 if request.command == "GET" else 400, {"attachment_error": str(exc)}
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            request.close_connection = True
+        except OSError:
+            _send_json(request, 500, {"attachment_error": "无法访问本机附件存储。"})
+
+    def _turn_attachments(
+        self, session_id: str, ids: list[str], config: LiBiConfig
+    ) -> list[dict[str, Any]]:
+        refs = [
+            {**self.attachments.get(session_id, attachment_id)[0], "session_id": session_id}
+            for attachment_id in ids
+        ]
+        if sum(ref["size"] for ref in refs) > MAX_TURN_ATTACHMENT_BYTES:
+            raise AttachmentError("一条消息的附件合计不能超过 20 MiB。")
+        if (
+            any(ref["media_type"].startswith("image/") for ref in refs)
+            and not create_llm_client(config.llm).supports_images
+        ):
+            raise AttachmentError(
+                "当前模型未启用图片输入。请在设置 → 模型中确认视觉能力，或移除图片。"
+            )
+        return refs
+
+    def _attachment_tool(self, session_id: str) -> Tool | None:
+        if not self.attachments.directory(session_id).is_dir():
+            return None
+        allowed = {
+            ref["id"]
+            for event in self.session_store.events(session_id, event_types=("user/message",))
+            for ref in event.payload.get("attachments", [])
+            if ref.get("session_id") == session_id and ref.get("media_type") == "text/plain"
+        }
+        if not allowed:
+            return None
+
+        async def read(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
+            identity = payload["attachment_id"]
+            if not isinstance(identity, str) or identity not in allowed:
+                return ToolResult("此会话没有该文本附件。", is_error=True)
+            try:
+                text = await asyncio.to_thread(
+                    self.attachments.read_text,
+                    session_id,
+                    identity,
+                    start=payload.get("start_line", 1),
+                    start_column=payload.get("start_column", 1),
+                    limit=payload.get("limit", 80),
+                )
+            except (AttachmentError, OSError):
+                return ToolResult("无法读取附件或行范围无效。", is_error=True)
+            return ToolResult(self.session_store.redactor.clean(text))
+
+        return Tool(
+            name="read_attachment",
+            description="按行读取当前会话上传的文本附件。仅使用用户消息所列附件 ID。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "attachment_id": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "start_column": {"type": "integer", "minimum": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+                "required": ["attachment_id"],
+            },
+            required_keys=["attachment_id"],
+            handler=read,
+        )
 
     def _handle_model_settings(
         self,
@@ -513,6 +655,7 @@ class RuntimeApiServer:
         interactive_approval: bool = False,
         config: LiBiConfig | None = None,
         turn_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         mode = _validate_mode(mode)
         if config is None:
@@ -521,7 +664,9 @@ class RuntimeApiServer:
         owns_turn = turn_id is None
         if turn_id is None:
             turn_id = f"turn_{uuid.uuid4().hex}"
-            self.session_store.start_turn(session_id, turn_id, mode=mode, message=message)
+            self.session_store.start_turn(
+                session_id, turn_id, mode=mode, message=message, attachments=attachments
+            )
             self._schedule_session_title(session_id, turn_id, message, config)
         engine: QueryEngine | None = None
         text = ""
@@ -575,6 +720,8 @@ class RuntimeApiServer:
             cwd = self._turn_cwd(session_id)
             # Session selection does not extend the Runtime's trust for MCP configuration.
             registry, manager = await build_tool_registry(config=config, cwd=self.cwd)
+            if tool := self._attachment_tool(session_id):
+                registry.register(tool)
             await self.mcp.remember_discovered(manager)
             engine = QueryEngine(
                 llm_client=create_llm_client(config.llm, on_usage=record_usage),
@@ -632,13 +779,20 @@ class RuntimeApiServer:
         }
 
     def _start_background_turn(
-        self, session_id: str, message: str, *, mode: str, interactive_approval: bool = False
+        self,
+        session_id: str,
+        message: str,
+        *,
+        mode: str,
+        interactive_approval: bool = False,
+        attachment_ids: list[str] | None = None,
     ) -> tuple[str, int]:
         run_id = f"turn_{uuid.uuid4().hex}"
         config = self._reserve_turn(session_id, run_id)
         try:
+            attachments = self._turn_attachments(session_id, attachment_ids or [], config)
             after_sequence = self.session_store.start_turn(
-                session_id, run_id, mode=mode, message=message
+                session_id, run_id, mode=mode, message=message, attachments=attachments
             )
         except Exception:
             with self._background_turns_lock:
@@ -1277,19 +1431,41 @@ def _parse_cursor(value: str | None) -> int:
         raise ValueError("cursor must be a non-negative integer") from exc
 
 
-def _read_json(request: BaseHTTPRequestHandler) -> dict[str, Any]:
+def _attachment_ids(body: dict[str, Any]) -> list[str]:
+    ids = body.get("attachment_ids", [])
+    if (
+        not isinstance(ids, list)
+        or len(ids) > MAX_TURN_ATTACHMENTS
+        or any(not isinstance(item, str) for item in ids)
+        or len(set(ids)) != len(ids)
+    ):
+        raise AttachmentError("一条消息最多可包含 5 个不同的附件。")
+    return ids
+
+
+def _read_body(request: BaseHTTPRequestHandler, max_bytes: int) -> bytes:
     lengths = request.headers.get_all("content-length", [])
     if len(lengths) > 1 or request.headers.get("transfer-encoding"):
         raise ValueError("invalid request body framing")
     length = int(lengths[0]) if lengths else 0
     if length < 0:
         raise ValueError("content-length must be non-negative")
-    if length > _MAX_REQUEST_BYTES:
+    if length > max_bytes:
         raise RequestBodyTooLarge("request body exceeds 1 MiB")
     if length == 0:
+        return b""
+    data = request.rfile.read(length)
+    if len(data) != length:
+        raise ValueError("incomplete request body")
+    return data
+
+
+def _read_json(request: BaseHTTPRequestHandler) -> dict[str, Any]:
+    data = _read_body(request, _MAX_REQUEST_BYTES)
+    if not data:
         return {}
     try:
-        value = json.loads(request.rfile.read(length).decode("utf-8"))
+        value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("malformed JSON body") from exc
     if not isinstance(value, dict):
