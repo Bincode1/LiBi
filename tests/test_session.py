@@ -552,8 +552,12 @@ def test_query_engine_resumes_from_session_and_replays_requests(tmp_path, monkey
     asyncio.run(engine.ask_complete_async("new"))
     asyncio.run(engine.ask_complete_async("follow-up"))
 
-    assert [m.content for m in client.seen_messages[0]] == ["past request", "past answer", "new"]
-    assert [m.content for m in client.seen_messages[1]][-3:] == ["new", "ok", "follow-up"]
+    first = [m.content for m in client.seen_messages[0]]
+    second = [m.content for m in client.seen_messages[1]]
+    assert first[:2] == ["past request", "past answer"]
+    assert first[2].startswith("new\n\n")
+    assert second[:4] == [*first, "ok"]
+    assert second[4].startswith("follow-up\n\n")
     events = store.events(session_id)
     for prepared in (event for event in events if event.event_type == "request/prepared"):
         replay = ContextProjector().project(

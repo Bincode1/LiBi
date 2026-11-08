@@ -339,7 +339,7 @@ def test_async_receipt_is_durable_before_worker_starts(runtime_http, monkeypatch
     )
     assert [event.event_type for event in events] == ["turn/started", "user/message"]
     assert {event.turn_id for event in events} == {receipt["turn_id"]}
-    assert events[-1].payload == {"content": "persist me"}
+    assert events[-1].payload["content"] == "persist me"
     other_runtime.session_store.recover_interrupted_turns()
     assert other_runtime.session_store.state(session_id).status == "running"
     runtime.session_store.release_turn(session_id, receipt["turn_id"])
@@ -1630,6 +1630,7 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
     async def respond(_transport, request):
         messages = json.loads(request.content)["messages"]
         question = next(message["content"] for message in messages if message["role"] == "user")
+        question = question.partition("\n\n")[0]
         if question == "Search task":
             return httpx.Response(200, stream=SearchStream())
         if question == "Write task":

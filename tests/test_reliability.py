@@ -28,7 +28,7 @@ class DelegatingClient:
         self.result_counts = []
 
     async def chat(self, messages, tools, *, system_prompt):
-        if messages[0].content == "inspect child":
+        if messages[0].content.partition("\n\n")[0] == "inspect child":
             yield {"type": "text_delta", "text": "child findings"}
             yield {"type": "message_end", "stop_reason": "end_turn"}
             return
@@ -153,7 +153,7 @@ def test_parent_receives_partial_child_results(tmp_path, monkeypatch, failure):
             return CompactionResponse("invalid")
 
         async def chat(self, messages, tools, *, system_prompt):
-            if messages[0].content != "inspect child":
+            if messages[0].content.partition("\n\n")[0] != "inspect child":
                 async for event in super().chat(messages, tools, system_prompt=system_prompt):
                     yield event
                 return

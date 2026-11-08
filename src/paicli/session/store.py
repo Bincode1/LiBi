@@ -260,9 +260,16 @@ class SessionStore:
                     self._recover_turn_tx(conn, session_id)
                 self._assert_write_allowed(conn, session_id, "user/message", None)
                 created_at = _now()
+                user_payload = {"content": message}
+                if mode == "react":
+                    user_payload["submitted_at_local"] = (
+                        datetime.fromisoformat(created_at)
+                        .astimezone()
+                        .isoformat(timespec="seconds")
+                    )
                 for event_type, payload in (
                     ("turn/started", {"mode": mode}),
-                    ("user/message", {"content": message}),
+                    ("user/message", user_payload),
                 ):
                     self._insert_event_tx(
                         conn,

@@ -55,6 +55,7 @@ def test_delegated_research_links_are_validated_in_the_existing_summary_request(
         async def chat(self, messages, tools, *, system_prompt):
             names = {tool["function"]["name"] for tool in tools}
             question = next(msg.content for msg in messages if msg.role == "user")
+            question = question.partition("\n\n")[0]
             if question in {"Read release", "Find survey"}:
                 if messages[-1].role == "tool":
                     yield {

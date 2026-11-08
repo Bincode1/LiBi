@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 from paicli.agent import QueryEngine
 from paicli.config import load_config
+from paicli.llm import create_llm_client
 from paicli.memory import MemoryManager
 from paicli.prompt import PromptAssembler
+from paicli.session import SessionStore
 from paicli.tools import ToolRegistry
 
 
@@ -38,6 +41,46 @@ def test_static_prompt_is_stable_and_custom_project_instructions_are_loaded(tmp_
     assert "Current time" not in first
 
 
+def test_react_turn_keeps_the_previous_request_as_a_prefix(
+    tmp_path, config, provider_stream, monkeypatch
+):
+    config.llm.api_key = "synthetic-llm-credential"
+    config.features.memory = False
+    config.features.skill = False
+    batches, requests = provider_stream
+    store = SessionStore(tmp_path / "runtime.db")
+    session_id = store.create_session()
+    engine = QueryEngine(
+        llm_client=create_llm_client(config.llm),
+        tool_registry=ToolRegistry(),
+        config=config,
+        cwd=str(tmp_path),
+        session_store=store,
+        session_id=session_id,
+    )
+    turns = [
+        ("first question", "2030-01-02T03:04:05+00:00"),
+        ("follow-up", "2030-01-02T03:04:21+00:00"),
+    ]
+    for question, timestamp in turns:
+        monkeypatch.setattr("paicli.session.store._now", lambda value=timestamp: value)
+        batches.append([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}])
+        asyncio.run(engine.ask_complete_async(question))
+
+    first, second = requests
+    assert "Current time:" not in first["messages"][0]["content"]
+    assert first["tools"] == second["tools"]
+    assert first["messages"] == second["messages"][: len(first["messages"])]
+    for request, (question, timestamp) in zip(requests, turns, strict=True):
+        latest = request["messages"][-1]
+        local_time = datetime.fromisoformat(timestamp).astimezone().isoformat(timespec="seconds")
+        assert latest["role"] == "user"
+        assert latest["content"].startswith(question)
+        assert local_time in latest["content"]
+    messages = [event for event in store.events(session_id) if event.event_type == "user/message"]
+    assert [event.payload["content"] for event in messages] == [question for question, _ in turns]
+
+
 def test_dynamic_prompt_recall_is_rebuilt_for_each_request(tmp_path):
     config = load_config(project_root=tmp_path)
     client = CapturingClient()
@@ -57,7 +100,6 @@ def test_dynamic_prompt_recall_is_rebuilt_for_each_request(tmp_path):
     asyncio.run(engine.ask_complete_async("我偏好怎么执行测试？"))
 
     assert len(client.system_prompts) == 2
-    assert "Current time" in client.system_prompts[1]
     assert "recalled-memory" in client.system_prompts[1]
     assert "uv run python -m pytest" in client.system_prompts[1]
 

@@ -290,6 +290,15 @@ class ContextProjector:
                 if checkpoint is not None and event.sequence <= checkpoint.sequence:
                     continue
                 message = self._message_from_event(event)
+                if event.event_type == "user/message":
+                    submitted_at = event.payload.get("submitted_at_local")
+                    if isinstance(submitted_at, str) and isinstance(message.content, str):
+                        # Keep each timestamp with its original message across model requests.
+                        message.content += (
+                            '\n\n<runtime-context trust="generated">\n'
+                            f"User message time: {submitted_at}\n"
+                            "</runtime-context>"
+                        )
                 if (
                     event.event_type == "user/message"
                     and event.turn_id == turn_id

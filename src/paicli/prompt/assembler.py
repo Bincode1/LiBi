@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 
 from paicli.config import PaiCliConfig
@@ -83,7 +82,6 @@ class PromptAssembler:
     def build_dynamic(self, user_message: str) -> str:
         parts = [
             '<runtime-context trust="generated">',
-            f"Current time: {datetime.now().astimezone().isoformat(timespec='seconds')}",
             f"Working directory: {self.cwd}",
             f"Model: {self.model} ({self.provider})",
             f"Available tools: {', '.join(self.tool_names)}",
