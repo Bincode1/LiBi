@@ -1,11 +1,56 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from paicli.policy.path_guard import PathPolicyError
+from paicli.rag.code_index import CodeIndex
 from paicli.tools import file_ops
+
+
+def test_recursive_tools_do_not_enter_outside_directory_links(tmp_path):
+    workspace, outside = tmp_path / "workspace", tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "private.py").write_text("private_marker", encoding="utf-8")
+    (workspace / "public.py").write_text("public_marker", encoding="utf-8")
+    link = workspace / "linked"
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(link), str(outside)],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            pytest.skip("directory junctions are unavailable")
+    else:
+        link.symlink_to(outside, target_is_directory=True)
+    try:
+        assert "private_marker" not in file_ops.grep(str(workspace), "marker").content
+        assert "private.py" not in file_ops.directory_tree(str(workspace)).content
+        assert file_ops.glob_files(str(workspace), "**/*.py").content == "public.py"
+        index = CodeIndex(workspace)
+        assert index.rebuild() == 1
+        assert not index.search("private_marker")
+    finally:
+        if os.name == "nt":
+            link.rmdir()
+        else:
+            link.unlink()
+
+
+def test_write_and_edit_share_a_file_lock(tmp_path):
+    target = tmp_path / "note.txt"
+    target.write_text("original", encoding="utf-8")
+    with file_ops._lock_mutation(target):
+        assert file_ops.write_file(str(tmp_path), target.name, "new").is_error
+        assert file_ops.edit_file(str(tmp_path), target.name, "original", "new").is_error
+    assert target.read_text(encoding="utf-8") == "original"
+    assert not file_ops.edit_file(str(tmp_path), target.name, "original", "new").is_error
+    assert target.read_text(encoding="utf-8") == "new"
 
 
 @pytest.mark.parametrize(

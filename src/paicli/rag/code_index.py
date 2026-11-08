@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+
+from paicli.policy.path_guard import PathGuard, PathPolicyError, scan_files
 
 TEXT_SUFFIXES = {
     ".py",
@@ -40,23 +43,27 @@ class CodeSearchResult:
 class CodeIndex:
     def __init__(self, root: str | Path, db_path: str | Path | None = None):
         self.root = Path(root).resolve()
+        self._guard = PathGuard(self.root)
         self.db_path = (
-            Path(db_path).expanduser() if db_path else self.root / ".paicli" / "code_index.sqlite3"
+            Path(db_path).expanduser()
+            if db_path
+            else self._guard.validate(".paicli/code_index.sqlite3")
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
     def rebuild(self, path: str | Path | None = None) -> int:
-        base = self._resolve(path or self.root)
-        files = [base] if base.is_file() else list(self._iter_files(base))
-        with self._connect() as conn:
+        base = self._guard.validate(path or self.root)
+        files = [base] if base.is_file() else self._iter_files(base)
+        with closing(self._connect()) as conn, conn:
             conn.execute("delete from code_chunks where root = ?", (str(self.root),))
             count = 0
             for file_path in files:
                 rel = str(file_path.relative_to(self.root))
                 try:
-                    lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-                except OSError:
+                    with self._guard.open_read(file_path) as source:
+                        lines = source.read().decode("utf-8", errors="ignore").splitlines()
+                except (OSError, ValueError):
                     continue
                 for line_number, line in enumerate(lines, start=1):
                     stripped = line.strip()
@@ -73,48 +80,48 @@ class CodeIndex:
             return count
 
     def search(self, query: str, limit: int = 20) -> list[CodeSearchResult]:
-        terms = [term.lower() for term in query.split() if term.strip()]
-        if not terms:
+        terms = [term.casefold() for term in query.split()]
+        if not terms or limit <= 0:
             return []
-        rows: list[tuple[str, int, str]]
-        with self._connect() as conn:
-            like = f"%{terms[0]}%"
+        results: list[CodeSearchResult] = []
+        with closing(self._connect()) as conn:
+
+            def matches(content: str) -> bool:
+                text = content.casefold()
+                return all(term in text for term in terms)
+
+            conn.create_function("matches_terms", 1, matches)
             rows = conn.execute(
                 """
                 select path, line, content
                 from code_chunks
-                where root = ? and lower(content) like ?
+                where root = ? and matches_terms(content)
                 order by path, line
-                limit 500
                 """,
-                (str(self.root), like),
-            ).fetchall()
-        results: list[CodeSearchResult] = []
-        for path, line, content in rows:
-            lowered = content.lower()
-            if all(term in lowered for term in terms):
+                (str(self.root),),
+            )
+            for path, line, content in rows:
+                try:
+                    self._guard.validate(path)
+                except (OSError, PathPolicyError):
+                    continue
                 results.append(CodeSearchResult(path, int(line), content))
-            if len(results) >= limit:
-                break
+                if len(results) >= limit:
+                    break
         return results
 
     def _iter_files(self, base: Path):
-        for path in base.rglob("*"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES:
+        for path in scan_files(base, exclude=SKIP_DIRS):
+            if path.suffix.lower() in TEXT_SUFFIXES:
                 yield path
 
-    def _resolve(self, value: str | Path) -> Path:
-        path = Path(value)
-        if not path.is_absolute():
-            path = self.root / path
-        resolved = path.resolve()
-        resolved.relative_to(self.root)
-        return resolved
-
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
+            if conn.execute("pragma user_version").fetchone()[0] >= 1:
+                return
+            conn.execute("begin immediate")
+            if conn.execute("pragma user_version").fetchone()[0] >= 1:
+                return
             conn.execute(
                 """
                 create table if not exists code_chunks (
@@ -133,6 +140,9 @@ class CodeIndex:
                 "create index if not exists idx_code_chunks_root_content "
                 "on code_chunks(root, content)"
             )
+            # Existing caches may contain data read through a now-removed link.
+            conn.execute("delete from code_chunks")
+            conn.execute("pragma user_version = 1")
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)

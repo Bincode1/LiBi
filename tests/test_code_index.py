@@ -23,6 +23,13 @@ def test_code_index_rebuild_search_and_refresh(tmp_path):
     assert index.search("new_content")[0].line == 1
 
 
+def test_multiterm_search_limits_after_matching_every_term(tmp_path):
+    (tmp_path / "sample.py").write_text("common\n" * 500 + "common unique\n", encoding="utf-8")
+    index = CodeIndex(tmp_path)
+    index.rebuild()
+    assert index.search("common unique", limit=1)[0].line == 501
+
+
 def test_code_index_ignores_builds_binaries_and_blank_lines(tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src/app.ts").write_text("const needle = 1;\n\n", encoding="utf-8")

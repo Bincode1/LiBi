@@ -7,13 +7,16 @@ definitions so that builtins.py remains a thin wiring layer.
 
 from __future__ import annotations
 
-import glob as glob_module
+import hashlib
+import os
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 from paicli.lsp import diagnose_file
-from paicli.policy import PathGuard
+from paicli.policy.file_lock import try_file_lock
+from paicli.policy.path_guard import PathGuard, PathPolicyError, scan_entry, scan_files
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -54,6 +57,13 @@ def skip_file(path: Path) -> bool:
         return path.stat().st_size > MAX_FILE_SIZE
     except OSError:
         return True
+
+
+def _lock_mutation(path: Path):
+    identity = os.path.normcase(str(path.resolve()))
+    # Shard the lock names to keep their number bounded across sessions.
+    shard = hashlib.sha256(os.fsencode(identity)).hexdigest()[:2]
+    return try_file_lock(Path.home() / ".paicli" / "file-locks" / shard)
 
 
 def _line_numbered(content: str, offset: int = 1) -> str:
@@ -158,11 +168,17 @@ def write_file(
     if len(encoded) > 5 * 1024 * 1024:
         return FileOpResult("write_file rejected: content exceeds 5 MB", is_error=True)
 
-    resolved.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if append else "w"
     try:
-        with resolved.open(mode, encoding="utf-8") as handle:
-            handle.write(content)
+        lock = _lock_mutation(resolved)
+        if lock is None:
+            return FileOpResult(f"File is busy: {resolved}", is_error=True)
+        with lock:
+            if resolve_path(cwd, path, path_guard_enabled) != resolved:
+                return FileOpResult(f"File path changed: {resolved}", is_error=True)
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            with resolved.open(mode, encoding="utf-8") as handle:
+                handle.write(content)
     except OSError as exc:
         return FileOpResult(f"Failed to write {resolved}: {exc}", is_error=True)
 
@@ -199,6 +215,21 @@ def edit_file(
     if not resolved.is_file():
         return FileOpResult(f"Not a file: {resolved}", is_error=True)
 
+    try:
+        lock = nullcontext() if dry_run else _lock_mutation(resolved)
+        if lock is None:
+            return FileOpResult(f"File is busy: {resolved}", is_error=True)
+        with lock:
+            if resolve_path(cwd, path, path_guard_enabled) != resolved:
+                return FileOpResult(f"File path changed: {resolved}", is_error=True)
+            return _edit_locked(resolved, cwd, old_text, new_text, dry_run)
+    except OSError as exc:
+        return FileOpResult(f"Failed to edit {resolved}: {exc}", is_error=True)
+
+
+def _edit_locked(
+    resolved: Path, cwd: str, old_text: str, new_text: str, dry_run: bool
+) -> FileOpResult:
     try:
         original = resolved.read_text(encoding="utf-8")
     except OSError as exc:
@@ -305,17 +336,36 @@ def glob_files(
     if Path(pattern).anchor or ".." in Path(pattern).parts:
         return FileOpResult("glob pattern must stay inside workspace", is_error=True)
 
-    matches = glob_module.glob(str(root / pattern), recursive=True)
+    # Walk one pattern component at a time so links are checked before descent.
+    matches = _glob_entries(root, Path(pattern).parts)
     rels: list[str] = []
-    for match in sorted(matches):
-        mp = Path(match).resolve()
-        try:
-            rels.append(str(mp.relative_to(root)))
-        except ValueError:
+    for match in dict.fromkeys(sorted(matches)):
+        if match == root:
             continue
+        rels.append(str(match.relative_to(root)))
         if len(rels) >= limit:
             break
     return FileOpResult("\n".join(rels) or "(no matches)")
+
+
+def _glob_entries(directory: Path, parts: tuple[str, ...]):
+    if not parts:
+        yield directory
+        return
+    if parts[0] == "**":
+        yield from _glob_entries(directory, parts[1:])
+        for child in directory.iterdir():
+            if not child.name.startswith(".") and scan_entry(child):
+                if child.is_dir():
+                    yield from _glob_entries(child, parts)
+                elif len(parts) == 1:
+                    yield child
+        return
+    for child in directory.glob(parts[0]):
+        if not parts[0].startswith(".") and child.name.startswith("."):
+            continue
+        if scan_entry(child) and (len(parts) == 1 or child.is_dir()):
+            yield from _glob_entries(child, parts[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -342,34 +392,44 @@ def directory_tree(
     exclude = set(exclude_patterns) if exclude_patterns else SKIP_DIRS
 
     lines: list[str] = [f"{resolved.name}/"]
-    _walk_tree(resolved, resolved, "", max_depth, exclude, lines)
+    guard = PathGuard(cwd) if path_guard_enabled else None
+    _walk_tree(resolved, "", max_depth, exclude, lines, guard)
     return FileOpResult("\n".join(lines))
 
 
 def _walk_tree(
-    root: Path,
     current: Path,
     prefix: str,
     max_depth: int,
     exclude: set[str],
     lines: list[str],
+    guard: PathGuard | None,
 ) -> None:
     if max_depth <= 0:
         return
     try:
-        entries = sorted(current.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+        entries = sorted(
+            (
+                child
+                for child in current.iterdir()
+                if child.name not in exclude and scan_entry(child)
+            ),
+            key=lambda child: (not child.is_dir(), child.name.lower()),
+        )
     except OSError:
         return
     for i, child in enumerate(entries):
-        if child.name in exclude:
-            continue
         is_last = i == len(entries) - 1
         connector = "└── " if is_last else "├── "
         marker = "/" if child.is_dir() else ""
         lines.append(f"{prefix}{connector}{child.name}{marker}")
         if child.is_dir():
             extension = "    " if is_last else "│   "
-            _walk_tree(root, child, prefix + extension, max_depth - 1, exclude, lines)
+            try:
+                directory = guard.validate(child) if guard else child
+            except (OSError, PathPolicyError):
+                continue
+            _walk_tree(directory, prefix + extension, max_depth - 1, exclude, lines, guard)
 
 
 # ---------------------------------------------------------------------------
@@ -400,19 +460,24 @@ def grep(
         return FileOpResult(f"invalid regex: {exc}", is_error=True)
 
     matches: list[str] = []
-    files = [start] if start.is_file() else [p for p in start.rglob("*") if p.is_file()]
+    files = [start] if start.is_file() else scan_files(start, exclude=SKIP_DIRS)
+    guard = PathGuard(root) if path_guard_enabled else None
 
     for file_path in files:
         if skip_file(file_path):
             continue
         try:
-            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
+            with guard.open_read(file_path) if guard else file_path.open("rb") as handle:
+                raw = handle.read(MAX_FILE_SIZE + 1)
+            if len(raw) > MAX_FILE_SIZE:
+                continue
+            lines = raw.decode("utf-8", errors="ignore").splitlines()
+        except (OSError, ValueError):
             continue
         for line_number, line in enumerate(lines, start=1):
             found = bool(compiled.search(line)) if compiled else pattern in line
             if found:
-                matches.append(f"{file_path.relative_to(root)}:{line_number}: {line.strip()}")
+                matches.append(f"{_relative_to(file_path, cwd)}:{line_number}: {line.strip()}")
                 if len(matches) >= limit:
                     return FileOpResult("\n".join(matches))
 
