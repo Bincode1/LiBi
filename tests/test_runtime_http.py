@@ -146,7 +146,6 @@ def test_runtime_hides_other_workspaces_and_rejects_their_session_routes(runtime
 
 def test_async_receipt_is_durable_before_worker_starts(runtime_http, monkeypatch):
     runtime, client = runtime_http
-    runtime.session_store.runtime_port = 8080
     original_start = threading.Thread.start
 
     def defer_turn_thread(thread):
@@ -170,7 +169,10 @@ def test_async_receipt_is_durable_before_worker_starts(runtime_http, monkeypatch
     assert [event.event_type for event in events] == ["turn/started", "user/message"]
     assert {event.turn_id for event in events} == {receipt["turn_id"]}
     assert events[-1].payload == {"content": "persist me"}
-    other_runtime.session_store.recover_interrupted_runtime_turns(8080)
+    other_runtime.session_store.recover_interrupted_turns()
+    assert other_runtime.session_store.state(session_id).status == "running"
+    runtime.session_store.release_turn(session_id, receipt["turn_id"])
+    other_runtime.session_store.recover_interrupted_turns()
     assert other_runtime.session_store.state(session_id).status == "canceled"
 
 
@@ -241,7 +243,7 @@ def test_http_sessions_events_and_sse_have_consistent_cursors(runtime_http):
     assert [event["sequence"] for event in replay["events"]] == [answer.sequence]
 
 
-def test_http_restart_recovers_only_its_owned_interrupted_turn(
+def test_http_restart_recovers_orphaned_turns_across_entry_points(
     tmp_path, config, provider_stream, monkeypatch
 ):
     config.llm.api_key = "synthetic-runtime-llm-credential"
@@ -266,7 +268,7 @@ def test_http_restart_recovers_only_its_owned_interrupted_turn(
             start("cli", "cli-turn")
             start("other-listener", "other-turn", self.server_port + 1)
             start("continued-in-cli", "old-runtime-turn", self.server_port)
-            start("continued-in-cli", "new-cli-turn")
+            store.start_turn("continued-in-cli", "new-cli-turn", mode="react", message="Live")
             sid, tid, step = "interrupted", "old-turn", "tool-step"
             start(sid, tid, self.server_port)
             store.append(sid, "user/message", {"content": "Read and write"}, turn_id=tid)
@@ -308,14 +310,12 @@ def test_http_restart_recovers_only_its_owned_interrupted_turn(
                 tool_call_id="write-call",
                 approval_id="pending-approval",
             )
-            store.runtime_port = self.server_port
             store.acquire_compaction_lease(
                 sid,
                 attempt_id="interrupted-compaction",
                 base_sequence=store.last_sequence(sid),
                 surface_hash="surface",
             )
-            store.runtime_port = None
 
         def serve_forever(self, poll_interval=0.01):
             ready.put(self)
@@ -343,16 +343,18 @@ def test_http_restart_recovers_only_its_owned_interrupted_turn(
             assert page["active_run"] is None
             terminals = [event for event in page["events"] if event["type"] == "turn/canceled"]
             assert len(terminals) == 1
-            assert terminals[0]["payload"]["reason"] == "runtime_restarted"
+            assert terminals[0]["payload"]["reason"] == "executor_interrupted"
             approval = next(
                 event for event in page["events"] if event["type"] == "approval/canceled"
             )
             assert approval["approval_id"] == "pending-approval"
-            for sid in ("cli", "other-listener", "continued-in-cli"):
+            for sid in ("cli", "other-listener"):
                 assert (
                     client.get(f"/v1/sessions/{sid}/events.json").json()["state"]["status"]
-                    == "running"
+                    == "canceled"
                 )
+            live = client.get("/v1/sessions/continued-in-cli/events.json").json()
+            assert live["state"]["status"] == "running"
             resumed = client.post(f"{base}/turns", json={"message": "Continue"})
             assert resumed.status_code == 200
             assert resumed.json()["text"] == "Resumed"
@@ -363,14 +365,18 @@ def test_http_restart_recovers_only_its_owned_interrupted_turn(
             ]
             assert results == [
                 ("read-call", "read completed"),
-                ("write-call", "Tool call interrupted by Runtime restart. Result unknown."),
+                (
+                    "write-call",
+                    "Tool call interrupted before the executor settled. Result unknown.",
+                ),
             ]
             page = client.get(f"{base}/events.json").json()
             latest_start = [event for event in page["events"] if event["type"] == "turn/started"][
                 -1
             ]
-            assert latest_start["payload"]["runtime_port"] == server.server_port
+            assert latest_start["payload"] == {"mode": "react"}
     finally:
+        store.release_turn("continued-in-cli", "new-cli-turn")
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
@@ -569,6 +575,37 @@ def test_http_engine_failure_returns_error_and_persists_failed_turn(
     failed = next(event for event in page.json()["events"] if event["type"] == "turn/failed")
     assert failed["payload"].get("provider_error") == {"kind": "http", "status_code": 503}
     assert "synthetic-private" not in page.text
+
+
+def test_event_pages_bound_history_without_skipping_events(runtime_http, monkeypatch):
+    runtime, client = runtime_http
+    monkeypatch.setattr("paicli.runtime.api._EVENT_PAGE_SIZE", 2)
+    sid = runtime._create_session()
+    for index in range(5):
+        runtime.session_store.append(sid, "user/message", {"content": str(index)})
+    base = f"/v1/sessions/{sid}"
+    received = []
+    cursor = 0
+    for more in (True, True, False):
+        page = client.get(f"{base}/events.json", params={"cursor": cursor}).json()
+        received.extend(
+            event["payload"]["content"]
+            for event in page["events"]
+            if event["type"] == "user/message"
+        )
+        cursor = page["next_cursor"]
+        assert page["has_more"] is more
+    assert received == ["0", "1", "2", "3", "4"]
+    with client.stream("GET", f"{base}/events/stream", params={"view": "conversation"}) as stream:
+        pages = _event_stream_pages(stream)
+        assert [next(pages)["next_cursor"] for _ in range(3)] == [2, 4, 6]
+
+
+def test_runtime_rejects_oversized_request_body(runtime_http):
+    _runtime, client = runtime_http
+    result = client.post("/v1/sessions", content=b"x" * (1024 * 1024 + 1))
+    assert result.status_code == 413
+    assert client.get("/v1/sessions").json()["sessions"] == []
 
 
 def test_http_turn_recovers_from_one_transient_provider_failure(runtime_http, monkeypatch):
@@ -1605,5 +1642,4 @@ def test_background_turn_records_completion_or_failure(tmp_path, config, monkeyp
     assert "finished_at" in record
     if failure:
         assert record["error"] == "RuntimeError"
-    else:
-        assert record["result"]["text"] == "hello"
+    assert "result" not in record

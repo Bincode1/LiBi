@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -88,6 +90,42 @@ def test_worker_loop_settles_task_and_joins_heartbeat(runtime, monkeypatch, outc
         assert task.error == "worker failed"
     elif outcome == "completed":
         assert task.result == "result"
+
+
+def test_running_worker_waits_for_tool_cleanup_before_canceled(runtime, monkeypatch, tmp_path):
+    entered, canceled, release = (threading.Event() for _ in range(3))
+    late_file = tmp_path / "late.txt"
+    task_id = runtime.task_manager.add("simulate a suspended tool")
+
+    async def execute(_task):
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+            late_file.write_text("late write", encoding="utf-8")
+        except asyncio.CancelledError:
+            canceled.set()
+            assert await asyncio.to_thread(release.wait, 5)
+            raise
+
+    monkeypatch.setattr(runtime, "_run_task", execute)
+    worker = threading.Thread(target=runtime._worker_loop, args=("worker",), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert runtime.task_manager.cancel(task_id)
+        assert canceled.wait(5)
+        assert runtime.task_manager.get(task_id).status == "canceling"
+        release.set()
+        deadline = time.monotonic() + 5
+        while runtime.task_manager.get(task_id).status != "canceled":
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert not late_file.exists()
+    finally:
+        release.set()
+        runtime._stop.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
 
 
 def test_runtime_cancellation_closes_turn_and_propagates(runtime, monkeypatch):

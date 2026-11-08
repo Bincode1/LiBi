@@ -413,14 +413,20 @@ curl -sS http://127.0.0.1:24158/v1/sessions/<session_id>/events.json \
   -H 'x-api-key: dev-key'
 ```
 
-轮询接口 `GET /v1/sessions/<session_id>/events.json?cursor=<sequence>` 返回事件与
-`next_cursor`。游标只推进到本次返回的最后一条事件，避免并发写入造成事件遗漏。
+轮询接口 `GET /v1/sessions/<session_id>/events.json?cursor=<sequence>` 每页最多返回 200 条事件。
+当 `has_more` 为 true 时使用 `next_cursor` 读取下一页。游标只推进到本次返回的最后一条事件。
+Runtime JSON 请求体上限为 1 MiB。
 通过 `POST /v1/sessions/<session_id>/turns/async` 启动回合后，轮询响应中的 `assistant_preview`
 提供当前步骤已生成的文本，并附带 `turn_id` 和 `step_id`。预览独立于历史游标，步骤完成后由
 历史中的 `assistant/message` 接管。
 
 异步回合可通过 `POST /v1/sessions/<session_id>/runs/<run_id>/cancel` 请求停止。事件响应的
-提交时先在 SQLite 同一个事务内接收回合并保存用户消息，再返回 `run_id`、与它相同的 `turn_id` 和提交前的 `after_sequence`。客户端可以立即停止回合。同一工作区的 CLI 和 Runtime 共享会话，每个会话同时只接收一个回合。会话不在当前工作区时返回 `404`。事件响应中的 `active_run` 同步运行状态，支持刷新后继续管理。Runtime 正常关闭时先结束已接收的运行，再释放端口。同一工作区、同一端口重启时会收尾中断的回合及待处理审批，把未返回的工具结果标为未知，原会话随后可以继续。
+提交时先在 SQLite 同一个事务内接收回合并保存用户消息，再返回 `run_id`、与它相同的
+`turn_id` 和提交前的 `after_sequence`。同一工作区的 CLI、SDK 和 Runtime 共享会话。
+每个会话的执行者持有进程级文件锁，直到回合清理完成。Runtime 启动或继续会话时可收尾已退出
+执行者留下的回合和待处理审批，把未返回的工具结果标为未知。升级前请停止旧版本的执行进程。
+会话不在当前工作区时返回 `404`。事件响应中的 `active_run` 同步运行状态，支持刷新后继续管理。
+已结束的异步运行只在内存中保留有限的短期状态，结果通过会话事件读取。
 
 实时客户端可订阅 `GET /v1/sessions/<session_id>/events/stream?cursor=<sequence>`。
 SSE 的 `page` 消息沿用 `events.json` 的数据结构，先重放历史，再推送新事件和文本预览。
@@ -485,7 +491,10 @@ curl -sS http://127.0.0.1:24158/v1/tasks \
 uv run paicli worker --workers 2 --cwd .
 ```
 
-任务队列按项目目录隔离；worker 使用 SQLite 原子事务领取任务，并通过 lease/heartbeat 恢复崩溃任务。运行中取消会阻止 worker 把迟到结果重新覆盖为 completed。
+任务队列按项目目录隔离。Worker 使用 SQLite 原子事务领取任务，并按本次领取序号和租约有效期
+续租、提交。取消已运行的任务会先显示 `canceling`，Worker 收到请求后取消协程，在清理完成后
+更新为 `canceled`。已经产生的文件或外部副作用仍需按原工具语义处理。进程异常退出后，过期的
+运行任务可重新领取，过期的取消请求会收尾为 `canceled`。
 
 ## 图片输入
 

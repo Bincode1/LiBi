@@ -195,6 +195,7 @@ class Agent:
         """
         session_id = self._ensure_session()
         assert self.session_store is not None
+        owns_turn = turn_id is None
         if turn_id is None:
             turn_id = f"turn_{uuid.uuid4().hex}"
             self.session_store.start_turn(session_id, turn_id, mode=self.mode, message=message)
@@ -245,9 +246,13 @@ class Agent:
                 self._log("turn/failed", failure, turn_id=turn_id)
             raise
         finally:
-            if snapshot is not None and self._turn_snapshot is None:
-                with suppress(Exception):
-                    snapshot.finish_turn()
+            try:
+                if snapshot is not None and self._turn_snapshot is None:
+                    with suppress(Exception):
+                        snapshot.finish_turn()
+            finally:
+                if owns_turn:
+                    self.session_store.release_turn(session_id, turn_id)
 
     def _close_canceled_turn(self, turn_id: str, cleanup_error: str | None) -> None:
         assert self.session_store is not None and self.session_id is not None

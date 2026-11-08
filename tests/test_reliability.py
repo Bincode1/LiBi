@@ -63,9 +63,11 @@ def context(tmp_path):
     config.policy.hitl_mode = "never"
     config.features.memory = False
     config.features.skill = False
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     store = SessionStore(tmp_path / "runtime.db")
     return ToolContext(
-        cwd=str(tmp_path),
+        cwd=str(workspace),
         config=config,
         session_store=store,
         session_id=store.create_session(),
@@ -680,6 +682,7 @@ def test_runtime_turn_closes_idle_children(tmp_path, monkeypatch):
 
     ctx = context(tmp_path)
     ctx.config.llm.api_key = "unit-placeholder"
+    ctx.config.session_title.enabled = False
     engines = []
 
     def engine_factory(**kwargs):

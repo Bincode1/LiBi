@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import sqlite3
 import uuid
 from collections.abc import Callable
-from contextlib import closing
-from dataclasses import replace
+from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any
 
+from paicli.policy.file_lock import try_file_lock
 from paicli.policy.redaction import Redactor
 from paicli.session.models import (
     MAX_SESSION_TITLE_LENGTH,
@@ -72,7 +74,7 @@ class SessionStore:
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.redactor = Redactor(sensitive_values)
-        self.runtime_port: int | None = None
+        self._turn_owners: dict[tuple[str, str], ExitStack] = {}
         self._on_append = on_append
         self._ensure_schema()
 
@@ -197,32 +199,54 @@ class SessionStore:
 
     def start_turn(self, session_id: str, turn_id: str, *, mode: str, message: str) -> int:
         """Claim a session and persist its input before an executor can run it."""
-        started: dict[str, Any] = {"mode": mode}
-        if self.runtime_port is not None:
-            started["runtime_port"] = self.runtime_port
-        created_at = _now()
-        with closing(self._connect()) as conn, conn:
-            conn.execute("begin immediate")
-            status, after_sequence = self._session_row(conn, session_id)
-            if status == "running":
-                raise TurnInProgressError("session already has an active turn")
-            self._assert_write_allowed(conn, session_id, "user/message", None)
-            for event_type, payload in (
-                ("turn/started", started),
-                ("user/message", {"content": message}),
-            ):
-                self._insert_event_tx(
-                    conn,
-                    session_id,
-                    event_type,
-                    json.dumps(self.sanitize_payload(payload), ensure_ascii=False),
-                    created_at,
-                    turn_id=turn_id,
-                    step_id=None,
-                    source="cli-or-runtime",
-                )
+        owner = self._try_own_turn(session_id)
+        if owner is None and os.name == "nt":
+            # Windows may finish releasing a killed process's byte-range lock
+            # after signaling its exit. Wait briefly without overriding the lock.
+            deadline = monotonic() + 0.5
+            while owner is None and monotonic() < deadline:
+                sleep(0.01)
+                owner = self._try_own_turn(session_id)
+        if owner is None:
+            raise TurnInProgressError("session already has an active turn")
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute("begin immediate")
+                status, after_sequence = self._session_row(conn, session_id)
+                if status == "running":
+                    self._recover_turn_tx(conn, session_id)
+                self._assert_write_allowed(conn, session_id, "user/message", None)
+                created_at = _now()
+                for event_type, payload in (
+                    ("turn/started", {"mode": mode}),
+                    ("user/message", {"content": message}),
+                ):
+                    self._insert_event_tx(
+                        conn,
+                        session_id,
+                        event_type,
+                        json.dumps(self.sanitize_payload(payload), ensure_ascii=False),
+                        created_at,
+                        turn_id=turn_id,
+                        step_id=None,
+                        source="cli-or-runtime",
+                    )
+        except BaseException:
+            owner.close()
+            raise
+        self._turn_owners[session_id, turn_id] = owner
         self._notify_append(session_id)
         return after_sequence
+
+    def release_turn(self, session_id: str, turn_id: str) -> None:
+        owner = self._turn_owners.pop((session_id, turn_id), None)
+        if owner is not None:
+            owner.close()
+
+    def _try_own_turn(self, session_id: str) -> ExitStack | None:
+        db_path = self.db_path.resolve()
+        directory = db_path.with_suffix(db_path.suffix + ".turns")
+        return try_file_lock(directory / hashlib.sha256(session_id.encode()).hexdigest())
 
     def session_exists(self, session_id: str, *, root_only: bool = False) -> bool:
         """Return whether a persisted session can be resumed by its identifier."""
@@ -415,8 +439,6 @@ class SessionStore:
             raise ValueError("session event type cannot be empty")
         if schema_version != 1:
             raise ValueError(f"unsupported session event schema version: {schema_version}")
-        if event_type == "turn/started" and self.runtime_port is not None:
-            payload = {**payload, "runtime_port": self.runtime_port}
         cleaned = self.sanitize_payload(payload)
         payload_json = json.dumps(
             cleaned, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -528,7 +550,7 @@ class SessionStore:
                 conn.execute("delete from session_leases where session_id = ?", (session_id,))
             conn.execute(
                 "insert into session_leases(session_id, owner_token, attempt_id, base_sequence, "
-                "surface_hash, expires_at, runtime_port) values (?, ?, ?, ?, ?, ?, ?)",
+                "surface_hash, expires_at) values (?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     owner_token,
@@ -536,7 +558,6 @@ class SessionStore:
                     base_sequence,
                     surface_hash,
                     expires_at,
-                    self.runtime_port,
                 ),
             )
             conn.commit()
@@ -678,21 +699,27 @@ class SessionStore:
 
     def active_turn_step(self, session_id: str) -> tuple[str | None, str | None]:
         with closing(self._connect()) as conn:
-            row = conn.execute(
-                """
-                select start.turn_id, (
-                    select case when step.type = 'step/started' then step.step_id end
-                    from events step where step.session_id = start.session_id
-                      and step.turn_id = start.turn_id
-                      and step.type in ('step/started', 'step/completed', 'step/failed')
-                    order by step.sequence desc limit 1
-                )
-                from sessions s join events start on start.session_id = s.id
-                where s.id = ? and s.status = 'running' and start.type = 'turn/started'
-                order by start.sequence desc limit 1
-                """,
-                (session_id,),
-            ).fetchone()
+            return self._active_turn_step(conn, session_id)
+
+    @staticmethod
+    def _active_turn_step(
+        conn: sqlite3.Connection, session_id: str
+    ) -> tuple[str | None, str | None]:
+        row = conn.execute(
+            """
+            select start.turn_id, (
+                select case when step.type = 'step/started' then step.step_id end
+                from events step where step.session_id = start.session_id
+                  and step.turn_id = start.turn_id
+                  and step.type in ('step/started', 'step/completed', 'step/failed')
+                order by step.sequence desc limit 1
+            )
+            from sessions s join events start on start.session_id = s.id
+            where s.id = ? and s.status = 'running' and start.type = 'turn/started'
+            order by start.sequence desc limit 1
+            """,
+            (session_id,),
+        ).fetchone()
         return (row[0], row[1]) if row else (None, None)
 
     def pending_tool_calls(self, session_id: str, turn_id: str, step_id: str) -> dict[str, str]:
@@ -725,105 +752,106 @@ class SessionStore:
                 pending.pop(call_id, None)
         return pending
 
-    def recover_interrupted_runtime_turns(self, port: int) -> None:
-        """Settle turns from the preceding owner after exclusively binding its listener."""
-        now = datetime.now(UTC)
-        created_at = now.isoformat()
-        with closing(self._connect()) as conn, conn:
-            conn.execute("begin immediate")
-            conn.execute(
-                "delete from session_leases where runtime_port = ? and (? is null or "
-                "session_id in (select id from sessions where workspace = ?))",
-                (port, self.workspace, self.workspace),
-            )
-            turns = conn.execute(
-                """
-                select s.id, start.turn_id, start.payload, lease.expires_at
-                from sessions s
-                join events start on start.session_id = s.id and start.sequence = (
-                    select max(sequence) from events
-                    where session_id = s.id and type = 'turn/started'
-                )
-                left join session_leases lease on lease.session_id = s.id
-                where s.status = 'running' and start.turn_id is not null
-                  and (? is null or s.workspace = ?)
-                """,
+    def recover_interrupted_turns(self) -> None:
+        """Settle durable running turns whose execution slot is no longer held."""
+        with closing(self._connect()) as conn:
+            candidates = conn.execute(
+                "select id from sessions where status = 'running' and (? is null or workspace = ?)",
                 (self.workspace, self.workspace),
             ).fetchall()
-            for session_id, turn_id, payload, lease_expires_at in turns:
-                if json.loads(payload).get("runtime_port") != port:
+        for (session_id,) in candidates:
+            owner = self._try_own_turn(session_id)
+            if owner is None:
+                continue
+            with owner, closing(self._connect()) as conn, conn:
+                conn.execute("begin immediate")
+                if not self._recover_turn_tx(conn, session_id):
                     continue
-                if lease_expires_at is not None and not _is_expired(lease_expires_at, now):
-                    continue
-                step = conn.execute(
-                    """
-                    select type, step_id from events where session_id = ? and turn_id = ?
-                      and type in ('step/started', 'step/completed', 'step/failed')
-                    order by sequence desc limit 1
-                    """,
-                    (session_id, turn_id),
-                ).fetchone()
-                if step and step[0] == "step/started" and step[1]:
-                    for call_id, name in self._pending_tool_calls(
-                        conn, session_id, turn_id, step[1]
-                    ).items():
-                        self._insert_event_tx(
-                            conn,
-                            session_id,
-                            "tool/result",
-                            json.dumps(
-                                {
-                                    "name": name,
-                                    "content": "Tool call interrupted by Runtime restart. "
-                                    "Result unknown.",
-                                    "is_error": True,
-                                }
-                            ),
-                            created_at,
-                            turn_id=turn_id,
-                            step_id=step[1],
-                            tool_call_id=call_id,
-                            source="runtime",
-                        )
-                approvals = conn.execute(
-                    """
-                    select approval_id, tool_call_id, step_id from events
-                    where session_id = ? and turn_id = ? and type = 'approval/started'
-                      and approval_id is not null and approval_id not in (
-                        select approval_id from events where session_id = ? and turn_id = ?
-                          and type in (
-                              'approval/approved', 'approval/rejected', 'approval/canceled'
-                          )
-                          and approval_id is not null
-                    )
-                    order by sequence
-                    """,
-                    (session_id, turn_id, session_id, turn_id),
-                ).fetchall()
-                detail = json.dumps({"reason": "runtime_restarted"})
-                for approval_id, call_id, step_id in approvals:
-                    self._insert_event_tx(
-                        conn,
-                        session_id,
-                        "approval/canceled",
-                        detail,
-                        created_at,
-                        turn_id=turn_id,
-                        step_id=step_id,
-                        tool_call_id=call_id,
-                        approval_id=approval_id,
-                        source="runtime",
-                    )
+            self._notify_append(session_id)
+
+    def _recover_turn_tx(self, conn: sqlite3.Connection, session_id: str) -> bool:
+        # Caller holds the same OS lock used by a live executor.
+        row = conn.execute(
+            "select e.turn_id from sessions s join events e on e.session_id = s.id "
+            "where s.id = ? and s.status = 'running' and e.type = 'turn/started' "
+            "order by e.sequence desc limit 1",
+            (session_id,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return False
+        turn_id = row[0]
+        created_at = _now()
+        conn.execute("delete from session_leases where session_id = ?", (session_id,))
+        step = conn.execute(
+            """
+            select type, step_id from events where session_id = ? and turn_id = ?
+              and type in ('step/started', 'step/completed', 'step/failed')
+            order by sequence desc limit 1
+            """,
+            (session_id, turn_id),
+        ).fetchone()
+        if step and step[0] == "step/started" and step[1]:
+            for call_id, name in self._pending_tool_calls(
+                conn, session_id, turn_id, step[1]
+            ).items():
                 self._insert_event_tx(
                     conn,
                     session_id,
-                    "turn/canceled",
-                    detail,
+                    "tool/result",
+                    json.dumps(
+                        {
+                            "name": name,
+                            "content": "Tool call interrupted before the executor settled. "
+                            "Result unknown.",
+                            "is_error": True,
+                        }
+                    ),
                     created_at,
                     turn_id=turn_id,
-                    step_id=None,
-                    source="runtime",
+                    step_id=step[1],
+                    tool_call_id=call_id,
+                    source="session-recovery",
                 )
+        approvals = conn.execute(
+            """
+            select approval_id, tool_call_id, step_id from events
+            where session_id = ? and turn_id = ? and type = 'approval/started'
+              and approval_id is not null and approval_id not in (
+                select approval_id from events where session_id = ? and turn_id = ?
+                  and type in (
+                      'approval/approved', 'approval/rejected', 'approval/canceled'
+                  )
+                  and approval_id is not null
+            )
+            order by sequence
+            """,
+            (session_id, turn_id, session_id, turn_id),
+        ).fetchall()
+        detail = json.dumps({"reason": "executor_interrupted"})
+        for approval_id, call_id, step_id in approvals:
+            self._insert_event_tx(
+                conn,
+                session_id,
+                "approval/canceled",
+                detail,
+                created_at,
+                turn_id=turn_id,
+                step_id=step_id,
+                tool_call_id=call_id,
+                approval_id=approval_id,
+                source="session-recovery",
+            )
+        self._insert_event_tx(
+            conn,
+            session_id,
+            "turn/canceled",
+            detail,
+            created_at,
+            turn_id=turn_id,
+            step_id=None,
+            source="session-recovery",
+        )
+        return True
 
     def get_web_document(
         self,
@@ -884,6 +912,7 @@ class SessionStore:
         *,
         after_sequence: int = 0,
         event_types: tuple[str, ...] | None = None,
+        limit: int | None = None,
     ) -> list[SessionEvent]:
         if after_sequence < 0:
             raise ValueError("event cursor cannot be negative")
@@ -904,8 +933,9 @@ class SessionStore:
                 where session_id = ? and sequence > ? and schema_version is not null
                 {type_filter}
                 order by sequence
+                limit ?
                 """,
-                (session_id, after_sequence, *(event_types or ())),
+                (session_id, after_sequence, *(event_types or ()), -1 if limit is None else limit),
             ).fetchall()
         return self._decode_events(rows)
 
@@ -917,6 +947,7 @@ class SessionStore:
         visible_after_sequence: int,
         visible_types: tuple[str, ...],
         state_event_types: tuple[str, ...] = (),
+        page_size: int | None = None,
     ) -> tuple[list[SessionEvent], int]:
         """Read events needed for state and the undelivered conversation through a watermark."""
         state_events = _STATE_EVENT_TYPES + state_event_types
@@ -933,6 +964,8 @@ class SessionStore:
             if latest is None or latest[0] <= after_sequence:
                 return [], after_sequence
             watermark = latest[0]
+            if page_size is not None:
+                watermark = min(watermark, max(visible_after_sequence, after_sequence) + page_size)
             # Bound this read to the watermark so a concurrent append is delivered next time.
             rows = conn.execute(
                 f"""
@@ -984,11 +1017,37 @@ class SessionStore:
         return result
 
     def state(self, session_id: str) -> SessionState:
-        events, watermark = self.replay_events(
-            session_id, after_sequence=0, visible_after_sequence=0, visible_types=()
+        with closing(self._connect()) as conn, conn:
+            conn.execute("begin")
+            if self.workspace is not None:
+                self._session_row(conn, session_id)
+            row = conn.execute(
+                "select status, last_sequence, title from sessions where id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return SessionState(session_id, "created", 0)
+            status, sequence, title = row
+            turn_id, step_id = (
+                self._active_turn_step(conn, session_id) if status == "running" else (None, None)
+            )
+            checkpoint = conn.execute(
+                "select event_id, payload from events where session_id = ? "
+                "and type = 'compaction/checkpoint' order by sequence desc limit 1",
+                (session_id,),
+            ).fetchone()
+        compaction_id = None
+        if checkpoint is not None:
+            payload = self.sanitize_payload(json.loads(checkpoint[1]))
+            compaction_id = str(payload.get("compaction_id") or checkpoint[0])
+        return SessionState(
+            session_id,
+            status,
+            sequence,
+            turn_id,
+            step_id,
+            compaction_id,
+            self.redactor.clean(title) if title is not None else None,
         )
-        state = self.advance_state(SessionState(session_id, "created", 0), events)
-        return replace(state, last_sequence=watermark)
 
     @staticmethod
     def advance_state(state: SessionState, events: list[SessionEvent]) -> SessionState:
@@ -1286,6 +1345,10 @@ class SessionStore:
                 "on events(session_id, sequence) where type = 'turn/started'"
             )
             conn.execute(
+                "create index if not exists idx_events_compaction_checkpoints "
+                "on events(session_id, sequence) where type = 'compaction/checkpoint'"
+            )
+            conn.execute(
                 "create index if not exists idx_sessions_updated_at "
                 "on sessions(updated_at desc, id desc)"
             )
@@ -1297,12 +1360,8 @@ class SessionStore:
                 "create table if not exists session_leases ("
                 "session_id text primary key, owner_token text not null unique, "
                 "attempt_id text not null, base_sequence integer not null, "
-                "surface_hash text not null, expires_at text not null, runtime_port integer)"
+                "surface_hash text not null, expires_at text not null)"
             )
-            if "runtime_port" not in {
-                row[1] for row in conn.execute("pragma table_info(session_leases)")
-            }:
-                conn.execute("alter table session_leases add column runtime_port integer")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)

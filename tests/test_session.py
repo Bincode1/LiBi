@@ -3,13 +3,53 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import subprocess
+import sys
+import time
 
 import pytest
 
 from paicli.agent import Agent, QueryEngine
 from paicli.config import load_config
-from paicli.session import ContextProjector, RequestBuilder, SessionStore
+from paicli.session import ContextProjector, RequestBuilder, SessionStore, TurnInProgressError
 from paicli.tools import ToolRegistry
+
+
+@pytest.mark.integration
+def test_process_exit_releases_turn_ownership_without_a_listener_port(tmp_path):
+    db = tmp_path / "runtime.db"
+    store = SessionStore(db, workspace=tmp_path)
+    sid = store.create_session()
+    script = """
+import sys
+from paicli.session import SessionStore
+store = SessionStore(sys.argv[1], workspace=sys.argv[2])
+store.start_turn(sys.argv[3], "crashed-turn", mode="react", message="Original")
+sys.stdin.read()
+"""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, str(db), str(tmp_path), sid], stdin=subprocess.PIPE
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while store.state(sid).status != "running":
+            assert proc.poll() is None and time.monotonic() < deadline
+            time.sleep(0.02)
+        store.recover_interrupted_turns()
+        assert store.state(sid).status == "running"
+        with pytest.raises(TurnInProgressError):
+            store.start_turn(sid, "duplicate", mode="react", message="Duplicate")
+    finally:
+        proc.kill()
+        proc.communicate(timeout=5)
+
+    store.start_turn(sid, "resumed", mode="react", message="Continue")
+    try:
+        assert store.state(sid).active_turn_id == "resumed"
+        events = store.events(sid, event_types=("turn/canceled",))
+        assert [event.turn_id for event in events] == ["crashed-turn"]
+    finally:
+        store.release_turn(sid, "resumed")
 
 
 def test_session_store_appends_atomically_and_supports_cursor(tmp_path):

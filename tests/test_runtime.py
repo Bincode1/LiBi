@@ -51,6 +51,7 @@ def test_legacy_team_task_fails_explicitly(tmp_path):
 def test_runtime_initialization_failure_closes_canonical_turn(tmp_path, monkeypatch):
     config = load_config(project_root=tmp_path)
     config.llm.api_key = "unit-placeholder"
+    config.session_title.enabled = False
     server = RuntimeApiServer(
         cwd=str(tmp_path), config=config, api_key="unit-runtime-placeholder", workers=1
     )

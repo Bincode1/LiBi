@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 TASK_MODES = {"react", "plan"}
-TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 
 
 @dataclass(slots=True)
@@ -41,7 +41,7 @@ class DurableTaskManager:
         mode = _validate_mode(mode)
         task_id = _new_id("task")
         now = _now()
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 insert into tasks(id, prompt, status, created_at, updated_at, mode, scope)
@@ -60,11 +60,12 @@ class DurableTaskManager:
         """Atomically lease the oldest queued task or an abandoned expired task."""
 
         owner = worker_id or "anonymous-worker"
-        now = _now()
-        lease_expires = _future(lease_seconds)
         conn = self._connect()
         try:
             conn.execute("begin immediate")
+            now = _now()
+            lease_expires = _future(lease_seconds)
+            self._settle_expired_cancellations(conn, now)
             scope_clause = " and scope = ?" if self.scope else ""
             select_params: list[str] = [now]
             if self.scope:
@@ -117,73 +118,147 @@ class DurableTaskManager:
         finally:
             conn.close()
 
-    def heartbeat(self, task_id: str, worker_id: str, *, lease_seconds: float = 300) -> bool:
+    def heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 300,
+        attempt: int | None = None,
+    ) -> bool:
         scope_clause = " and scope = ?" if self.scope else ""
-        params: list[str] = [_now(), _future(lease_seconds), task_id, worker_id]
+        attempt_clause = " and attempts = ?" if attempt is not None else ""
+        now = _now()
+        params: list[str | int] = [now, _future(lease_seconds), task_id, worker_id, now]
+        if attempt is not None:
+            params.append(attempt)
         if self.scope:
             params.append(self.scope)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 f"""
                 update tasks
                 set updated_at = ?, lease_expires_at = ?
                 where id = ? and status = 'running' and worker_id = ?
+                and lease_expires_at > ? {attempt_clause}
                 {scope_clause}
                 """,
                 params,
             )
             return cursor.rowcount == 1
 
-    def complete(self, task_id: str, result: str, *, worker_id: str | None = None) -> bool:
+    def complete(
+        self,
+        task_id: str,
+        result: str,
+        *,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+    ) -> bool:
         return self._finish(
             task_id,
             "completed",
             result=result,
             error=None,
             worker_id=worker_id,
+            attempt=attempt,
         )
 
-    def fail(self, task_id: str, error: str, *, worker_id: str | None = None) -> bool:
+    def fail(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+        partial_result: str | None = None,
+    ) -> bool:
         return self._finish(
             task_id,
             "failed",
-            result=None,
+            result=partial_result,
             error=error,
             worker_id=worker_id,
+            attempt=attempt,
         )
 
     def cancel(self, task_id: str) -> bool:
         scope_clause = " and scope = ?" if self.scope else ""
-        params = [_now(), task_id]
+        now = _now()
+        params = [now, task_id]
         if self.scope:
             params.append(self.scope)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 f"""
                 update tasks
-                set status = 'canceled', updated_at = ?, worker_id = null,
-                    lease_expires_at = null
+                set status = case when status = 'running' then 'canceling' else 'canceled' end,
+                    updated_at = ?
                 where id = ? and status in ('queued', 'running')
                 {scope_clause}
                 """,
                 params,
             )
+            self._settle_expired_cancellations(conn, now)
             return cursor.rowcount > 0
 
     def is_canceled(self, task_id: str) -> bool:
         scope_clause = " and scope = ?" if self.scope else ""
         params = [task_id, *([self.scope] if self.scope else [])]
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             row = conn.execute(
                 f"select status from tasks where id = ?{scope_clause}", params
             ).fetchone()
-        return bool(row and row[0] == "canceled")
+        return bool(row and row[0] in {"canceling", "canceled"})
+
+    def owns_active_claim(self, task: TaskRecord) -> bool:
+        scope_clause = " and scope = ?" if self.scope else ""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f"""
+                select 1 from tasks where id = ? and status = 'running'
+                and worker_id = ? and attempts = ? and lease_expires_at > ?
+                {scope_clause}
+                """,
+                (
+                    task.id,
+                    task.worker_id,
+                    task.attempts,
+                    _now(),
+                    *([self.scope] if self.scope else []),
+                ),
+            ).fetchone()
+        return row is not None
+
+    def finish_cancel(self, task: TaskRecord) -> bool:
+        return self._finish(
+            task.id,
+            "canceled",
+            result=None,
+            error=None,
+            worker_id=task.worker_id,
+            attempt=task.attempts,
+            previous_status="canceling",
+        )
+
+    def _settle_expired_cancellations(self, conn: sqlite3.Connection, now: str) -> None:
+        scope_clause = " and scope = ?" if self.scope else ""
+        conn.execute(
+            f"""
+            update tasks set status = 'canceled', updated_at = ?, worker_id = null,
+                lease_expires_at = null
+            where status = 'canceling' and (lease_expires_at is null or lease_expires_at <= ?)
+            {scope_clause}
+            """,
+            (now, now, *([self.scope] if self.scope else [])),
+        )
 
     def requeue_expired(self) -> int:
         now = _now()
         scope_clause = " and scope = ?" if self.scope else ""
         params = [now, now, *([self.scope] if self.scope else [])]
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
+            self._settle_expired_cancellations(conn, now)
             cursor = conn.execute(
                 f"""
                 update tasks
@@ -201,7 +276,7 @@ class DurableTaskManager:
     def list(self, limit: int = 50) -> list[TaskRecord]:
         scope_clause = " where scope = ?" if self.scope else ""
         params: list[str | int] = [self.scope, limit] if self.scope else [limit]
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             rows = conn.execute(
                 f"""
                 select {_TASK_COLUMNS}
@@ -217,7 +292,7 @@ class DurableTaskManager:
     def get(self, task_id: str) -> TaskRecord | None:
         scope_clause = " and scope = ?" if self.scope else ""
         params = [task_id, *([self.scope] if self.scope else [])]
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             row = conn.execute(
                 f"select {_TASK_COLUMNS} from tasks where id = ?{scope_clause}", params
             ).fetchone()
@@ -231,21 +306,28 @@ class DurableTaskManager:
         result: str | None,
         error: str | None,
         worker_id: str | None,
+        attempt: int | None,
+        previous_status: str = "running",
     ) -> bool:
         owner_clause = " and worker_id = ?" if worker_id else ""
         scope_clause = " and scope = ?" if self.scope else ""
-        params: list[str | None] = [status, result, error, _now(), task_id]
+        attempt_clause = " and attempts = ?" if attempt is not None else ""
+        now = _now()
+        params: list[str | int | None] = [status, result, error, now, task_id, previous_status, now]
         if worker_id:
             params.append(worker_id)
+        if attempt is not None:
+            params.append(attempt)
         if self.scope:
             params.append(self.scope)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 f"""
                 update tasks
                 set status = ?, result = ?, error = ?, updated_at = ?,
                     worker_id = null, lease_expires_at = null
-                where id = ? and status = 'running'{owner_clause}
+                where id = ? and status = ? and lease_expires_at > ?
+                {owner_clause}{attempt_clause}
                 {scope_clause}
                 """,
                 params,
@@ -253,7 +335,8 @@ class DurableTaskManager:
             return cursor.rowcount == 1
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
+            conn.execute("begin immediate")
             conn.execute(
                 """
                 create table if not exists tasks (

@@ -8,11 +8,13 @@ import re
 import socket
 import threading
 import uuid
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from hmac import compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import monotonic
@@ -37,6 +39,13 @@ from paicli.session import (
 from paicli.tools.base import ToolDecision
 
 _APPROVAL_TIMEOUT = 300.0
+_TASK_LEASE_SECONDS = 300
+_TASK_HEARTBEAT_INTERVAL = 30.0
+_TASK_CONTROL_INTERVAL = 0.1
+_MAX_REQUEST_BYTES = 1024 * 1024
+_EVENT_PAGE_SIZE = 200
+_FINISHED_RUN_LIMIT = 256
+_FINISHED_RUN_TTL = 600.0
 _APPROVAL_ROUTE = re.compile(r"/v1/sessions/([^/]+)/approvals/([^/]+)/decision")
 _CANCEL_RUN_ROUTE = re.compile(r"/v1/sessions/([^/]+)/runs/([^/]+)/cancel")
 _CHILD_STREAM_ROUTE = re.compile(r"/v1/sessions/([^/]+)/subagents/([^/]+)/events/stream")
@@ -94,6 +103,10 @@ class RuntimeBindError(OSError):
     pass
 
 
+class RequestBodyTooLarge(ValueError):
+    pass
+
+
 class RuntimeApiServer:
     """HTTP runtime backed directly by the canonical SessionStore event log."""
 
@@ -118,6 +131,7 @@ class RuntimeApiServer:
         self._stop = threading.Event()
         self._title_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="paicli-title")
         self._background_turns: dict[str, dict[str, Any]] = {}
+        self._finished_runs: OrderedDict[str, float] = OrderedDict()
         self._background_turns_lock = threading.Condition(threading.Lock())
         self._active_turn_sessions: dict[str, str | None] = {}
         self._session_permissions: dict[str, PermissionMode] = {}
@@ -138,6 +152,8 @@ class RuntimeApiServer:
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
+            timeout = 10
+
             def do_POST(self) -> None:  # noqa: N802
                 outer._handle(self)
 
@@ -160,8 +176,7 @@ class RuntimeApiServer:
                 raise RuntimeBindError(
                     f"Cannot listen on 127.0.0.1:{self.port}: {exc.strerror or exc}."
                 ) from exc
-            self.session_store.recover_interrupted_runtime_turns(server.server_port)
-            self.session_store.runtime_port = server.server_port
+            self.session_store.recover_interrupted_turns()
             self._start_workers()
             print(
                 f"PaiCLI Runtime API listening on http://127.0.0.1:{server.server_port}", flush=True
@@ -180,7 +195,7 @@ class RuntimeApiServer:
                 self._cancel_background_turn(session_id, run_id)
         with self._background_turns_lock:
             self._background_turns_lock.wait_for(lambda: not self._active_turn_sessions)
-        self._title_executor.shutdown(wait=False, cancel_futures=True)
+        self._title_executor.shutdown(wait=True, cancel_futures=True)
 
     def work_forever(self) -> None:
         self._start_workers()
@@ -210,6 +225,15 @@ class RuntimeApiServer:
             return
         try:
             body = _read_json(request)
+        except RequestBodyTooLarge as exc:
+            request.close_connection = True
+            _send_json(request, 413, {"error": str(exc)})
+            _drain_rejected_request(request.connection)
+            return
+        except TimeoutError:
+            request.close_connection = True
+            _send_json(request, 408, {"error": "request body timed out"})
+            return
         except ValueError as exc:
             _send_json(request, 400, {"error": str(exc)})
             return
@@ -363,6 +387,7 @@ class RuntimeApiServer:
         mode = _validate_mode(mode)
         if config is None:
             config = deepcopy(self.config)
+        owns_turn = turn_id is None
         if turn_id is None:
             turn_id = f"turn_{uuid.uuid4().hex}"
             self.session_store.start_turn(session_id, turn_id, mode=mode, message=message)
@@ -439,6 +464,8 @@ class RuntimeApiServer:
                     "Canceled turn cleanup failed: %s", type(exc).__name__
                 )
             finally:
+                if owns_turn:
+                    self.session_store.release_turn(session_id, turn_id)
                 with self._assistant_previews_lock:
                     for identity, preview_turn in preview_turns.items():
                         self._assistant_previews.pop((identity, preview_turn), None)
@@ -494,8 +521,8 @@ class RuntimeApiServer:
         def runner() -> None:
             outcome: dict[str, Any] = {"status": "failed", "error": "interrupted"}
             try:
-                result = asyncio.run(run())
-                outcome = {"status": "completed", "result": result}
+                asyncio.run(run())
+                outcome = {"status": "completed"}
             except asyncio.CancelledError:
                 outcome = {"status": "canceled"}
                 self._close_turn(session_id, run_id, "turn/canceled", {"mode": mode})
@@ -505,9 +532,12 @@ class RuntimeApiServer:
                     session_id, run_id, "turn/failed", {"error_type": type(exc).__name__}
                 )
             finally:
+                self.session_store.release_turn(session_id, run_id)
                 with self._background_turns_lock:
                     record.pop("task", None)
                     record.update(outcome, finished_at=datetime.now(UTC).isoformat())
+                    self._finished_runs[run_id] = monotonic() + _FINISHED_RUN_TTL
+                    self._prune_finished_runs_locked()
                     self._release_turn_locked(session_id)
                 self._wake_event_streams(session_id)
 
@@ -519,6 +549,7 @@ class RuntimeApiServer:
                     session_id, run_id, "turn/failed", {"error_type": type(exc).__name__}
                 )
             finally:
+                self.session_store.release_turn(session_id, run_id)
                 with self._background_turns_lock:
                     del self._background_turns[run_id]
                     self._release_turn_locked(session_id)
@@ -568,8 +599,18 @@ class RuntimeApiServer:
         del self._active_turn_sessions[session_id]
         self._background_turns_lock.notify_all()
 
+    def _prune_finished_runs_locked(self) -> None:
+        now = monotonic()
+        while self._finished_runs:
+            oldest = next(iter(self._finished_runs.values()))
+            if oldest > now and len(self._finished_runs) <= _FINISHED_RUN_LIMIT:
+                break
+            run_id, _ = self._finished_runs.popitem(last=False)
+            self._background_turns.pop(run_id, None)
+
     def _cancel_background_turn(self, session_id: str, run_id: str) -> int:
         with self._background_turns_lock:
+            self._prune_finished_runs_locked()
             record = self._background_turns.get(run_id)
             if record is None or record["session_id"] != session_id:
                 return 404
@@ -691,12 +732,16 @@ class RuntimeApiServer:
         ]
 
     def _events_json(self, session_id: str, after_sequence: int) -> dict[str, Any]:
-        events = self.session_store.events(session_id, after_sequence=after_sequence)
+        events = self.session_store.events(
+            session_id, after_sequence=after_sequence, limit=_EVENT_PAGE_SIZE
+        )
         state = self.session_store.state(session_id)
+        cursor = events[-1].sequence if events else after_sequence
         return {
             "session_id": session_id,
             "events": [self._serialize_event(event) for event in events],
-            "next_cursor": events[-1].sequence if events else after_sequence,
+            "next_cursor": cursor,
+            "has_more": state.last_sequence > cursor,
             "state": asdict(state),
             "active_run": self._active_background_run(session_id),
             "permission_mode": self._permission_mode(session_id),
@@ -764,6 +809,7 @@ class RuntimeApiServer:
             visible_after_sequence=cursor,
             visible_types=_CONVERSATION_EVENT_TYPES if include_messages else (),
             state_event_types=SUBAGENT_STATE_EVENTS,
+            page_size=_EVENT_PAGE_SIZE if include_messages else None,
         )
         catalog.advance(state, history)
         return history, replace(
@@ -837,7 +883,7 @@ class RuntimeApiServer:
                             child_summary = summaries[0] if summaries else None
                     else:
                         history = self.session_store.events(
-                            session_id, after_sequence=state.last_sequence
+                            session_id, after_sequence=state.last_sequence, limit=_EVENT_PAGE_SIZE
                         )
                         state = self.session_store.advance_state(state, history)
                     events = [
@@ -849,6 +895,10 @@ class RuntimeApiServer:
                         and (not conversation or event.event_type in _CONVERSATION_EVENT_TYPES)
                     ]
                     history_deadline = monotonic() + _STREAM_HISTORY_INTERVAL
+                    if len(history) >= _EVENT_PAGE_SIZE or (
+                        conversation and state.last_sequence >= cursor + _EVENT_PAGE_SIZE
+                    ):
+                        history_deadline = monotonic()
                 preview = self._assistant_preview(state)
                 active_run = self._active_background_run(session_id)
                 permission_mode = self._permission_mode(session_id)
@@ -917,33 +967,57 @@ class RuntimeApiServer:
 
     def _worker_loop(self, worker_id: str) -> None:
         while not self._stop.is_set():
-            task = self.task_manager.claim_next(worker_id, lease_seconds=300)
+            task = self.task_manager.claim_next(worker_id, lease_seconds=_TASK_LEASE_SECONDS)
             if not task:
                 self._stop.wait(0.5)
                 continue
-            heartbeat_stop = threading.Event()
-            heartbeat = threading.Thread(
-                target=self._heartbeat_loop,
-                args=(task.id, worker_id, heartbeat_stop),
-                name=f"paicli-heartbeat-{task.id}",
-                daemon=True,
-            )
-            heartbeat.start()
             try:
-                result = asyncio.run(self._run_task(task))
-                self.task_manager.complete(task.id, result, worker_id=worker_id)
+                result = asyncio.run(self._execute_claim(task))
+                self.task_manager.complete(
+                    task.id, result, worker_id=worker_id, attempt=task.attempts
+                )
             except TaskCanceledError:
                 pass
             except Exception as exc:  # noqa: BLE001
-                self.task_manager.fail(task.id, str(exc), worker_id=worker_id)
+                self.task_manager.fail(
+                    task.id, str(exc), worker_id=worker_id, attempt=task.attempts
+                )
             finally:
-                heartbeat_stop.set()
-                heartbeat.join(timeout=1)
+                self.task_manager.finish_cancel(task)
 
-    def _heartbeat_loop(self, task_id: str, worker_id: str, stop: threading.Event) -> None:
-        while not stop.wait(30):
-            if not self.task_manager.heartbeat(task_id, worker_id, lease_seconds=300):
+    async def _execute_claim(self, task: TaskRecord) -> str:
+        operation = asyncio.create_task(self._run_task(task))
+        watcher = asyncio.create_task(self._watch_claim(task))
+        try:
+            done, _ = await asyncio.wait({operation, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if operation in done:
+                return operation.result()
+            watcher.result()
+            raise TaskCanceledError(task.id)
+        finally:
+            for pending in (operation, watcher):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(operation, watcher, return_exceptions=True)
+
+    async def _watch_claim(self, task: TaskRecord) -> None:
+        deadline = monotonic() + _TASK_HEARTBEAT_INTERVAL
+        assert task.worker_id is not None
+        while not self._stop.is_set():
+            if not await asyncio.to_thread(self.task_manager.owns_active_claim, task):
                 return
+            if monotonic() >= deadline:
+                renewed = await asyncio.to_thread(
+                    self.task_manager.heartbeat,
+                    task.id,
+                    task.worker_id,
+                    lease_seconds=_TASK_LEASE_SECONDS,
+                    attempt=task.attempts,
+                )
+                if not renewed:
+                    return
+                deadline = monotonic() + _TASK_HEARTBEAT_INTERVAL
+            await asyncio.sleep(_TASK_CONTROL_INTERVAL)
 
     async def _run_task(self, task: TaskRecord) -> str:
         if self.task_manager.is_canceled(task.id):
@@ -965,8 +1039,6 @@ class RuntimeApiServer:
             events = _engine_events(engine, task.mode, task.prompt)
             async with aclosing(events):
                 async for event in events:
-                    if self.task_manager.is_canceled(task.id):
-                        raise TaskCanceledError(task.id)
                     if event.get("type") == "text_delta":
                         text += str(event.get("text") or "")
                     elif event.get("type") == "error":
@@ -984,7 +1056,10 @@ class RuntimeApiServer:
     def _authorized(self, request: BaseHTTPRequestHandler) -> bool:
         auth = request.headers.get("authorization", "")
         token = request.headers.get("x-api-key", "")
-        return auth == f"Bearer {self.api_key}" or token == self.api_key
+        return bool(self.api_key) and (
+            compare_digest(auth.encode(), f"Bearer {self.api_key}".encode())
+            or compare_digest(token.encode(), self.api_key.encode())
+        )
 
 
 def _matches_session_route(path: str, suffix: str) -> bool:
@@ -1011,7 +1086,14 @@ def _parse_cursor(value: str | None) -> int:
 
 
 def _read_json(request: BaseHTTPRequestHandler) -> dict[str, Any]:
-    length = int(request.headers.get("content-length") or 0)
+    lengths = request.headers.get_all("content-length", [])
+    if len(lengths) > 1 or request.headers.get("transfer-encoding"):
+        raise ValueError("invalid request body framing")
+    length = int(lengths[0]) if lengths else 0
+    if length < 0:
+        raise ValueError("content-length must be non-negative")
+    if length > _MAX_REQUEST_BYTES:
+        raise RequestBodyTooLarge("request body exceeds 1 MiB")
     if length == 0:
         return {}
     try:
@@ -1030,6 +1112,21 @@ def _send_json(request: BaseHTTPRequestHandler, status: int, payload: dict[str, 
     request.send_header("content-length", str(len(body)))
     request.end_headers()
     request.wfile.write(body)
+
+
+def _drain_rejected_request(connection: socket.socket) -> None:
+    # Closing with unread bytes can reset TCP and discard the 413 response.
+    # A short half-close drain gives sending clients time to receive it.
+    with suppress(OSError):
+        connection.shutdown(socket.SHUT_WR)
+        deadline = monotonic() + 0.25
+        remaining = 2 * _MAX_REQUEST_BYTES
+        while remaining > 0 and monotonic() < deadline:
+            connection.settimeout(max(0.001, deadline - monotonic()))
+            chunk = connection.recv(min(64 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
 
 
 def runtime_api_key(explicit: str | None = None) -> str:

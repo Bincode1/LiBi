@@ -72,6 +72,7 @@ class PlanExecuteAgent:
         if self.session_id is None:
             self.session_id = store.create_session()
         session_id = self.session_id
+        owns_turn = turn_id is None
         if turn_id is None:
             turn_id = f"turn_{uuid.uuid4().hex}"
             store.start_turn(session_id, turn_id, mode="plan", message=message)
@@ -79,9 +80,11 @@ class PlanExecuteAgent:
             raise RuntimeError("The accepted turn is no longer active.")
         step_id = f"step_{uuid.uuid4().hex}"
         plan_request_id = f"req_{uuid.uuid4().hex}"
-        store.append(session_id, "step/started", {"mode": "plan"}, turn_id=turn_id, step_id=step_id)
         answer: list[str] = []
         try:
+            store.append(
+                session_id, "step/started", {"mode": "plan"}, turn_id=turn_id, step_id=step_id
+            )
             async with aclosing(self._run(message)) as events:
                 async for event in events:
                     kind = event.get("type")
@@ -174,6 +177,9 @@ class PlanExecuteAgent:
             )
             store.append(session_id, status, failure, turn_id=turn_id)
             raise
+        finally:
+            if owns_turn:
+                store.release_turn(session_id, turn_id)
 
     async def _run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)

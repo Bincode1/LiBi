@@ -122,8 +122,10 @@ def test_cancel_running_task_cannot_be_overwritten_by_worker_completion(tmp_path
 
     canceled = manager.get(task_id)
     assert canceled is not None
-    assert canceled.status == "canceled"
+    assert canceled.status == "canceling"
     assert canceled.result is None
+    assert manager.finish_cancel(task)
+    assert manager.get(task_id).status == "canceled"
 
 
 def test_expired_worker_lease_is_reclaimed(tmp_path):
@@ -131,12 +133,16 @@ def test_expired_worker_lease_is_reclaimed(tmp_path):
     task_id = manager.add("do work", mode="plan")
     first = manager.claim_next("worker-1", lease_seconds=-1)
     assert first is not None
+    assert not manager.heartbeat(task_id, "worker-1", attempt=first.attempts)
+    assert not manager.complete(task_id, "expired", worker_id="worker-1", attempt=first.attempts)
 
-    second = manager.claim_next("worker-2")
-
+    second = manager.claim_next("worker-1")
     assert second is not None
+    assert not manager.heartbeat(task_id, "worker-1", attempt=first.attempts)
+    assert manager.heartbeat(task_id, "worker-1", attempt=second.attempts)
+
     assert second.id == task_id
-    assert second.worker_id == "worker-2"
+    assert second.worker_id == "worker-1"
     assert second.attempts == 2
 
 
