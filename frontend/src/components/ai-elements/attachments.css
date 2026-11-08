@@ -17,7 +17,7 @@
 }
 
 .attachment-chip,
-.attachment-chip > :is(a, div) {
+.attachment-chip > :is(a, div, .attachment-chip-preview) {
   display: inline-flex;
   align-items: center;
   min-width: 0;
@@ -34,9 +34,21 @@
   font-size: 12px;
 }
 
+.attachment-chip:has(> .attachment-chip-preview) {
+  gap: 0;
+  padding: 0;
+}
+
 .attachment-chip > a:hover,
 .attachment-chip > button:hover {
   color: var(--primary);
+}
+
+.attachment-chip-preview {
+  padding: 3px 7px;
+  border-radius: inherit;
+  cursor: zoom-in;
+  text-align: start;
 }
 
 .attachment-chip img {
@@ -57,12 +69,56 @@
   white-space: nowrap;
 }
 
-.attachment-chip button {
+.attachment-chip-remove {
   display: grid;
   width: 26px;
   height: 26px;
   flex-shrink: 0;
   place-items: center;
+}
+
+.attachment-chip-preview ~ .attachment-chip-remove {
+  margin-inline-end: 7px;
+}
+
+.dialog-content.attachment-image-dialog {
+  width: fit-content;
+  min-width: min(280px, calc(100vw - 32px));
+  max-width: min(1200px, calc(100vw - 32px));
+  padding: 16px;
+}
+
+.attachment-image-dialog .dialog-title {
+  margin: 0 38px 12px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  line-height: 32px;
+  letter-spacing: normal;
+}
+
+.attachment-image-dialog .dialog-close {
+  top: 14px;
+  right: 14px;
+}
+
+.attachment-image-dialog img:not([hidden]) {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100dvh - 126px);
+  margin-inline: auto;
+  border-radius: var(--radius-control);
+  object-fit: contain;
+}
+
+.attachment-image-status {
+  display: grid;
+  min-height: 120px;
+  margin: 0;
+  place-items: center;
+  color: var(--secondary);
+  font-size: 13px;
 }
 
 .composer-attachment-notice {
