@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowUp, CircleAlert, LoaderCircle, ShieldCheck, Square } from 'lucide-react'
 import { AnimatePresence } from 'motion/react'
 import * as m from 'motion/react-m'
@@ -8,6 +8,7 @@ import { useSurfaceMotion } from '@/lib/motion'
 import type { Mode, PermissionMode } from '@/lib/types'
 import { ModePicker } from './mode-picker'
 export function Composer({
+  workspace,
   draft,
   setDraft,
   mode,
@@ -27,6 +28,7 @@ export function Composer({
   onStop,
   onNewConversation,
 }: {
+  workspace?: ReactNode
   draft: string
   setDraft: (value: string) => void
   mode: Mode
@@ -76,6 +78,7 @@ export function Composer({
           </Button>
         </div>
       )}
+      {workspace}
       <form
         className="composer"
         onSubmit={(e) => {

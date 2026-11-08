@@ -56,6 +56,7 @@ class SessionSummary:
     parent_session_id: str | None = None
     latest_user_message: str | None = None
     title: str | None = None
+    cwd: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

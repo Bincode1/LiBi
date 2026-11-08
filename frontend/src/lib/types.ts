@@ -2,11 +2,19 @@ export type Mode = 'react' | 'plan'
 export type PermissionMode = 'default' | 'auto'
 export interface Session {
   id: string
+  cwd?: string
   created_at: string
   updated_at: string
   status: string
   last_sequence: number
   title?: string | null
+}
+export interface WorkspaceDirectory {
+  path: string
+  parent: string | null
+  home: string
+  roots: string[]
+  directories: { name: string; path: string }[]
 }
 export interface RuntimeEvent {
   id: string
@@ -49,6 +57,7 @@ export interface Subagent {
 }
 export interface EventPage {
   session_id: string
+  cwd?: string
   events: RuntimeEvent[]
   next_cursor: number
   state: { status: string; active_turn_id?: string | null; title?: string | null }
@@ -84,7 +93,8 @@ export interface RuntimeClient {
   capabilities: Capabilities
   health(signal?: AbortSignal): Promise<{ status: string; cwd: string }>
   sessions(signal?: AbortSignal): Promise<Session[]>
-  createSession(): Promise<Session>
+  createSession(cwd?: string): Promise<Session>
+  browseWorkspace(path: string, signal?: AbortSignal): Promise<WorkspaceDirectory>
   renameSession(id: string, title: string): Promise<{ title: string }>
   events(id: string, cursor: number, signal?: AbortSignal): Promise<EventPage>
   subscribe(

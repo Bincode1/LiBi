@@ -88,7 +88,7 @@ uv run paicli -r
 
 Session ID 可以在 REPL 的 `/context` 输出中查看。指定的 ID 不存在时，CLI 会直接报错，不会自动创建一个新会话。
 
-会话绑定创建时的工作区。CLI 的 `--resume`、`--session-id` 和网页工作台仅访问当前工作区的主会话。
+会话绑定创建时的工作区。CLI 的 `--resume` 和 `--session-id` 访问当前工作区的主会话。网页工作台也会列出通过当前 Runtime 创建的跨目录会话。
 
 单次查询：
 
@@ -407,6 +407,10 @@ Runtime 默认监听 `127.0.0.1:24158`。项目配置 `.paicli/config.json` 的 
 curl -sS -X POST http://127.0.0.1:24158/v1/sessions \
   -H 'x-api-key: dev-key'
 ```
+
+网页工作台在新会话输入框上方提供工作目录菜单。可以选择最近使用的目录，或浏览本机文件夹。工作台会记住这个浏览器最近一次的选择，发送首条消息时将目录绑定到会话。
+
+`POST /v1/sessions` 接受可选的 JSON 字段 `cwd`，用于指定已有目录的绝对路径。省略时使用 Runtime 启动目录。创建、列表和事件响应会返回会话的 `cwd`。经鉴权的 `GET /v1/workspaces?path=...` 可浏览目录及其直接子文件夹。MCP 自动发现仍使用 Runtime 启动目录。
 
 发送 turn：
 

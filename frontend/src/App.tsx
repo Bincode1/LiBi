@@ -32,6 +32,11 @@ import { AgentMark } from '@/features/conversation/agent-avatar'
 import { Composer } from '@/features/conversation/composer'
 import { ModePicker } from '@/features/conversation/mode-picker'
 import { Details, type DetailsTab } from '@/features/workspace/details'
+import {
+  SessionWorkspace,
+  WorkspacePicker,
+  useRecentWorkspaces,
+} from '@/features/workspace/workspace-picker'
 import { useEventFeed } from '@/hooks/use-event-feed'
 import { useTabDrafts } from '@/hooks/use-tab-drafts'
 import { ApiError, liveClient, request } from '@/lib/api'
@@ -97,6 +102,7 @@ export default function App() {
   const [detailsTab, setDetailsTab] = useState<DetailsTab>('changes')
   const [agentSelection, setAgentSelection] = useState<{ key: string; path: Subagent[] }>()
   const [drafts, setDrafts] = useTabDrafts()
+  const { recent: recentWorkspaces, remember: rememberWorkspace } = useRecentWorkspaces()
   const [mode, setMode] = useState<Mode>('react')
   const [submitting, setSubmitting] = useState(false),
     [retry, setRetry] = useState(0),
@@ -223,10 +229,15 @@ export default function App() {
     [sessions.data, id, feed.title, feed.status, feed.cursor, feed.connectedAt],
   )
   const current = visibleSessions.find((session) => session.id === id)
+  const runtimeCwd = health.data?.cwd ?? ''
+  const newSessionCwd = recentWorkspaces[0] ?? runtimeCwd
+  const sessionCwd = feed.cwd ?? current?.cwd
   const searchQuery = searchTerm.trim().toLowerCase()
   const searchMatches = search
     ? visibleSessions.filter((session) =>
-        `${sessionTitle(session)} ${session.id}`.toLowerCase().includes(searchQuery),
+        `${sessionTitle(session)} ${session.id} ${session.cwd ?? ''}`
+          .toLowerCase()
+          .includes(searchQuery),
       )
     : []
   const title = id ? sessionTitle(current ?? { id, title: feed.title }) : '新会话'
@@ -374,7 +385,7 @@ export default function App() {
     let submittedDraftKey = key
     try {
       if (!sessionId) {
-        const session = await client.createSession()
+        const session = await client.createSession(newSessionCwd || undefined)
         sessionId = session.id
         if (permissionMode === 'auto') await client.setPermissionMode(sessionId, 'auto')
         setNewPermissionMode('default')
@@ -580,7 +591,7 @@ export default function App() {
               <button
                 className={`session-item ${session.id === id ? 'selected' : ''}`}
                 aria-current={session.id === id ? 'page' : undefined}
-                title={sessionTitle(session)}
+                title={[sessionTitle(session), session.cwd].filter(Boolean).join('\n')}
                 key={session.id}
                 onClick={() => selectSession(session.id)}
               >
@@ -798,6 +809,20 @@ export default function App() {
           </Button>
         )}
         <Composer
+          workspace={
+            id ? (
+              sessionCwd && <SessionWorkspace path={sessionCwd} />
+            ) : (
+              <WorkspacePicker
+                client={client}
+                defaultPath={runtimeCwd}
+                path={newSessionCwd}
+                recent={recentWorkspaces}
+                disabled={connectionSyncing || runtimeOffline || submitting}
+                onSelect={rememberWorkspace}
+              />
+            )
+          }
           draft={draft}
           setDraft={setDraft}
           mode={mode}

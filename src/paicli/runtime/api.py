@@ -30,6 +30,7 @@ from paicli.policy.permission_mode import PermissionMode, PermissionModeControll
 from paicli.runtime.conversation import SUBAGENT_STATE_EVENTS, SubagentCatalog, conversation_event
 from paicli.runtime.tasks import TASK_MODES, DurableTaskManager, TaskRecord
 from paicli.runtime.titles import generate_session_title
+from paicli.runtime.workspaces import WorkspaceError, browse_directory, resolve_directory
 from paicli.session import (
     SessionEvent,
     SessionState,
@@ -151,6 +152,7 @@ class RuntimeApiServer:
         self.session_store = SessionStore(
             self.db_path,
             workspace=self.cwd,
+            include_runtime_sessions=True,
             sensitive_values=(api_key, config.llm.api_key),
             on_append=lambda session_id: self._wake_event_streams(session_id, history_changed=True),
         )
@@ -260,10 +262,14 @@ class RuntimeApiServer:
                 _send_json(request, 404, {"error": "session not found"})
                 return
             if request.command == "POST" and path == "/v1/sessions":
-                session_id = self._create_session()
-                _send_json(request, 200, {"id": session_id})
+                cwd = resolve_directory(body.get("cwd", self.cwd))
+                session_id = self._create_session(cwd)
+                _send_json(request, 200, {"id": session_id, "cwd": str(cwd)})
             elif request.command == "GET" and path == "/v1/sessions":
                 _send_json(request, 200, {"sessions": self._list_sessions()})
+            elif request.command == "GET" and path == "/v1/workspaces":
+                query = parse_qs(request.path.partition("?")[2], keep_blank_values=True)
+                _send_json(request, 200, browse_directory(query.get("path", [self.cwd])[0]))
             elif request.command == "GET" and path == "/v1/health":
                 _send_json(request, 200, {"status": "ok", "cwd": self.cwd})
             elif request.command == "POST" and _matches_session_route(path, "/title"):
@@ -384,6 +390,8 @@ class RuntimeApiServer:
             _send_json(request, 409, {"error": "session already has an active turn"})
         except RuntimeStoppingError:
             _send_json(request, 503, {"error": "Runtime is stopping"})
+        except WorkspaceError as exc:
+            _send_json(request, 400, {"workspace_error": str(exc)})
         except ValueError as exc:
             _send_json(request, 400, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 - API boundary
@@ -441,12 +449,14 @@ class RuntimeApiServer:
             self._wake_event_streams(event_session_id)
 
         try:
+            cwd = self._turn_cwd(session_id)
+            # Session selection does not extend the Runtime's trust for MCP configuration.
             registry, _manager = await build_tool_registry(config=config, cwd=self.cwd)
             engine = QueryEngine(
                 llm_client=create_llm_client(config.llm),
                 tool_registry=registry,
                 config=config,
-                cwd=self.cwd,
+                cwd=cwd,
                 session_store=self.session_store,
                 session_id=session_id,
                 approval_callback=approve_tool if interactive_approval else None,
@@ -605,6 +615,7 @@ class RuntimeApiServer:
             )
 
     def _reserve_turn(self, session_id: str, run_id: str | None = None) -> PaiCliConfig:
+        self._turn_cwd(session_id)
         with self._background_turns_lock:
             if self._stop.is_set():
                 raise RuntimeStoppingError
@@ -614,6 +625,13 @@ class RuntimeApiServer:
             PermissionModeController(config, self._session_permissions.get(session_id, "default"))
             self._active_turn_sessions[session_id] = run_id
             return config
+
+    def _turn_cwd(self, session_id: str) -> str:
+        cwd = self.session_store.session_cwd(session_id) or self.cwd
+        resolved = str(resolve_directory(cwd))
+        if os.path.normcase(resolved) != os.path.normcase(cwd):
+            raise WorkspaceError("会话的工作目录位置已改变，请使用新目录创建会话。")
+        return cwd
 
     def _release_turn_locked(self, session_id: str) -> None:
         del self._active_turn_sessions[session_id]
@@ -731,8 +749,8 @@ class RuntimeApiServer:
             self._session_permissions[session_id] = mode
         self._wake_event_streams(session_id)
 
-    def _create_session(self) -> str:
-        session_id = self.session_store.create_session()
+    def _create_session(self, cwd: Path | None = None) -> str:
+        session_id = self.session_store.create_session(cwd=cwd)
         self.session_store.append(
             session_id, "session/created", {"id": session_id}, source="runtime"
         )
@@ -747,6 +765,7 @@ class RuntimeApiServer:
                 "status": item.status,
                 "last_sequence": item.last_sequence,
                 "title": item.title,
+                "cwd": item.cwd or self.cwd,
             }
             for item in self.session_store.list_sessions(limit=100)
         ]
@@ -759,6 +778,7 @@ class RuntimeApiServer:
         cursor = events[-1].sequence if events else after_sequence
         return {
             "session_id": session_id,
+            "cwd": self.session_store.session_cwd(session_id) or self.cwd,
             "events": [self._serialize_event(event) for event in events],
             "next_cursor": cursor,
             "has_more": state.last_sequence > cursor,
@@ -845,6 +865,7 @@ class RuntimeApiServer:
         conversation: bool = False,
         root_session_id: str | None = None,
     ) -> None:
+        cwd = self.session_store.session_cwd(session_id) or self.cwd
         parent_id = self.session_store.child_parent(session_id) if root_session_id else None
         parent_state = SessionState(parent_id, "created", 0) if parent_id else None
         parent_catalog = SubagentCatalog()
@@ -941,6 +962,7 @@ class RuntimeApiServer:
                     data = json.dumps(
                         {
                             "session_id": session_id,
+                            "cwd": cwd,
                             "events": events,
                             "next_cursor": cursor,
                             "state": asdict(state),

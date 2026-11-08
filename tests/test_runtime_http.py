@@ -144,6 +144,86 @@ def test_runtime_hides_other_workspaces_and_rejects_their_session_routes(runtime
     assert client.post(f"{base}/turns/async", json={"message": "continue"}).status_code == 404
 
 
+def test_session_uses_its_selected_directory_for_tools_and_resume(
+    runtime_http, provider_stream, tmp_path, monkeypatch
+):
+    runtime, client = runtime_http
+    workspace = tmp_path / "另一个项目"
+    workspace.mkdir()
+    runtime.config.policy.hitl_mode = "never"
+    runtime.config.features.mcp = True
+    monkeypatch.setenv("PAICLI_TRUST_PROJECT_MCP", "1")
+    for root, name in [(tmp_path, "startup"), (workspace, "selected")]:
+        mcp_config = root / ".paicli" / "mcp.json"
+        mcp_config.parent.mkdir(exist_ok=True)
+        mcp_config.write_text(json.dumps({"mcpServers": {name: {"command": "echo"}}}))
+
+    discovered = []
+
+    async def load_tools(manager):
+        discovered.extend(manager.specs)
+        return []
+
+    monkeypatch.setattr("paicli.bootstrap.McpClientManager.load_tools", load_tools)
+    batches, _ = provider_stream
+    write = {
+        "index": 0,
+        "id": "call_workspace",
+        "function": {"name": "write_file", "arguments": '{"path":"note.txt","content":"ok"}'},
+    }
+    batches.extend(
+        [
+            [{"choices": [{"delta": {"tool_calls": [write]}, "finish_reason": "tool_calls"}]}],
+            [{"choices": [{"delta": {"content": "written"}, "finish_reason": "stop"}]}],
+        ]
+    )
+
+    created = client.post("/v1/sessions", json={"cwd": str(workspace)})
+    assert created.status_code == 200
+    assert created.json()["cwd"] == str(workspace)
+    sid = created.json()["id"]
+    assert client.post(f"/v1/sessions/{sid}/turns", json={"message": "write"}).status_code == 200
+    assert discovered == ["startup"]
+    assert (workspace / "note.txt").read_text() == "ok"
+    assert not (tmp_path / "note.txt").exists()
+    assert client.get(f"/v1/sessions/{sid}/events.json").json()["cwd"] == str(workspace)
+    assert SessionStore(runtime.db_path, workspace=workspace).session_exists(sid, root_only=True)
+    assert not SessionStore(runtime.db_path, workspace=tmp_path).session_exists(sid)
+
+    child = runtime.session_store.create_session(kind="child", parent_session_id=sid)
+    reopened = RuntimeApiServer(cwd=runtime.cwd, config=runtime.config, api_key=runtime.api_key)
+    assert reopened._list_sessions()[0]["cwd"] == str(workspace)
+    assert reopened.session_store.is_child_session(sid, child)
+    assert reopened.session_store.session_cwd(child) == str(workspace)
+
+
+def test_workspace_browsing_and_unavailable_session_directory(runtime_http, tmp_path):
+    _, client = runtime_http
+    workspace = tmp_path / "Project & 目录"
+    workspace.mkdir()
+    file_path = tmp_path / "file.txt"
+    file_path.touch()
+    response = client.get("/v1/workspaces", params={"path": str(tmp_path)})
+    assert response.status_code == 200
+    assert response.json()["directories"] == [{"name": workspace.name, "path": str(workspace)}]
+    assert client.get("/v1/workspaces", params={"path": str(workspace)}).json()["parent"] == str(
+        tmp_path
+    )
+    for invalid in ["relative", str(file_path), str(workspace / "missing"), 123]:
+        response = client.post("/v1/sessions", json={"cwd": invalid})
+        assert response.status_code == 400
+        assert "workspace_error" in response.json()
+    assert client.get("/v1/sessions").json()["sessions"] == []
+
+    sid = client.post("/v1/sessions", json={"cwd": str(workspace)}).json()["id"]
+    workspace.rmdir()
+    response = client.post(f"/v1/sessions/{sid}/turns/async", json={"message": "continue"})
+    assert response.status_code == 400
+    assert "workspace_error" in response.json()
+    events = client.get(f"/v1/sessions/{sid}/events.json").json()["events"]
+    assert [event["type"] for event in events] == ["session/created"]
+
+
 def test_async_receipt_is_durable_before_worker_starts(runtime_http, monkeypatch):
     runtime, client = runtime_http
     original_start = threading.Thread.start

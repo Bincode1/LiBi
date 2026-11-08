@@ -16,6 +16,7 @@ const emptyEvents: RuntimeEvent[] = []
 
 interface FeedCheckpoint {
   cursor: number
+  cwd?: string
   events: RuntimeEvent[]
   preview?: AssistantPreview | null
   activeRun?: ActiveRun | null
@@ -65,6 +66,7 @@ export function useEventFeed(
               const events = previous?.events ?? emptyEvents
               return {
                 cursor: page.next_cursor,
+                cwd: page.cwd,
                 events: page.events.length ? mergeEvents(events, page.events) : events,
                 preview: page.assistant_preview,
                 activeRun: page.active_run,
@@ -115,6 +117,7 @@ export function useEventFeed(
   const syncing = Boolean(sessionId && !current?.error && (!current || !checkpoint))
   return {
     cursor: checkpoint?.cursor ?? 0,
+    cwd: checkpoint?.cwd,
     events: checkpoint?.events ?? emptyEvents,
     subagents: checkpoint?.subagents,
     subagent: checkpoint?.subagent,

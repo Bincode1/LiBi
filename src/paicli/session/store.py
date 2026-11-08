@@ -51,6 +51,7 @@ _STATE_EVENT_TYPES = (
     "step/failed",
     "compaction/checkpoint",
 )
+_WORKSPACE_FILTER = "(? is null or workspace = ? or runtime_workspace = ?)"
 
 
 class TurnInProgressError(RuntimeError):
@@ -65,6 +66,7 @@ class SessionStore:
         db_path: str | Path,
         *,
         workspace: str | Path | None = None,
+        include_runtime_sessions: bool = False,
         sensitive_values: tuple[str, ...] = (),
         on_append: Callable[[str], None] | None = None,
     ):
@@ -72,6 +74,8 @@ class SessionStore:
         self.workspace = (
             os.path.normcase(str(Path(workspace).resolve())) if workspace is not None else None
         )
+        self._runtime_workspace = self.workspace if include_runtime_sessions else None
+        self._workspace_params = (self.workspace, self.workspace, self._runtime_workspace)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.redactor = Redactor(sensitive_values)
         self._turn_owners: dict[tuple[str, str], ExitStack] = {}
@@ -84,6 +88,7 @@ class SessionStore:
         *,
         kind: str = "root",
         parent_session_id: str | None = None,
+        cwd: Path | None = None,
     ) -> str:
         if kind not in {"root", "child"}:
             raise ValueError("session kind must be root or child")
@@ -91,12 +96,14 @@ class SessionStore:
             raise ValueError("child sessions require a parent session")
         if kind == "root" and parent_session_id is not None:
             raise ValueError("root sessions cannot have a parent session")
+        if cwd is not None and (kind != "root" or self._runtime_workspace is None):
+            raise ValueError("only Runtime root sessions can specify a working directory")
         identity = session_id or f"session_{uuid.uuid4().hex}"
         created_at = _now()
         with closing(self._connect()) as conn, conn:
             if parent_session_id is not None and self.workspace is not None:
                 self._session_row(conn, parent_session_id)
-            self._insert_session_tx(conn, identity, created_at, kind, parent_session_id)
+            self._insert_session_tx(conn, identity, created_at, kind, parent_session_id, cwd)
             self._session_row(conn, identity)
         return identity
 
@@ -107,12 +114,37 @@ class SessionStore:
         created_at: str,
         kind: str,
         parent_session_id: str | None,
+        cwd: Path | None = None,
     ) -> bool:
+        workspace = self.workspace
+        runtime_workspace = None
+        cwd_text = None
+        if parent_session_id is not None:
+            parent = conn.execute(
+                "select workspace, runtime_workspace, cwd from sessions where id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if parent is not None:
+                workspace, runtime_workspace, cwd_text = parent
+        elif cwd is not None:
+            cwd_text = str(cwd)
+            workspace = os.path.normcase(cwd_text)
+            runtime_workspace = self._runtime_workspace
         cursor = conn.execute(
             "insert into sessions "
             "(id, created_at, updated_at, last_sequence, status, kind, parent_session_id, "
-            "workspace) values (?, ?, ?, 0, 'created', ?, ?, ?) on conflict(id) do nothing",
-            (session_id, created_at, created_at, kind, parent_session_id, self.workspace),
+            "workspace, runtime_workspace, cwd) values (?, ?, ?, 0, 'created', ?, ?, ?, ?, ?) "
+            "on conflict(id) do nothing",
+            (
+                session_id,
+                created_at,
+                created_at,
+                kind,
+                parent_session_id,
+                workspace,
+                runtime_workspace,
+                cwd_text,
+            ),
         )
         return cursor.rowcount == 1
 
@@ -191,11 +223,22 @@ class SessionStore:
 
     def _session_row(self, conn: sqlite3.Connection, session_id: str) -> tuple[str, int]:
         row = conn.execute(
-            "select status, last_sequence, workspace from sessions where id = ?", (session_id,)
+            f"select status, last_sequence from sessions where id = ? and {_WORKSPACE_FILTER}",
+            (session_id, *self._workspace_params),
         ).fetchone()
-        if row is None or (self.workspace is not None and row[2] != self.workspace):
+        if row is None:
             raise ValueError(f"session not found in this workspace: {session_id}")
         return str(row[0]), int(row[1] or 0)
+
+    def session_cwd(self, session_id: str) -> str | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f"select cwd from sessions where id = ? and {_WORKSPACE_FILTER}",
+                (session_id, *self._workspace_params),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"session not found in this workspace: {session_id}")
+        return row[0]
 
     def start_turn(self, session_id: str, turn_id: str, *, mode: str, message: str) -> int:
         """Claim a session and persist its input before an executor can run it."""
@@ -257,8 +300,8 @@ class SessionStore:
                 return (
                     conn.execute(
                         "select 1 from sessions where id = ? "
-                        "and (? is null or workspace = ?) and (not ? or kind = 'root')",
-                        (session_id, self.workspace, self.workspace, root_only),
+                        f"and {_WORKSPACE_FILTER} and (not ? or kind = 'root')",
+                        (session_id, *self._workspace_params, root_only),
                     ).fetchone()
                     is not None
                 )
@@ -351,12 +394,12 @@ class SessionStore:
             elif not include_children:
                 filters.append("kind = 'root'")
             if self.workspace is not None:
-                filters.append("workspace = ?")
-                params.append(self.workspace)
+                filters.append(_WORKSPACE_FILTER)
+                params.extend(self._workspace_params)
             where = "where " + " and ".join(filters) if filters else ""
             rows = conn.execute(
                 "select id, created_at, updated_at, last_sequence, status, kind, "
-                "parent_session_id, title "
+                "parent_session_id, title, cwd "
                 f"from sessions {where} order by updated_at desc, id desc limit ?",
                 (*params, limit if limit is not None else -1),
             ).fetchall()
@@ -371,6 +414,7 @@ class SessionStore:
                 kind=str(kind or "root"),
                 parent_session_id=str(parent_session_id) if parent_session_id else None,
                 title=self.redactor.clean(title) if title is not None else None,
+                cwd=cwd,
             )
             for (
                 session_id,
@@ -381,6 +425,7 @@ class SessionStore:
                 kind,
                 parent_session_id,
                 title,
+                cwd,
             ) in rows
         ]
 
@@ -390,23 +435,21 @@ class SessionStore:
             return False
         with closing(self._connect()) as conn:
             row = conn.execute(
-                """
+                f"""
                 with recursive ancestors(id, parent_session_id, kind) as (
                     select id, parent_session_id, kind from sessions
-                    where id = ? and kind = 'child' and (? is null or workspace = ?)
+                    where id = ? and kind = 'child' and {_WORKSPACE_FILTER}
                     union
                     select s.id, s.parent_session_id, s.kind from sessions s join ancestors a
                       on s.id = a.parent_session_id and a.kind = 'child'
-                    where (? is null or s.workspace = ?)
+                    where {_WORKSPACE_FILTER}
                 )
                 select 1 from ancestors where id = ?
                 """,
                 (
                     child_session_id,
-                    self.workspace,
-                    self.workspace,
-                    self.workspace,
-                    self.workspace,
+                    *self._workspace_params,
+                    *self._workspace_params,
                     parent_session_id,
                 ),
             ).fetchone()
@@ -416,8 +459,8 @@ class SessionStore:
         with closing(self._connect()) as conn:
             row = conn.execute(
                 "select parent_session_id from sessions where id = ? and kind = 'child' "
-                "and (? is null or workspace = ?)",
-                (child_session_id, self.workspace, self.workspace),
+                f"and {_WORKSPACE_FILTER}",
+                (child_session_id, *self._workspace_params),
             ).fetchone()
         return row[0] if row else None
 
@@ -756,8 +799,8 @@ class SessionStore:
         """Settle durable running turns whose execution slot is no longer held."""
         with closing(self._connect()) as conn:
             candidates = conn.execute(
-                "select id from sessions where status = 'running' and (? is null or workspace = ?)",
-                (self.workspace, self.workspace),
+                f"select id from sessions where status = 'running' and {_WORKSPACE_FILTER}",
+                self._workspace_params,
             ).fetchall()
         for (session_id,) in candidates:
             owner = self._try_own_turn(session_id)
@@ -1182,6 +1225,8 @@ class SessionStore:
                 "kind": "text",
                 "parent_session_id": "text",
                 "workspace": "text",
+                "runtime_workspace": "text",
+                "cwd": "text",
                 "title": "text",
                 "title_generation_claimed": "integer not null default 0",
             }

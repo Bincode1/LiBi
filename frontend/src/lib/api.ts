@@ -21,7 +21,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!response.ok) {
     // Do not echo arbitrary provider diagnostics or credentials from an error body.
-    const message =
+    const fallback =
       response.status === 401
         ? 'Runtime 鉴权失败，请检查服务端环境配置。'
         : response.status === 503
@@ -29,7 +29,18 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
           : response.status === 502
             ? '无法连接 Runtime，请确认本地服务已启动。'
             : `Runtime 请求失败（${response.status}）。`
-    throw new ApiError(response.status, message)
+    const errorField =
+      response.status === 400 &&
+      (path.startsWith('/v1/workspaces?') ||
+        path === '/v1/sessions' ||
+        /^\/v1\/sessions\/[^/]+\/turns\/async$/.test(path))
+        ? 'workspace_error'
+        : undefined
+    const payload: Record<string, unknown> | null = errorField
+      ? await response.json().catch(() => null)
+      : null
+    const message = errorField && payload?.[errorField]
+    throw new ApiError(response.status, typeof message === 'string' ? message : fallback)
   }
   return response.json() as Promise<T>
 }
@@ -41,16 +52,19 @@ export const liveClient: RuntimeClient = {
   health: (signal) => request('/v1/health', { signal }),
   sessions: async (signal) =>
     (await request<{ sessions: Session[] }>('/v1/sessions', { signal })).sessions,
-  createSession: async () => {
-    const { id } = await post<{ id: string }>('/v1/sessions')
+  createSession: async (path) => {
+    const { id, cwd } = await post<{ id: string; cwd: string }>('/v1/sessions', { cwd: path })
     return {
       id,
+      cwd,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       status: 'idle',
       last_sequence: 0,
     }
   },
+  browseWorkspace: (path, signal) =>
+    request(`/v1/workspaces?${new URLSearchParams({ path })}`, { signal }),
   renameSession: (id, title) => post(`${sid(id)}/title`, { title }),
   events: (id, cursor, signal) =>
     request<EventPage>(`${sid(id)}/events.json?cursor=${cursor}`, { signal }),
