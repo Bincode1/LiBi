@@ -1483,6 +1483,7 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
     runtime, client = runtime_http
     runtime.config.features.skill = False
     release = threading.Event()
+    parent_requests = []
 
     def chunk(*, text=None, calls=None, reason=None):
         delta = {"content": text} if calls is None else {"tool_calls": calls}
@@ -1519,23 +1520,28 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
                 ],
                 reason="tool_calls",
             )
+        parent_requests.append(messages)
         if messages[-1]["role"] == "tool":
-            return response(text="Initial draft", reason="stop")
-        if any("Child agent results:" in (message.get("content") or "") for message in messages):
+            assert messages[-1]["tool_call_id"] == "delegate-batch"
+            assert "Search progress [redacted] and result" in messages[-1]["content"]
+            assert "Write result" in messages[-1]["content"]
             return response(text="Final synthesis", reason="stop")
         return response(
             calls=[
                 call(
                     0,
-                    "spawn-search",
+                    "delegate-batch",
                     "subagent",
-                    {"description": "Search", "prompt": "Search task", "role": "researcher"},
-                ),
-                call(
-                    1,
-                    "spawn-write",
-                    "subagent",
-                    {"description": "Write", "prompt": "Write task", "role": "builder"},
+                    {
+                        "tasks": [
+                            {
+                                "description": "Search",
+                                "prompt": "Search task",
+                                "role": "researcher",
+                            },
+                            {"description": "Write", "prompt": "Write task", "role": "builder"},
+                        ]
+                    },
                 ),
             ],
             reason="tool_calls",
@@ -1558,7 +1564,7 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
             page = next(_event_stream_pages(opened))
         search, write = page["subagents"]
         assert [search["role"], write["role"]] == ["researcher", "builder"]
-        assert [search["tool_call_id"], write["tool_call_id"]] == ["spawn-search", "spawn-write"]
+        assert [search["tool_call_id"], write["tool_call_id"]] == ["delegate-batch"] * 2
         assert search["parent_turn_id"] == receipt.json()["turn_id"]
         assert search["parent_step_id"] == write["parent_step_id"]
         assert search["status"] == "running"
@@ -1593,6 +1599,13 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
             ).status_code
             == 200
         )
+        await_one_result = _wait_for_session_page(
+            client,
+            root,
+            lambda page: any(e["type"] == "agent/child_delivery_created" for e in page["events"]),
+        )
+        assert await_one_result["state"]["status"] == "running"
+        assert len(parent_requests) == 1
         release.set()
         _wait_for_session_page(
             client,
@@ -1609,9 +1622,14 @@ def test_http_subagent_overview_and_read_only_transcripts(runtime_http, monkeypa
         assert [
             e["payload"]["content"] for e in completed["events"] if e["type"] == "user/message"
         ] == ["My question"]
-        markers = [e for e in completed["events"] if e["type"] == "agent/results_received"]
-        assert len({i for e in markers for i in e["payload"]["delivery_ids"]}) == 2
-        assert all("content" not in e["payload"] for e in markers)
+        (report,) = [
+            e
+            for e in completed["events"]
+            if e["type"] == "tool/result" and e["payload"]["name"] == "subagent"
+        ]
+        assert report["tool_call_id"] == "delegate-batch"
+        assert report["payload"]["content"] == "已收到子 agent 的结果。"
+        assert len(parent_requests) == 2
         assert "Write result" not in json.dumps(completed)
         assert any(e["payload"].get("content") == "Final synthesis" for e in completed["events"])
         with client.stream(

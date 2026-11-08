@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from paicli.agent.subagents import (
+    Activation,
     ActivationState,
     ProviderCapabilities,
     SubagentManager,
@@ -61,7 +62,7 @@ def test_subagent_admission_enforces_capacity_and_cwd(tmp_path, monkeypatch):
 
     async def run():
         started = await manager.start({"description": "first", "prompt": "work"}, context)
-        assert not started.is_error
+        assert isinstance(started, Activation)
         rejected = await manager.start({"description": "second", "prompt": "work"}, context)
         assert rejected.is_error
         assert "ACTIVATION_LIMIT_REACHED" in rejected.content
@@ -105,8 +106,10 @@ def test_batch_queues_after_four_and_cancels_unstarted_tasks(tmp_path, monkeypat
         tasks = [{"description": key, "prompt": key, "timeout": 30} for key in gates]
         result = await tool.execute({"tasks": [*tasks, tasks[0]]}, context)
         assert result.is_error and not manager.activations
-        result = await tool.execute({"tasks": tasks}, context)
-        assert not result.is_error and result.content.count("state=queued") == 4
+        batch = asyncio.create_task(tool.execute({"tasks": tasks}, context))
+        async with asyncio.timeout(3):
+            assert {await started.get() for _ in range(4)} == {"0", "1", "2", "3"}
+        assert not batch.done()
         catalog = SubagentCatalog()
         catalog.advance(
             context.session_store.state(context.session_id),
@@ -122,7 +125,6 @@ def test_batch_queues_after_four_and_cancels_unstarted_tasks(tmp_path, monkeypat
         activations = list(manager.activations.values())
         assert all(item.timeout_task is None for item in activations[4:])
         async with asyncio.timeout(3):
-            assert {await started.get() for _ in range(4)} == {"0", "1", "2", "3"}
             assert await manager.interrupt(activations[-1].id)
             assert activations[-1].status == ActivationState.CANCELED
             gates["0"].set()
@@ -130,6 +132,9 @@ def test_batch_queues_after_four_and_cancels_unstarted_tasks(tmp_path, monkeypat
             assert activations[4].timeout_task is not None
             assert started.empty()
         await manager.cancel_for_parent("root")
+        async with asyncio.timeout(3):
+            result = await batch
+        assert "report 0" in result.content and "canceled" in result.content
         assert all(not item.provider_started for item in activations[5:])
         await manager.drain()
         assert not activations[-1].provider_started
@@ -151,14 +156,14 @@ def test_subagent_deadline_cancels_and_settles_once(tmp_path, monkeypatch):
         started = await manager.start(
             {"description": "deadline", "prompt": "work", "timeout": 0.01}, context
         )
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         await asyncio.wait_for(asyncio.gather(activation.task, return_exceptions=True), timeout=1)
         await asyncio.gather(*tuple(manager._settlers))
         assert activation.status == ActivationState.TIMED_OUT
         assert activation.error_code == "CHILD_DEADLINE_EXCEEDED"
         assert activation.settled
-        assert len(manager.completed_for("root")) == 1
+        assert activation.report.status == "timed_out"
         await manager.drain()
 
     asyncio.run(run())
@@ -178,15 +183,14 @@ def test_subagent_expiring_while_idle_keeps_successful_delivery(tmp_path, monkey
         started = await manager.start(
             {"description": "research", "prompt": "work", "timeout": 0.1}, context
         )
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         async with asyncio.timeout(2):
             await asyncio.gather(activation.task, return_exceptions=True)
             await asyncio.gather(*tuple(manager._settlers))
         assert activation.status == ActivationState.DISPOSED
         assert activation.error_code == "CHILD_IDLE_EXPIRED"
-        (delivered,) = manager.deliveries.values()
-        assert (delivered.status, delivered.result) == ("completed", "findings")
+        assert (activation.report.status, activation.report.result) == ("completed", "findings")
         catalog = SubagentCatalog()
         catalog.advance(
             context.session_store.state(context.session_id),
@@ -220,7 +224,7 @@ def test_activation_state_machine_rejects_illegal_and_terminal_transitions(tmp_p
 
     async def run():
         started = await manager.start({"description": "state", "prompt": "work"}, context)
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         assert activation.status == ActivationState.RUNNING
         with pytest.raises(RuntimeError, match="illegal subagent transition"):
@@ -265,7 +269,7 @@ def test_send_message_continues_a_parked_local_child(tmp_path, monkeypatch):
 
     async def run():
         started = await manager.start({"description": "continuable", "prompt": "first"}, context)
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         await asyncio.wait_for(manager._condition.acquire(), timeout=1)
         manager._condition.release()
@@ -278,8 +282,7 @@ def test_send_message_continues_a_parked_local_child(tmp_path, monkeypatch):
             {"agent_id": activation.id, "message": "follow-up"}, context
         )
         assert not result.is_error
-        while calls < 2:
-            await asyncio.sleep(0)
+        assert "reply-2:follow-up" in result.content and "reply-1:first" not in result.content
         await manager.interrupt(activation.id)
         assert calls == 2
         assert activation.status == ActivationState.IDLE_WAITING
@@ -305,13 +308,13 @@ def test_idle_children_do_not_consume_active_capacity(tmp_path, monkeypatch):
 
     async def run():
         first = await manager.start({"description": "one", "prompt": "first"}, context)
-        assert not first.is_error
+        assert isinstance(first, Activation)
         first_activation = next(iter(manager.activations.values()))
         while first_activation.status != ActivationState.IDLE_WAITING:
             await asyncio.sleep(0)
         second = await manager.start({"description": "two", "prompt": "second"}, context)
-        assert not second.is_error
-        second_activation = manager.activations[second.content.split()[2].rstrip(".")]
+        assert isinstance(second, Activation)
+        second_activation = second
         while second_activation.status != ActivationState.IDLE_WAITING:
             await asyncio.sleep(0)
         third = await manager.start({"description": "three", "prompt": "third"}, context)
@@ -395,9 +398,8 @@ def test_send_message_rejects_cross_tree_child(tmp_path):
     asyncio.run(run())
 
 
-def test_send_message_to_running_child_is_consumed_at_safe_boundary(tmp_path, monkeypatch):
+def test_internal_steering_of_running_child_is_consumed_at_safe_boundary(tmp_path, monkeypatch):
     from paicli.agent.agent import Agent
-    from paicli.agent.subagents import make_subagent_control_tools
 
     calls = 0
     release_first = asyncio.Event()
@@ -423,14 +425,10 @@ def test_send_message_to_running_child_is_consumed_at_safe_boundary(tmp_path, mo
 
     async def run():
         started = await manager.start({"description": "running", "prompt": "initial"}, context)
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         await asyncio.sleep(0)
-        send = next(tool for tool in make_subagent_control_tools() if tool.name == "send_message")
-        response = await send.execute(
-            {"agent_id": activation.id, "message": "please include this"}, context
-        )
-        assert "steered" in response.content
+        assert (await manager.queue_message(activation.id, "please include this"))[0]
         release_first.set()
         while calls < 2:
             await asyncio.sleep(0)
@@ -441,9 +439,8 @@ def test_send_message_to_running_child_is_consumed_at_safe_boundary(tmp_path, mo
     asyncio.run(run())
 
 
-def test_settlement_creates_and_acknowledges_durable_delivery(tmp_path, monkeypatch):
+def test_settlement_keeps_one_durable_report(tmp_path, monkeypatch):
     from paicli.agent.agent import Agent
-    from paicli.agent.run_controller import RunController
 
     async def completes(self, message):
         class Result:
@@ -457,7 +454,7 @@ def test_settlement_creates_and_acknowledges_durable_delivery(tmp_path, monkeypa
 
     async def run():
         started = await manager.start({"description": "delivery", "prompt": "work"}, context)
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         while activation.status != ActivationState.IDLE_WAITING:
             await asyncio.sleep(0)
@@ -470,67 +467,12 @@ def test_settlement_creates_and_acknowledges_durable_delivery(tmp_path, monkeypa
         events = context.session_store.events(context.session_id)
         created = [event for event in events if event.event_type == "agent/child_delivery_created"]
         assert len(created) == 1
-        assert created[0].payload["delivery_id"] == activation.delivery_id
+        assert created[0].payload["run_id"] == activation.report.run_id
         assert created[0].payload["result_status"] == "completed"
-        controller = RunController(
-            manager=manager,
-            parent_id="root",
-            parent_session_id=context.session_id,
-            session_store=context.session_store,
-        )
-        deliveries = controller.ready_deliveries()
-        assert len(deliveries) == 1
-        assert deliveries[0].delivery_id == activation.delivery_id
-        assert controller.ready_deliveries() == deliveries
-        controller.acknowledge_deliveries(deliveries)
-        assert controller.ready_deliveries() == []
-        acked = [
-            event
-            for event in context.session_store.events(context.session_id)
-            if event.event_type == "agent/child_delivery_acknowledged"
-        ]
-        assert len(acked) == 1
+        assert created[0].payload["content"] == activation.report.result == "child result"
         await manager.drain()
 
     asyncio.run(run())
-
-
-def test_pending_delivery_recovers_after_manager_restart(tmp_path):
-    context = _context(tmp_path)
-    parent_session_id = context.session_id
-    delivery_id = "delivery_recovery_test"
-    context.session_store.append(
-        parent_session_id,
-        "agent/child_delivery_created",
-        {
-            "delivery_id": delivery_id,
-            "child_id": "agent_child",
-            "status": "pending",
-            "result_status": "completed",
-            "content": "recovered result",
-        },
-        source="test",
-    )
-    manager = SubagentManager()
-    from paicli.agent.run_controller import RunController
-
-    controller = RunController(
-        manager=manager,
-        parent_id="root",
-        parent_session_id=parent_session_id,
-        session_store=context.session_store,
-    )
-    recovered = controller.ready_deliveries()
-    assert len(recovered) == 1
-    assert recovered[0].result == "recovered result"
-    assert recovered[0].delivery_id == delivery_id
-    controller.acknowledge_deliveries(recovered)
-    assert controller.ready_deliveries() == []
-    assert any(
-        event.event_type == "agent/child_delivery_acknowledged"
-        and event.payload["delivery_id"] == delivery_id
-        for event in context.session_store.events(parent_session_id)
-    )
 
 
 def test_approval_broker_cancel_and_close_active_presenter():
@@ -615,7 +557,7 @@ def test_one_shot_activation_does_not_enter_idle_waiting(tmp_path):
         started = await manager.start(
             {"description": "one-shot", "prompt": "work", "provider": "external"}, context
         )
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         while not activation.settled:
             await asyncio.sleep(0)
@@ -659,7 +601,7 @@ def test_external_provider_cleanup_failure_is_reported_separately(tmp_path):
             },
             context,
         )
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         while not activation.settled:
             await asyncio.sleep(0)
@@ -850,7 +792,7 @@ def test_subagent_tool_allowlist_is_applied_to_child_registry(tmp_path, monkeypa
 
     async def run():
         started = await manager.start({"description": "allowlist", "prompt": "work"}, context)
-        assert not started.is_error
+        assert isinstance(started, Activation)
         activation = next(iter(manager.activations.values()))
         child = Agent(
             llm_client=context.llm_client,
@@ -882,46 +824,3 @@ def test_file_tools_enforce_child_cwd_boundary(tmp_path):
             asyncio.run(_read_file({"path": str(outside)}, context))
     finally:
         outside.unlink()
-
-
-def test_deferred_ack_marks_activation_and_persists_ack(tmp_path, monkeypatch):
-    from paicli.agent.agent import Agent
-    from paicli.agent.run_controller import RunController
-
-    async def complete(self, message):
-        class Result:
-            text = "ready"
-
-        return Result()
-
-    monkeypatch.setattr(Agent, "run_complete", complete)
-    context = _context(tmp_path)
-    manager = SubagentManager()
-
-    async def run():
-        await manager.start({"description": "ack", "prompt": "work"}, context)
-        activation = next(iter(manager.activations.values()))
-        while activation.status != ActivationState.IDLE_WAITING:
-            await asyncio.sleep(0)
-        await manager.interrupt(activation.id)
-        assert await manager.dispose(activation.id)
-        while not activation.settled:
-            await asyncio.sleep(0)
-        controller = RunController(
-            manager=manager,
-            parent_id="root",
-            parent_session_id=context.session_id,
-            session_store=context.session_store,
-        )
-        deliveries = controller.ready_deliveries()
-        assert deliveries
-        controller.acknowledge_deliveries(deliveries)
-        assert activation.delivered
-        assert any(
-            event.event_type == "agent/child_delivery_acknowledged"
-            and event.payload["delivery_id"] == activation.delivery_id
-            for event in context.session_store.events(context.session_id)
-        )
-        await manager.drain()
-
-    asyncio.run(run())

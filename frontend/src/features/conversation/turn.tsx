@@ -95,10 +95,14 @@ export function Turn({
   )
   const workTools = tools.filter((tool) => !coordinationTools.has(tool.name))
   const activeTool = workTools.find((tool) => tool.status === 'running')
+  const waitingForDelegation = turn.tools.some(
+    (tool) =>
+      tool.status === 'running' && (delegationTools.has(tool.name) || tool.name === 'send_message'),
+  )
   const drafts = turn.messages.filter((message) => message.superseded)
   const answers = turn.messages.filter((message) => !message.commentary && !message.superseded)
   const progress =
-    turn.status === 'running' && !unmanaged && !pending && !activeTool
+    turn.status === 'running' && !unmanaged && !pending && !activeTool && !waitingForDelegation
       ? replyProgress[turn.replyPhase]
       : ''
   const copy = async () => {

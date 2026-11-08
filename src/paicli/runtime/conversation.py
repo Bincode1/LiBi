@@ -199,6 +199,10 @@ def conversation_event(event: SessionEvent, serialized: dict[str, Any]) -> dict[
         }
     if event.event_type == "tool/result":
         name = event.payload.get("name")
+        if name in ("subagent", "send_message") and str(
+            event.payload.get("content") or ""
+        ).startswith("Child agent results:\n"):
+            return {**serialized, "payload": {"name": name, "content": "已收到子 agent 的结果。"}}
         if (
             isinstance(name, str)
             and name in _COORDINATION_RESULTS

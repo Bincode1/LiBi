@@ -26,8 +26,12 @@ from typing import Any, Literal
 
 from paicli.agent.events import OutputLimitError, collect_query_result
 from paicli.agent.plan_execute import PlanExecuteAgent
-from paicli.agent.run_controller import RunController
-from paicli.agent.subagents import SubagentManager, make_subagent_control_tools, make_subagent_tool
+from paicli.agent.subagents import (
+    SUBAGENT_REPORT_TOOLS,
+    SubagentManager,
+    make_subagent_control_tools,
+    make_subagent_tool,
+)
 from paicli.config import PaiCliConfig
 from paicli.context import (
     CompactionClient,
@@ -585,12 +589,12 @@ class Agent:
         total_usage = Usage()
         turn = 0
         finished = False
-        run_controller = RunController(
-            manager=self.subagent_manager,
-            parent_id=self.agent_id,
-            parent_session_id=session_id,
-            session_store=store,
-        )
+        manager = self.subagent_manager
+        if manager is not None:
+            manager.session_store = store
+            manager.redactor = store.redactor
+            manager.restore_catalog(self.agent_id, session_id)
+            manager.recover_orphaned_children(self.agent_id, session_id)
         context_events: list[SessionEvent] = []
         context_cursor = 0
         context_secrets = store.redactor.sensitive_values
@@ -734,25 +738,6 @@ class Agent:
                 current_view = project_current()
                 raw_estimate, input_tokens = estimate_input(current_view)
 
-            # Receive after any asynchronous compaction, before freezing this request.
-            deliveries = run_controller.ready_deliveries()
-            if deliveries:
-                report_budget = max(0, pressure_limit - input_tokens)
-                self._log(
-                    "user/message",
-                    {
-                        "content": run_controller.format_deliveries(
-                            deliveries, report_budget, pending=run_controller.pending_children()
-                        ),
-                        "delivery_ids": [item.delivery_id for item in deliveries],
-                    },
-                    turn_id=turn_id,
-                    step_id=step_id,
-                    source="subagent-delivery",
-                )
-                run_controller.acknowledge_deliveries(deliveries)
-                current_view = project_current()
-                raw_estimate, input_tokens = estimate_input(current_view)
             if context.research_budget is not None:
                 context.research_budget.request_tokens_left = max(0, input_limit - input_tokens)
 
@@ -1006,14 +991,8 @@ class Agent:
                     turn_id=turn_id,
                     step_id=step_id,
                 )
-                if self.subagent_manager is not None:
-                    if self.subagent_manager.event_callback is not None:
-                        run_controller.discard_observations()
-                    async for event in run_controller.observe_until_delivery():
-                        yield _annotate_event(event, session_id, turn_id, step_id)
-                    self.subagent_manager.raise_background_errors()
-                    if run_controller.ready_deliveries():
-                        continue
+                if manager is not None:
+                    manager.raise_background_errors()
                 finished = True
                 break
 
@@ -1041,13 +1020,56 @@ class Agent:
                 )
 
             completed_results: list[ToolResult] = []
+            report_calls = sum(
+                call.get("function", {}).get("name") in SUBAGENT_REPORT_TOOLS for call in tool_calls
+            )
+            report_budget = max(
+                0,
+                pressure_limit
+                - max(input_tokens, turn_usage.input_tokens)
+                - turn_usage.output_tokens,
+            )
+            execution = executor.execute_all(
+                tool_calls,
+                replace(
+                    context,
+                    step_id=step_id,
+                    subagent_report_tokens=report_budget // max(1, report_calls),
+                ),
+                on_result=completed_results.append,
+            )
             try:
-                tool_results = await executor.execute_all(
-                    tool_calls,
-                    replace(context, step_id=step_id),
-                    on_result=completed_results.append,
-                )
-            except (Exception, asyncio.CancelledError):
+                if report_calls and manager is not None and manager.event_callback is None:
+                    # SDK consumers receive child progress while the tool result is pending.
+                    tools_task = asyncio.create_task(execution)
+                    progress_task = asyncio.create_task(manager.next_event(self.agent_id))
+                    try:
+                        while not tools_task.done():
+                            done, _ = await asyncio.wait(
+                                (tools_task, progress_task), return_when=asyncio.FIRST_COMPLETED
+                            )
+                            if progress_task in done:
+                                yield _annotate_event(
+                                    progress_task.result(), session_id, turn_id, step_id
+                                )
+                                progress_task = asyncio.create_task(
+                                    manager.next_event(self.agent_id)
+                                )
+                        tool_results = tools_task.result()
+                    finally:
+                        for task in (tools_task, progress_task):
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(tools_task, progress_task, return_exceptions=True)
+                    if not progress_task.cancelled():
+                        yield _annotate_event(progress_task.result(), session_id, turn_id, step_id)
+                    for event in manager.drain_events(self.agent_id):
+                        yield _annotate_event(event, session_id, turn_id, step_id)
+                else:
+                    tool_results = await execution
+                    if report_calls and manager is not None:
+                        manager.drain_events(self.agent_id)
+            except (Exception, asyncio.CancelledError, GeneratorExit):
                 for result in completed_results:
                     self._log(
                         "tool/result",
@@ -1086,6 +1108,8 @@ class Agent:
                     source="tool-executor",
                 )
 
+            if manager is not None:
+                manager.raise_background_errors()
             for result in tool_results:
                 yield _annotate_event(
                     {

@@ -176,7 +176,8 @@ def test_slow_callback_does_not_block_child_and_gap_recovers_state(tmp_path, mon
             await manager.start({"description": "review", "prompt": "inspect"}, ctx)
             child = next(iter(manager.activations.values()))
             await until(lambda: child.status == ActivationState.IDLE_WAITING)
-            assert manager.deliveries and not release.is_set()
+            assert next(iter(manager.activations.values())).report is not None
+            assert not release.is_set()
             assert manager._callback_buffer.qsize() <= 32
         finally:
             release.set()
@@ -320,7 +321,7 @@ def test_multiple_cleanup_failures_preserve_business_result_and_safe_diagnostics
         assert len(child.cleanup_diagnostics) == 2
         assert len(child.final_result.diagnostic.encode("utf-8")) <= 4096
         assert "unit-private-value" not in json.dumps(manager.describe_activation(child))
-        assert manager.deliveries
+        assert child.report is not None
         with pytest.raises(RuntimeError, match="cleanup failures"):
             await manager.drain()
 

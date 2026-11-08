@@ -40,6 +40,7 @@ class ToolContext:
     turn_id: str | None = None
     step_id: str | None = None
     tool_call_id: str | None = None
+    subagent_report_tokens: int = 8_000
     research_budget: ResearchBudget | None = None
     web_fetch_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
@@ -54,7 +55,7 @@ class Tool:
     is_concurrency_safe: bool = True
     danger_level: DangerLevel = "safe"
     requires_approval: bool = False
-    timeout: float = 60.0
+    timeout: float | None = 60.0
     required_keys: list[str] = field(default_factory=list)
     needs_workspace_checkpoint: bool = True
 

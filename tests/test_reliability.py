@@ -7,8 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from paicli.agent import Agent, QueryEngine
-from paicli.agent.run_controller import RunController
-from paicli.agent.subagents import ActivationState, PersistedDelivery, SubagentManager
+from paicli.agent.subagents import ActivationState, ChildReport, SubagentManager, _report_result
 from paicli.config import PaiCliConfig
 from paicli.context import CompactionResponse
 from paicli.context.tokens import estimate_text_tokens
@@ -16,7 +15,7 @@ from paicli.policy.redaction import Redactor
 from paicli.session import ContextProjector, SessionStore
 from paicli.tools import ToolRegistry, get_builtin_tools
 from paicli.tools.approval import ApprovalBroker
-from paicli.tools.base import Tool, ToolContext, ToolResult
+from paicli.tools.base import ToolContext
 
 
 class DelegatingClient:
@@ -86,7 +85,7 @@ async def wait_idle(activation):
             await asyncio.sleep(0)
 
 
-def test_parent_natural_child_completion_delivers_once_and_sdk_closes(tmp_path, monkeypatch):
+def test_single_delegation_returns_as_tool_result_and_sdk_closes(tmp_path, monkeypatch):
     monkeypatch.setattr("paicli.agent.agent.SnapshotService.create", lambda *args: None)
     ctx = context(tmp_path)
 
@@ -101,99 +100,33 @@ def test_parent_natural_child_completion_delivers_once_and_sdk_closes(tmp_path, 
             async with asyncio.timeout(3):
                 await engine.ask_complete_async("delegate inspection")
             manager = engine._react_agent.subagent_manager
-            assert ctx.llm_client.root_calls == 3
-            assert ctx.llm_client.result_counts == [0, 0, 1]
-            deliveries = [
-                e
-                for e in ctx.session_store.events(engine.session_id)
-                if e.source == "subagent-delivery"
-            ]
-            assert len(deliveries) == 1
-            assert len(deliveries[0].payload["delivery_ids"]) == 1
-            next_request = next(
+            assert ctx.llm_client.root_calls == 2
+            assert ctx.llm_client.result_counts == [0, 1]
+            events = ctx.session_store.events(engine.session_id)
+            (report,) = [
                 event
-                for event in ctx.session_store.events(engine.session_id)
-                if event.event_type == "request/prepared"
-                and event.sequence > deliveries[0].sequence
-            )
-            assert next_request.step_id == deliveries[0].step_id
+                for event in events
+                if event.event_type == "tool/result" and event.payload["name"] == "subagent"
+            ]
+            assert report.tool_call_id == "spawn"
+            assert "child findings" in report.payload["content"]
+            assert [
+                event.payload["content"] for event in events if event.event_type == "user/message"
+            ] == ["delegate inspection"]
         assert not manager.active_for("root")
         assert all(a.settled for a in manager.activations.values())
 
     asyncio.run(run())
 
 
-def test_child_delivery_reaches_next_request_after_tool_batch(tmp_path):
-    ctx = context(tmp_path)
-
-    class Client(DelegatingClient):
-        async def chat(self, messages, tools, *, system_prompt):
-            if self.root_calls == 0 or messages[0].content == "inspect child":
-                async for event in super().chat(messages, tools, system_prompt=system_prompt):
-                    yield event
-                return
-            self.root_calls += 1
-            if self.root_calls == 2:
-                yield {
-                    "type": "tool_call_delta",
-                    "tool_call": {
-                        "index": 0,
-                        "id": "independent",
-                        "function": {"name": "independent_work", "arguments": "{}"},
-                    },
-                }
-                yield {"type": "message_end", "stop_reason": "tool_use"}
-                return
-            assert messages[-2].role == "tool"
-            assert messages[-2].content == "independent work finished"
-            assert "child findings" in messages[-1].content
-            yield {"type": "text_delta", "text": "final synthesis"}
-            yield {"type": "message_end", "stop_reason": "end_turn"}
-
-    async def run():
-        client = Client()
-        async with QueryEngine(
-            llm_client=client,
-            tool_registry=ctx.tool_registry,
-            config=ctx.config,
-            cwd=ctx.cwd,
-            session_store=ctx.session_store,
-        ) as engine:
-
-            async def independent_work(_payload, _context):
-                while not ctx.session_store.events(
-                    engine.session_id, event_types=("agent/child_delivery_created",)
-                ):
-                    await asyncio.sleep(0)
-                return ToolResult("independent work finished")
-
-            ctx.tool_registry.register(
-                Tool("independent_work", "Independent work", {}, independent_work)
-            )
-            async with asyncio.timeout(3):
-                result = await engine.ask_complete_async("delegate inspection")
-            assert result.text == "final synthesis"
-            assert client.root_calls == 3
-            assert (
-                len(
-                    ctx.session_store.events(
-                        engine.session_id, event_types=("agent/child_delivery_acknowledged",)
-                    )
-                )
-                == 1
-            )
-
-    asyncio.run(run())
-
-
 def test_delivery_excerpt_respects_utf8_bytes_and_batch_context():
     content = "调研证据" * 20_000
-    delivery = PersistedDelivery("delivery", "root", "session", "child", "completed", content)
-    rendered = RunController.format_deliveries([delivery], 120_000)
+    delivery = ChildReport("run", "child", "completed", content)
+    rendered = _report_result([delivery], 120_000).content
     report = rendered.split("Subagent child completed: ", 1)[1]
     assert len(report.encode("utf-8")) <= 50 * 1024
     assert "Full report saved" in report and delivery.result == content
-    limited = RunController.format_deliveries([delivery, delivery], 250)
+    limited = _report_result([delivery, delivery], 250).content
     assert estimate_text_tokens(limited) <= 250
     assert limited.count("Subagent child completed:") == 2
 
@@ -266,14 +199,14 @@ def test_parent_receives_partial_child_results(tmp_path, monkeypatch, failure):
             (accepted,) = [
                 event
                 for event in ctx.session_store.events(engine.session_id)
-                if event.source == "subagent-delivery"
+                if event.event_type == "tool/result" and event.payload["name"] == "subagent"
             ]
             assert expected[1] in accepted.payload["content"]
 
     asyncio.run(run())
 
 
-def test_continuation_keeps_unacknowledged_rounds_and_capacity(tmp_path, monkeypatch):
+def test_continuation_keeps_both_reports_and_enforces_capacity(tmp_path, monkeypatch):
     ctx = context(tmp_path)
 
     async def complete(self, message):
@@ -295,57 +228,18 @@ def test_continuation_keeps_unacknowledged_rounds_and_capacity(tmp_path, monkeyp
         await manager.interrupt(second.id)
         assert (await manager.queue_message(first.id, "next"))[0]
         await wait_idle(first)
-        controller = RunController(
-            manager=manager,
-            parent_id="root",
-            parent_session_id=ctx.session_id,
-            session_store=ctx.session_store,
-        )
-        deliveries = controller.ready_deliveries()
-        rounds = [d for d in deliveries if d.child_id == first.id]
-        assert [d.result for d in rounds] == ["first", "next"]
-        assert len({d.delivery_id for d in rounds}) == 2
-        controller.acknowledge_deliveries(deliveries)
-        assert controller.ready_deliveries() == []
+        rounds = [
+            e.payload
+            for e in ctx.session_store.events(
+                ctx.session_id, event_types=("agent/child_delivery_created",)
+            )
+            if e.payload["child_id"] == first.id
+        ]
+        assert [report["content"] for report in rounds] == ["first", "next"]
+        assert len({report["run_id"] for report in rounds}) == 2
         await manager.drain()
 
     asyncio.run(run())
-
-
-def test_restore_after_acceptance_before_acknowledgement(tmp_path):
-    ctx = context(tmp_path)
-    store = ctx.session_store
-    store.append(
-        ctx.session_id,
-        "agent/child_delivery_created",
-        {
-            "delivery_id": "delivery-test",
-            "child_id": "child-test",
-            "result_status": "completed",
-            "content": "findings",
-        },
-    )
-    manager = SubagentManager()
-    controller = RunController(
-        manager=manager, parent_id="root", parent_session_id=ctx.session_id, session_store=store
-    )
-    deliveries = controller.ready_deliveries()
-    assert len(deliveries) == 1
-    store.append(
-        ctx.session_id,
-        "user/message",
-        {
-            "content": "accepted findings",
-            "delivery_ids": [deliveries[0].delivery_id],
-        },
-    )
-    restarted = RunController(
-        manager=SubagentManager(),
-        parent_id="root",
-        parent_session_id=ctx.session_id,
-        session_store=store,
-    )
-    assert restarted.ready_deliveries() == []
 
 
 def test_approval_failure_reaches_current_queued_and_future_requests():
@@ -544,15 +438,7 @@ def test_observer_failure_keeps_delivery_and_persistence_failure_is_visible(tmp_
         await manager.start({"description": "test", "prompt": "test"}, ctx)
         child = next(iter(manager.activations.values()))
         await wait_idle(child)
-        controller = RunController(
-            manager=manager,
-            parent_id="root",
-            parent_session_id=ctx.session_id,
-            session_store=ctx.session_store,
-        )
-        deliveries = controller.ready_deliveries()
-        assert len(deliveries) == 1
-        controller.acknowledge_deliveries(deliveries)
+        assert child.report.result == "findings"
         await manager.flush_observations()
         with pytest.raises(RuntimeError, match="observation callback failed"):
             manager.raise_background_errors()

@@ -11,15 +11,13 @@ from paicli.runtime.api import RuntimeApiServer, _engine_events
 from paicli.session import SessionStore
 
 
-def test_runtime_loads_subagent_modules_at_startup():
+def test_runtime_loads_subagent_module_at_startup():
     subprocess.run(
         [
             sys.executable,
             "-B",
             "-c",
-            "import sys; import paicli.runtime; "
-            "assert 'paicli.agent.subagents' in sys.modules; "
-            "assert 'paicli.agent.run_controller' in sys.modules",
+            "import sys; import paicli.runtime; assert 'paicli.agent.subagents' in sys.modules",
         ],
         check=True,
         timeout=15,

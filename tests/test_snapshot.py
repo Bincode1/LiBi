@@ -853,9 +853,10 @@ def test_parent_snapshot_covers_delegated_mutation(tmp_path, config):
     snapshots = SnapshotService(tmp_path)
 
     class SubagentManager:
-        async def start(self, payload, _context):
+        async def delegate(self, tasks, _context):
+            (payload,) = tasks
             (Path(payload["cwd"]) / "note.txt").write_text("changed", encoding="utf-8")
-            return ToolResult("child started")
+            return ToolResult("child finished")
 
     registry = ToolRegistry()
     registry.register(make_subagent_tool())
