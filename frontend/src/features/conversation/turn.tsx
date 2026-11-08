@@ -103,11 +103,10 @@ export function Turn({
   const drafts = turn.messages.filter((message) => message.superseded)
   const answers = turn.messages.filter((message) => !message.commentary && !message.superseded)
   const canCopyAnswer = turn.status === 'completed' && answers.length > 0
+  const working = turn.status === 'running' && !unmanaged && !pending
   const finishedUsage = turn.status !== 'running' ? turn.usage : undefined
   const progress =
-    turn.status === 'running' && !unmanaged && !pending && !activeTool && !waitingForDelegation
-      ? replyProgress[turn.replyPhase]
-      : ''
+    working && !activeTool && !waitingForDelegation ? replyProgress[turn.replyPhase] : ''
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(answers.map((m) => m.text).join('\n\n'))
@@ -170,7 +169,9 @@ export function Turn({
         </div>
       )}
       <div className="agent-message">
-        <AgentMark />
+        <AgentMark
+          variant={working ? 'working' : turn.status === 'completed' ? 'done' : 'avatar'}
+        />
         <div className="agent-body">
           <div className="message-label">LiBi</div>
           {(tools.length > 0 || drafts.length > 0) && (

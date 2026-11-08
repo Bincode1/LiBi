@@ -1,14 +1,17 @@
 /// <reference types="vite/client" />
 
-import { Terminal } from 'lucide-react'
 import { avatarRole, avatarRoles } from '@/lib/activity'
 import type { Subagent } from '@/lib/types'
 
-export function AgentMark() {
+type AgentMarkVariant = 'primary' | 'avatar' | 'working' | 'done'
+
+export function AgentMark({ variant = 'primary' }: { variant?: AgentMarkVariant }) {
   return (
-    <span className="agent-mark" aria-hidden="true">
-      <Terminal size={19} strokeWidth={1.9} />
-    </span>
+    <img
+      className="agent-mark"
+      alt=""
+      src={`${import.meta.env.BASE_URL}libi-icons/${variant}.png`}
+    />
   )
 }
 

@@ -272,19 +272,15 @@ kbd {
   width: 32px;
   height: 32px;
   border-radius: 10px;
-  background: var(--selected);
-  color: var(--primary);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  background: #eee9ff;
+  display: inline-block;
+  object-fit: contain;
   flex-shrink: 0;
 }
 .brand .agent-mark {
   width: 30px;
   height: 30px;
   border-radius: 9px;
-  background: var(--primary);
-  color: var(--primary-foreground);
 }
 .new-chat {
   width: 100%;
@@ -531,9 +527,6 @@ kbd {
   width: 29px;
   height: 29px;
   border-radius: 9px;
-}
-.agent-message > .agent-mark svg {
-  width: 17px;
 }
 .agent-body {
   min-width: 0;
@@ -1368,6 +1361,12 @@ kbd {
   width: 100%;
   padding-bottom: 7vh;
   text-align: center;
+}
+.welcome .agent-mark {
+  width: 64px;
+  height: 64px;
+  border-radius: 18px;
+  margin-bottom: 16px;
 }
 .welcome h1 {
   font-size: 34px;

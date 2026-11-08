@@ -737,6 +737,7 @@ export default function App() {
           <div className={`conversation-content ${!id && !pending ? 'welcome-content' : ''}`}>
             {!id && !pending ? (
               <section className="welcome">
+                <AgentMark />
                 <h1>今天想做什么？</h1>
                 <div className="suggestions">
                   {[

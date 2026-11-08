@@ -28,11 +28,13 @@ it('animates the live draft and keeps raw HTML out of the reply', () => {
   expect(draft).toContain('data-streamdown="strong"')
   expect(draft).toContain('data-sd-animate')
   expect(draft).toContain('正在生成回复')
+  expect(draft).toContain('libi-icons/working.png')
 
   const final = render('completed', '**你好**\n\n<img src="https://example.invalid/pixel">')
   expect(final).toContain('data-streamdown="strong">你好</span>')
   expect(final).not.toContain('data-sd-animate')
-  expect(final).not.toContain('<img')
+  expect(final).not.toContain('src="https://example.invalid/pixel"')
+  expect(final).toContain('libi-icons/done.png')
 })
 
 it('groups handled approvals behind one closed disclosure and leaves pending requests visible', () => {
@@ -64,6 +66,7 @@ it('groups handled approvals behind one closed disclosure and leaves pending req
   expect(html).not.toContain('second-command')
   expect(html.slice(0, historyStart)).toContain('pending-command')
   expect(html).not.toContain('等待模型响应')
+  expect(html).toContain('libi-icons/avatar.png')
 })
 
 function renderEvents(type: string, payload: RuntimeEvent['payload'], preview?: AssistantPreview) {
@@ -94,6 +97,7 @@ it.each([
 ])('reports the reason for a failed turn with no tools (%j)', (payload, expected) => {
   const html = renderEvents('turn/failed', payload)
   expect(html).toContain(expected)
+  expect(html).toContain('libi-icons/avatar.png')
   expect(html).not.toContain('展开执行')
 })
 
