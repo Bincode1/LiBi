@@ -1,31 +1,94 @@
-.DS_Store
-.env
+# Credentials and machine-specific configuration
+.env*
+!.env.example
+.envrc
+.direnv/
+.npmrc
+.pypirc
+.netrc
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials.json
+secrets.json
+secrets/
+mcp.json
+.mcp.json
+
+# LiBi configuration, conversations, attachments, memory, and snapshots
+.libi/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Dependencies and generated build output
 .venv/
+venv/
+node_modules/
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.tsbuildinfo
+dist/
+build/
+
+# Test, lint, and browser state
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.cache/
 .coverage
 .coverage.*
 coverage.json
 coverage.xml
+coverage/
 htmlcov/
-dist/
-build/
-.libi/
-/.playwright-cli
+.playwright-cli/
+playwright-report/
+test-results/
+storage-state*.json
+storageState*.json
 
-# Local credentials and environment overrides
-.env.*
-!.env.example
+# Local editor and agent state
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.codex/
+.kilo/
+.kilocode/
+.claude/settings.local.json
 
-# Local workspace reports
+# Intermediate designs, research notes, and local reports
+/docs/*-design-*.md
+/docs/interview-agent-questions.md
+/docs/parity.md
+/docs/designs/
+/docs/drafts/
+/docs/research/
+/designs/
+/plans/
+/reports/
 /DIRECTORY_REPORT.md
 
-# Scratch files and command output
+# Scratch files, local backups, and command output
+/tmp/
+/temp/
+/scratch/
+/backups/
 /%TMPD%/
 /$null
 /test1.md
 /test2.md
 *.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.bundle

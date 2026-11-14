@@ -53,7 +53,7 @@ the default configuration and CI never skip integration or slow tests.
 | Agent / Plan | `test_query.py`, `test_plan.py`, `test_reliability.py` | Tool replay, skills, DAG batches, cycles, failed dependencies, cleanup |
 | Child runtime | `test_subagents.py`, `test_subagent_observation.py` | Capacity, deadlines, nesting, recovery, exactly-once delivery, bounded observation, approvals |
 | Tools | `test_tools.py`, `test_tool_executor.py`, `test_tool_parsing.py`, `test_builtin_wiring.py` | Approval matrix, malformed input, timeouts, cancellation, bounded reads, serial writes, real handler wiring |
-| Files / commands | `test_file_ops.py`, `test_commands.py`, `test_policy.py` | Paths, byte/line limits, dry runs, missing matches, permissions, exit codes, process termination |
+| Files / commands | `test_file_ops.py`, `test_policy.py`, `test_runtime_http.py` | Paths, byte/line limits, dry runs, missing matches, permissions, exit codes, process termination |
 | Sessions / compaction | `test_session.py`, `test_compaction.py`, `test_context.py` | Projection, replay, migration, summary validation, provenance, fencing, failed compaction and retry |
 | LLM / images | `test_llm_usage.py`, `test_llm_protocol.py`, `test_image.py`, `test_model_selector.py` | SSE fragmentation, finish reasons, usage/prices, HTTP failures, actual image MIME, resize |
 | MCP | `test_mcp.py`, `test_mcp_config.py` | Real stdio server, tool calls, broken server isolation, scope merge, environment expansion |
