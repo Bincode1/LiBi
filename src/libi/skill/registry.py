@@ -1,12 +1,30 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import unicodedata
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
+
+import yaml
+
+SKILL_LOCK = RLock()
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".skill-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 @dataclass(slots=True)
@@ -19,6 +37,7 @@ class Skill:
     version: str = ""
     tags: list[str] = field(default_factory=list)
     enabled: bool = True
+    problem: str | None = None
 
     @property
     def body(self) -> str:
@@ -97,34 +116,74 @@ class SkillStateStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path or Path.home() / ".libi" / "skills.json").expanduser()
 
-    def disabled(self) -> set[str]:
+    def _read(self) -> dict:
         if not self.path.exists():
-            return set()
+            return {}
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return set()
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("技能启停配置无法读取，请修复 ~/.libi/skills.json 后重试。") from exc
+        if not isinstance(data, dict):
+            raise ValueError("技能启停配置必须是 JSON 对象。")
+        disabled = data.get("disabled", [])
+        if not isinstance(disabled, list) or any(not isinstance(v, str) for v in disabled):
+            raise ValueError("技能全局开关配置无效。")
+        return data
+
+    def disabled(self, project_root: Path | None = None) -> set[str]:
+        data = self._read()
         values = data.get("disabled") if isinstance(data, dict) else None
-        if not isinstance(values, list):
-            return set()
-        return {str(item) for item in values if str(item).strip()}
+        disabled = {str(item) for item in values or [] if str(item).strip()}
+        for name, enabled in self.overrides(project_root).items():
+            if enabled:
+                disabled.discard(name)
+            else:
+                disabled.add(name)
+        return disabled
+
+    def overrides(self, project_root: Path | None) -> dict[str, bool]:
+        if project_root is None:
+            return {}
+        projects = self._read().get("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError("技能项目开关配置无效。")
+        values = projects.get(str(project_root.resolve()), {})
+        if not isinstance(values, dict) or any(type(v) is not bool for v in values.values()):
+            raise ValueError("技能项目开关配置无效。")
+        return values
+
+    def set_project(self, project_root: Path, name: str, enabled: bool | None) -> None:
+        with SKILL_LOCK:
+            data = self._read()
+            values = dict(self.overrides(project_root))
+            if enabled is None:
+                values.pop(name, None)
+            else:
+                values[name] = enabled
+            projects = data.setdefault("projects", {})
+            key = str(project_root.resolve())
+            if values:
+                projects[key] = values
+            else:
+                projects.pop(key, None)
+            atomic_write(self.path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
     def disable(self, name: str) -> None:
-        values = self.disabled()
-        values.add(name)
-        self._write(values)
+        with SKILL_LOCK:
+            values = self.disabled()
+            values.add(name)
+            self._write(values)
 
     def enable(self, name: str) -> None:
-        values = self.disabled()
-        values.discard(name)
-        self._write(values)
+        with SKILL_LOCK:
+            values = self.disabled()
+            values.discard(name)
+            self._write(values)
 
     def _write(self, disabled: set[str]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps({"disabled": sorted(disabled)}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        data = self._read()
+        data["disabled"] = sorted(disabled)
+        atomic_write(self.path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
 class SkillRegistry:
@@ -207,7 +266,8 @@ class SkillRegistry:
         if path.exists() and not overwrite:
             raise FileExistsError(f'skill "{slug}" already exists in {scope} scope')
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        atomic_write(
+            path,
             _render_skill_file(
                 name=slug,
                 description=description,
@@ -215,10 +275,9 @@ class SkillRegistry:
                 version=version,
                 tags=tags or [],
             ),
-            encoding="utf-8",
         )
         self.reload()
-        skill = self._load_skill_file(path, scope, self.state_store.disabled())
+        skill = self._load_skill_file(path, scope, self.state_store.disabled(self.project_root))
         if not skill:  # pragma: no cover - the file was just written successfully
             raise OSError(f"failed to load newly written skill: {path}")
         return skill
@@ -237,7 +296,7 @@ class SkillRegistry:
         path = self._skill_path(slug, scope)
         if not path.is_file():
             raise FileNotFoundError(f'skill "{slug}" does not exist in {scope} scope')
-        existing = self._load_skill_file(path, scope, self.state_store.disabled())
+        existing = self._load_skill_file(path, scope, self.state_store.disabled(self.project_root))
         if not existing:
             raise ValueError(f'skill "{slug}" could not be parsed')
         return self.create(
@@ -290,8 +349,16 @@ class SkillRegistry:
     def _load_all(self) -> dict[str, Skill]:
         if self._skills is not None:
             return self._skills
-        disabled = self.state_store.disabled()
         skills: dict[str, Skill] = {}
+        for skill in self.definitions():
+            if not skill.problem:
+                skills[skill.name] = skill
+        self._skills = skills
+        return skills
+
+    def definitions(self) -> list[Skill]:
+        disabled = self.state_store.disabled(self.project_root)
+        skills = []
         for source, root in [
             ("builtin", self.builtin_root),
             ("user", self.user_root),
@@ -302,18 +369,30 @@ class SkillRegistry:
             for skill_file in sorted(root.glob("*/SKILL.md")):
                 skill = self._load_skill_file(skill_file, source, disabled)
                 if skill:
-                    skills[skill.name] = skill
-        self._skills = skills
+                    skills.append(skill)
         return skills
 
     def _load_skill_file(self, path: Path, source: str, disabled: set[str]) -> Skill | None:
         try:
             content = path.read_text(encoding="utf-8")
-        except OSError:
-            return None
-        metadata = _parse_frontmatter(content)
-        name = metadata.get("name") or path.parent.name
-        description = metadata.get("description") or ""
+        except (OSError, UnicodeError):
+            return Skill(
+                name=path.parent.name,
+                description="",
+                path=path,
+                content="",
+                source=source,
+                enabled=False,
+                problem="无法读取 SKILL.md，请检查 UTF-8 编码和文件权限。",
+            )
+        problem = None
+        try:
+            metadata = _parse_frontmatter(content)
+        except ValueError as exc:
+            metadata = {}
+            problem = str(exc)
+        name = (metadata.get("name") or path.parent.name).strip()
+        description = (metadata.get("description") or "").strip()
         tags = _parse_tags(metadata.get("tags", ""))
         return Skill(
             name=name,
@@ -324,6 +403,7 @@ class SkillRegistry:
             path=path,
             content=content,
             enabled=name not in disabled,
+            problem=problem,
         )
 
 
@@ -333,27 +413,15 @@ def _parse_frontmatter(content: str) -> dict[str, str]:
     match = re.match(r"^---\s*\n(.*?)\n---\s*", content, re.S)
     if not match:
         return {}
-    lines = match.group(1).splitlines()
-    metadata: dict[str, str] = {}
-    index = 0
-    while index < len(lines):
-        raw_line = lines[index]
-        if ":" not in raw_line:
-            index += 1
-            continue
-        key, value = raw_line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if value == "|":
-            index += 1
-            block: list[str] = []
-            while index < len(lines) and (lines[index].startswith(" ") or not lines[index].strip()):
-                block.append(lines[index].strip())
-                index += 1
-            metadata[key] = " ".join(part for part in block if part)
-            continue
-        metadata[key] = value.strip().strip('"').strip("'")
-        index += 1
+    try:
+        data = yaml.safe_load(match.group(1)) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError("SKILL.md 的 YAML 元数据格式无效。") from exc
+    if not isinstance(data, dict):
+        raise ValueError("SKILL.md 的 YAML 元数据必须是对象。")
+    metadata = {key: str(value) for key, value in data.items() if value is not None}
+    if isinstance(data.get("tags"), list):
+        metadata["tags"] = json.dumps(data["tags"], ensure_ascii=False)
     return metadata
 
 
@@ -367,6 +435,12 @@ def _parse_tags(raw: str) -> list[str]:
     value = raw.strip()
     if not value:
         return []
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    except json.JSONDecodeError:
+        pass
     if value.startswith("[") and value.endswith("]"):
         value = value[1:-1]
     return [item.strip().strip('"').strip("'") for item in value.split(",") if item.strip()]

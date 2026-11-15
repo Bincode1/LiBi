@@ -54,6 +54,7 @@ from libi.session import (
     TurnInProgressError,
     default_runtime_db_path,
 )
+from libi.skill.management import SkillConflict, SkillManagement
 from libi.tools.base import Tool, ToolContext, ToolDecision, ToolResult
 from libi.types import Usage
 
@@ -298,6 +299,9 @@ class RuntimeApiServer:
                 return
             if path == "/v1/mcp/servers" or path.startswith("/v1/mcp/servers/"):
                 self._handle_mcp(request, path, body)
+                return
+            if path == "/v1/skills" or path.startswith("/v1/skills/"):
+                self._handle_skills(request, path, body)
                 return
             if path.startswith("/v1/sessions/") and not self.session_store.session_exists(
                 _session_id_from_path(path), root_only=True
@@ -645,6 +649,43 @@ class RuntimeApiServer:
             _send_json(request, 500, {"mcp_error": "无法访问 MCP 配置文件。请检查文件权限。"})
         except Exception:
             _send_json(request, 500, {"mcp_error": "处理 MCP 配置时出错。"})
+
+    def _handle_skills(self, request: BaseHTTPRequestHandler, path: str, body: dict) -> None:
+        management = SkillManagement(self.cwd)
+        try:
+            if request.command == "GET" and path == "/v1/skills":
+                result = management.inventory(feature_enabled=self.config.features.skill)
+            elif request.command == "POST" and path.startswith("/v1/skills/"):
+                if (
+                    request.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                    != "application/json"
+                ):
+                    raise ValueError("请使用 JSON 提交技能。")
+                action = path.removeprefix("/v1/skills/")
+                if action == "detail":
+                    result = management.detail(body)
+                elif action == "preview":
+                    result = management.preview(body)
+                elif action in {"add", "edit", "toggle", "reset", "remove", "import"}:
+                    management.mutate(action, body)
+                    result = {"saved": True}
+                else:
+                    _send_json(request, 404, {"error": "not found"})
+                    return
+            else:
+                _send_json(request, 404, {"error": "not found"})
+                return
+            _send_json(request, 200, result)
+        except SkillConflict as exc:
+            _send_json(request, 409, {"skill_error": str(exc)})
+        except FileNotFoundError:
+            _send_json(request, 404, {"skill_error": "技能或导入目录已不存在，请刷新后重试。"})
+        except (ValueError, TypeError) as exc:
+            _send_json(request, 400, {"skill_error": str(exc)})
+        except (OSError, UnicodeError):
+            _send_json(
+                request, 500, {"skill_error": "无法读取或保存技能，请检查文件编码和目录权限。"}
+            )
 
     async def _run_turn(
         self,

@@ -35,6 +35,7 @@ import { Composer, isImageAttachment } from '@/features/conversation/composer'
 import { ModePicker } from '@/features/conversation/mode-picker'
 import { TurnUsageSummary } from '@/features/conversation/turn-usage'
 import { McpSettings } from '@/features/mcp/settings'
+import { SkillSettings } from '@/features/skills/settings'
 import { SettingsLayout } from '@/features/settings/layout'
 import {
   ModelSettings,
@@ -103,9 +104,11 @@ export default function App() {
   const settingsPage =
     route.pathname === '/settings/mcp'
       ? 'mcp'
-      : route.pathname === '/settings/models' || route.pathname === '/settings'
-        ? 'models'
-        : null
+      : route.pathname === '/settings/skills'
+        ? 'skills'
+        : route.pathname === '/settings/models' || route.pathname === '/settings'
+          ? 'models'
+          : null
   const inSettings = settingsPage !== null
   const from: unknown = route.state?.returnTo
   const returnTo = typeof from === 'string' && matchPath('/sessions/:id', from) ? from : '/new'
@@ -316,8 +319,7 @@ export default function App() {
     if (feed.error) void checkHealth()
   }, [checkHealth, feed.error])
   useEffect(() => {
-    if (previousRuntimeError.current && runtimeReady && feed.error)
-      setRetry((value) => value + 1)
+    if (previousRuntimeError.current && runtimeReady && feed.error) setRetry((value) => value + 1)
     previousRuntimeError.current = runtimeOffline
   }, [runtimeOffline, runtimeReady, feed.error])
   useEffect(() => {
@@ -1229,7 +1231,13 @@ export default function App() {
           returnTo={returnTo}
           onConnection={() => setSettings(true)}
         >
-          {settingsPage === 'models' ? <ModelSettings /> : <McpSettings />}
+          {settingsPage === 'models' ? (
+            <ModelSettings />
+          ) : settingsPage === 'skills' ? (
+            <SkillSettings />
+          ) : (
+            <McpSettings />
+          )}
         </SettingsLayout>
       )}
       {workspace}

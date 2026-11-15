@@ -827,8 +827,13 @@ async def _load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResu
     if not skill:
         return ToolResult(f'Skill "{payload["name"]}" not found or disabled.', is_error=True)
     content = skill.body or skill.content
-    if len(content) > 5_000:
-        content = content[:5_000] + "\n... [truncated; use /skill show for the full skill]"
+    directory = str(skill.path.parent.resolve())
+    if len(content) > 32_000:
+        content = content[:32_000] + f"\n... [truncated; read the complete file at {skill.path}]"
+    content = (
+        f"Skill directory: {directory}\n"
+        "Resolve relative scripts, references, and assets against this directory.\n\n" + content
+    )
     if context.skill_context_buffer:
         context.skill_context_buffer.push(skill.name, content)
         return ToolResult(

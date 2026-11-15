@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { ArrowLeft, Boxes, Plug, Settings2 } from 'lucide-react'
+import { ArrowLeft, BookOpen, Boxes, Plug, Settings2 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import '../mcp/settings.css'
 
@@ -9,7 +9,7 @@ export function SettingsLayout({
   onConnection,
   children,
 }: {
-  page: 'models' | 'mcp'
+  page: 'models' | 'mcp' | 'skills'
   returnTo: string
   onConnection: () => void
   children: ReactNode
@@ -35,6 +35,13 @@ export function SettingsLayout({
         </div>
         <div className="mcp-nav-group">
           <span>集成</span>
+          <Link
+            to="/settings/skills"
+            state={{ returnTo }}
+            aria-current={page === 'skills' ? 'page' : undefined}
+          >
+            <BookOpen size={16} aria-hidden="true" /> Skills
+          </Link>
           <Link
             to="/settings/mcp"
             state={{ returnTo }}

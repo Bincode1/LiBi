@@ -34,14 +34,16 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
         ? 'model_error'
         : /^\/v1\/sessions\/[^/]+\/attachments(?:\?|\/|$)/.test(path)
           ? 'attachment_error'
-          : path.startsWith('/v1/mcp/servers/')
-            ? 'mcp_error'
-            : response.status === 400 &&
-                (path.startsWith('/v1/workspaces?') ||
-                  path === '/v1/sessions' ||
-                  /^\/v1\/sessions\/[^/]+\/turns\/async$/.test(path))
-              ? 'workspace_error'
-              : undefined
+          : path.startsWith('/v1/skills')
+            ? 'skill_error'
+            : path.startsWith('/v1/mcp/servers/')
+              ? 'mcp_error'
+              : response.status === 400 &&
+                  (path.startsWith('/v1/workspaces?') ||
+                    path === '/v1/sessions' ||
+                    /^\/v1\/sessions\/[^/]+\/turns\/async$/.test(path))
+                ? 'workspace_error'
+                : undefined
     const payload: Record<string, unknown> | null = errorField
       ? await response.json().catch(() => null)
       : null

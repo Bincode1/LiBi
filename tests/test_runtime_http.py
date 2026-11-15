@@ -83,6 +83,41 @@ def test_http_authentication_precedes_request_parsing(runtime_http, header):
     assert runtime.session_store.list_sessions() == []
 
 
+def test_skill_management_http_roundtrip_and_authentication(runtime_http, tmp_path):
+    runtime, client = runtime_http
+    root = "/v1/skills"
+    assert client.get(root, headers={"x-api-key": ""}).status_code == 401
+    inventory = client.get(root).raise_for_status().json()
+    assert inventory["feature_enabled"]
+    document = "---\nname: release-check\ndescription: Verify releases\n---\nRun checks.\n"
+    target = {"slug": "release-check", "scope": "project"}
+    body = {**target, "document": document, "revision": inventory["revision"]}
+    assert client.post(root + "/add", json=body).status_code == 200
+    assert client.post(root + "/remove", json=body).status_code == 409
+    detail = client.post(root + "/detail", json=target).raise_for_status().json()
+    assert detail["document"] == document
+    assert detail["resources"][0]["path"] == "SKILL.md"
+    revision = client.get(root).json()["revision"]
+    response = client.post(
+        root + "/toggle", json={**target, "revision": revision, "enabled": False}
+    )
+    assert response.status_code == 200
+    from libi.skill import SkillRegistry
+
+    assert SkillRegistry(tmp_path).load("release-check") is None
+    response = client.post(
+        root + "/remove", json={**target, "revision": client.get(root).json()["revision"]}
+    )
+    assert response.status_code == 200
+    assert not (tmp_path / ".libi/skills/release-check").exists()
+    assert client.post(root + "/detail", json=target).status_code == 404
+    assert client.post(root + "/unknown", json={}).status_code == 404
+    assert (
+        client.post(root + "/add", content="{}", headers={"Content-Type": "text/plain"}).status_code
+        == 400
+    )
+
+
 def test_workbench_model_settings_discover_save_and_use_new_connection(
     runtime_http, tmp_path, monkeypatch
 ):
